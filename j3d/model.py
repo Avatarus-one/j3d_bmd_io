@@ -89,10 +89,14 @@ class MeshData:
         self.shape_index = 0
         self.material_index = 0
         self.joint = 0
+        self.node_index = 0          # index of the INF1 shape node this came from
         self.verts = None            # (V,3) float32, model space
         self.vert_influence = None   # (V,) int32 -> influence_sets
         self.influence_sets = []     # list of tuples ((joint, weight), ...)
+        self.source_vertex = None    # (V,) int32, original VTX1 position index (merged mode)
         self.faces = None            # (T,3) int32
+        self.face_node = None        # (T,) int32, source INF1 node (merged mode)
+        self.face_material = None    # (T,) int32, source material index (merged mode)
         self.loop_normals = None     # (3T,3) float32 or None
         self.loop_colors = [None, None]  # (3T,4) float32 or None
         self.loop_uvs = [None] * 8   # (3T,2) float32 or None  (GX convention: v down)
@@ -597,6 +601,7 @@ def build_mesh(bmd, node, mesh_index=0):
     mesh.shape_index = shape_idx
     mesh.material_index = material
     mesh.joint = max(joint, 0)
+    mesh.node_index = int(mesh_index)
     if decoded is None:
         return None
     rec, tris, drw = decoded
@@ -626,7 +631,7 @@ def build_mesh(bmd, node, mesh_index=0):
     u_pos_i = uniq // ndrw
     u_drw = uniq % ndrw
     verts = pos_arr[u_pos_i].astype(np.float64)
-
+    mesh.source_vertex = u_pos_i.astype(np.int32)
     drw_ids = np.unique(u_drw)
     inf_sets = []
     for k in drw_ids:
@@ -687,3 +692,120 @@ def extract_meshes(bmd):
         if m is not None:
             meshes.append(m)
     return meshes
+
+
+def merge_meshes(bmd, meshes):
+    """Merge the per-shape meshes into one mesh that keeps the original VTX1 order.
+
+    The first variant of a vertex keeps its original position index.  A second variant
+    (the same position used with a different draw matrix / skin) is appended after the
+    original vertices, because Blender stores skin weights per vertex.
+    """
+    pos_arr = bmd.arrays.get(VA_POS)
+    if not meshes or pos_arr is None:
+        return None
+    n_orig = max(int(getattr(bmd, "vertex_count", 0)), 0)
+    max_src = max((int(m.source_vertex.max()) for m in meshes
+                   if m.source_vertex is not None and len(m.source_vertex)), default=-1)
+    n = max(n_orig, max_src + 1, 1)
+
+    verts = []
+    for i in range(n):
+        verts.append(np.asarray(pos_arr[i], np.float64) if i < len(pos_arr)
+                     else np.zeros(3, np.float64))
+    source_of = list(range(n))
+    g_inf = [None] * n
+    used = {}
+    key_to_gid = {}
+    inf_sets = []
+    inf_lookup = {}
+
+    def influence_index(infl):
+        key = tuple(sorted((int(j), float(w)) for j, w in infl))
+        idx = inf_lookup.get(key)
+        if idx is None:
+            idx = len(inf_sets)
+            inf_lookup[key] = idx
+            inf_sets.append(tuple(infl))
+        return idx
+
+    all_faces, face_node, face_material = [], [], []
+    normals_all = True
+    loop_normals = []
+    colors_present = [any(m.loop_colors[c] is not None for m in meshes) for c in range(2)]
+    loop_colors = [[], []]
+    uvs_present = [any(m.loop_uvs[t] is not None for m in meshes) for t in range(8)]
+    loop_uvs = [[] for _ in range(8)]
+
+    for mesh in meshes:
+        nlocal = len(mesh.verts)
+        local_map = np.empty(nlocal, np.int64)
+        srcs = np.asarray(mesh.source_vertex, np.int64)
+        for li in range(nlocal):
+            src = int(srcs[li])
+            infl = mesh.influence_sets[int(mesh.vert_influence[li])]
+            inf_idx = influence_index(infl)
+            coord = np.asarray(mesh.verts[li], np.float64)
+            base_key = (src, tuple(sorted((int(j), float(w)) for j, w in infl)))
+            gid = key_to_gid.get(base_key)
+            if gid is not None and np.allclose(verts[gid], coord, atol=1e-6, rtol=0.0):
+                local_map[li] = gid
+                continue
+            if src not in used:
+                gid = src
+                used[src] = gid
+            else:
+                gid = len(verts)
+                verts.append(np.zeros(3, np.float64))
+                source_of.append(src)
+                g_inf.append(None)
+            verts[gid] = coord
+            g_inf[gid] = inf_idx
+            key_to_gid[base_key] = gid
+            local_map[li] = gid
+
+        all_faces.append(local_map[mesh.faces])
+        face_node.extend([int(mesh.node_index)] * len(mesh.faces))
+        face_material.extend([int(mesh.material_index)] * len(mesh.faces))
+
+        nloops = len(mesh.faces) * 3
+        if mesh.loop_normals is None:
+            normals_all = False
+        else:
+            loop_normals.append(mesh.loop_normals)
+        for c in range(2):
+            if colors_present[c]:
+                loop_colors[c].append(
+                    mesh.loop_colors[c] if mesh.loop_colors[c] is not None
+                    else np.ones((nloops, 4), np.float32))
+        for t in range(8):
+            if uvs_present[t]:
+                loop_uvs[t].append(
+                    mesh.loop_uvs[t] if mesh.loop_uvs[t] is not None
+                    else np.zeros((nloops, 2), np.float32))
+
+    if any(v is None for v in g_inf):
+        default_inf = influence_index(((0, 1.0),) if bmd.joints else ())
+        for i in range(len(g_inf)):
+            if g_inf[i] is None:
+                g_inf[i] = default_inf
+
+    merged = MeshData()
+    merged.name = "merged"
+    merged.node_index = -1
+    merged.verts = np.asarray(verts, np.float32)
+    merged.vert_influence = np.asarray(g_inf, np.int32)
+    merged.influence_sets = inf_sets
+    merged.source_vertex = np.asarray(source_of, np.int32)
+    merged.faces = (np.concatenate(all_faces, 0).astype(np.int32) if all_faces
+                    else np.zeros((0, 3), np.int32))
+    merged.face_node = np.asarray(face_node, np.int32)
+    merged.face_material = np.asarray(face_material, np.int32)
+    merged.loop_normals = np.concatenate(loop_normals, 0) if normals_all and loop_normals else None
+    merged.loop_colors = [
+        np.concatenate(loop_colors[c], 0) if loop_colors[c] else None for c in range(2)
+    ]
+    merged.loop_uvs = [
+        np.concatenate(loop_uvs[t], 0) if loop_uvs[t] else None for t in range(8)
+    ]
+    return merged

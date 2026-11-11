@@ -22,7 +22,7 @@ class ExportError(Exception):
 
 def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifiers=False,
                default_format="AUTO", source_file="", allow_missing_textures=False,
-               keep_vertex_formats=True, report=None):
+               keep_vertex_formats=True, report=None, limit_weights=False):
     scene_objs = context.selected_objects if use_selection else [
         o for o in context.scene.objects if o.visible_get()]
     mesh_objs = [o for o in scene_objs if o.type == "MESH"]
@@ -40,13 +40,16 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
 
     mesh_objs.sort(key=lambda o: (o.get("bmd_shape_index", 1e9), o.get("bmd_order", 1e9), o.name))
     model = writer.ExportModel()
+    model.preserve_vertex_order = any(
+        o.data is not None and o.data.attributes.get("bmd_node") is not None for o in mesh_objs)
     bone_index = _build_joints(model, arm_obj, scale)
 
     mats = _MaterialCollector(model, default_format)
     if arm_obj is not None and "bmd_textures" in arm_obj:
         mats.preload_original_textures(arm_obj, source_file, allow_missing_textures, report)
     for obj in mesh_objs:
-        _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modifiers, context)
+        _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modifiers,
+                            context, limit_weights)
     mats.finish()
     # keep the original shape order: the game addresses shapes and materials by index
     model.meshes.sort(key=lambda m: (m.sort_key, m.order))
@@ -195,10 +198,11 @@ def _eval_mesh(obj, apply_modifiers, context):
     return me, (ev, disabled)
 
 
-def _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modifiers, context):
+def _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modifiers, context,
+                        limit_weights=False):
     me, cleanup = _eval_mesh(obj, apply_modifiers, context)
     try:
-        _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale)
+        _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_weights)
     finally:
         if cleanup:
             ev, disabled = cleanup
@@ -207,7 +211,7 @@ def _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modi
                 m.show_viewport = True
 
 
-def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale):
+def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_weights=False):
     me.calc_loop_triangles()
     nt = len(me.loop_triangles)
     if nt == 0:
@@ -235,6 +239,11 @@ def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale):
         tri_loops = tri_loops[:, [0, 2, 1]]
     pts = co @ M[:3, :3].T + M[:3, 3]
     verts = bc.point_from_blender(pts, scale)
+    base_vertex = len(model.positions) if model.preserve_vertex_order else 0
+    if model.preserve_vertex_order:
+        # All vertices of this object, in their current order.  Groups below reference
+        # them by their global id; the writer must not sort this table.
+        model.positions.extend(verts.tolist())
 
     normals = None
     try:
@@ -298,8 +307,12 @@ def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale):
                 ws[j] = ws.get(j, 0.0) + g.weight
         if not ws:
             ws = {parent_joint if parent_joint is not None else root: 1.0}
-        if len(ws) > 4:
-            ws = dict(sorted(ws.items(), key=lambda kv: -kv[1])[:4])
+        max_weights = 4 if limit_weights else writer.MAX_ENVELOPE_WEIGHTS
+        if len(ws) > max_weights:
+            if not limit_weights:
+                print(f"[BMD] {obj.name}: vertex {i} has more than "
+                      f"{writer.MAX_ENVELOPE_WEIGHTS} influences; clamping")
+            ws = dict(sorted(ws.items(), key=lambda kv: -kv[1])[:max_weights])
         tot = sum(ws.values())
         key = tuple(sorted((j, round(w / tot, 5)) for j, w in ws.items()))
         k = infl_lookup.get(key)
@@ -310,8 +323,34 @@ def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale):
         vert_inf[i] = k
 
     slots = obj.material_slots
-    for mi in np.unique(tri_mat):
-        sel = np.nonzero(tri_mat == mi)[0]
+    merged = me.attributes.get("bmd_node") is not None
+    node_table = []
+    tri_node = None
+    if merged:
+        node_attr = me.attributes.get("bmd_node")
+        try:
+            node_table = json.loads(obj.get("bmd_shape_nodes", "[]"))
+        except Exception:
+            node_table = []
+        if node_attr is not None and node_table:
+            node_values = np.empty(len(me.polygons), np.int32)
+            node_attr.data.foreach_get("value", node_values)
+            poly_index = np.empty(nt, np.int32)
+            me.loop_triangles.foreach_get("polygon_index", poly_index)
+            tri_node = node_values[poly_index]
+        else:
+            merged = False
+
+    if merged:
+        pairs = np.stack([tri_node, tri_mat], 1)
+        groups, group_inv = np.unique(pairs, axis=0, return_inverse=True)
+        work = [(int(n), int(m), np.nonzero(group_inv == gi)[0])
+                for gi, (n, m) in enumerate(groups)]
+    else:
+        work = [(None, int(mi), np.nonzero(tri_mat == mi)[0])
+                for mi in np.unique(tri_mat)]
+
+    for node_id, mi, sel in work:
         mat = slots[mi].material if mi < len(slots) else None
         faces_old = tri_verts[sel]
         used, inv = np.unique(faces_old, return_inverse=True)
@@ -321,6 +360,8 @@ def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale):
         em.vert_influence = vert_inf[used]
         em.influence_sets = infl_sets
         em.faces = inv.reshape(-1, 3).astype(np.int32)
+        if model.preserve_vertex_order:
+            em.vertex_ids = (used + base_vertex).astype(np.int64)
         lp = tri_loops[sel].reshape(-1)
         if normals is not None:
             em.loop_normals = normals[lp]
@@ -329,10 +370,16 @@ def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale):
                 em.loop_colors[c] = colors[c][lp]
         for t, a in uv_layers.items():
             em.loop_uvs[t] = a[lp]
-        em.order = int(obj.get("bmd_order", 1e6 + len(model.meshes)))
-        em.sort_key = int(obj.get("bmd_shape_index", 1e6 + len(model.meshes)))
-        if "bmd_joint" in obj:
-            em.joint = int(obj["bmd_joint"])
+        if merged and 0 <= node_id < len(node_table):
+            info = node_table[node_id]
+            em.joint = int(info[0])
+            em.sort_key = int(info[2])
+            em.order = int(info[3])
+        else:
+            em.order = int(obj.get("bmd_order", 1e6 + len(model.meshes)))
+            em.sort_key = int(obj.get("bmd_shape_index", 1e6 + len(model.meshes)))
+            if "bmd_joint" in obj:
+                em.joint = int(obj["bmd_joint"])
         em.material = mats.index_for(mat, em)
         model.meshes.append(em)
 

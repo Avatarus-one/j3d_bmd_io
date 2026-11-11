@@ -14,6 +14,7 @@ from .model import (HIER_CLOSE, HIER_END, HIER_JOINT, HIER_MATERIAL, HIER_OPEN, 
 _INT_TYPES = {0: "u1", 1: "i1", 2: ">u2", 3: ">i2"}
 MAX_PACKET_MATRICES = 10
 MAX_PRIM_VERTS = 65532  # multiple of 3 below the u16 limit
+MAX_ENVELOPE_WEIGHTS = 255  # EVP1 stores the influence count per envelope as u8
 
 
 class ExportMesh:
@@ -24,6 +25,7 @@ class ExportMesh:
         self.vert_influence = None   # (V,) -> influence_sets
         self.influence_sets = []     # tuples of (joint, weight), normalised
         self.faces = None            # (T,3) indices into verts
+        self.vertex_ids = None       # (V,) global position ids (preserve_vertex_order)
         self.loop_normals = None     # (3T,3)
         self.loop_colors = [None, None]  # (3T,4) 0..1
         self.loop_uvs = [None] * 8   # (3T,2) GX convention
@@ -44,6 +46,9 @@ class ExportModel:
         self.file_tag = b"bmd3"
         # {attr: (comp_count, comp_type, frac_bits)} of the imported file; None = write floats
         self.vtx_formats = None
+        # global position table used by the "single mesh / original order" path
+        self.positions = []
+        self.preserve_vertex_order = False
 
 
 def _build_strips(tri):
@@ -239,12 +244,38 @@ def write(model):
         return u, inv.reshape(-1), fmt, dt
 
     # positions are indexed per *vertex*; the DL indexes per loop through faces
-    pos_u, pos_inv, pos_fmt, pos_dt = uniq_attr(VA_POS, [i["stored"] for i in per_mesh])
-    offs = 0
-    for info in per_mesh:
-        nv = len(info["stored"])
-        info["pos_idx"] = pos_inv[offs:offs + nv]
-        offs += nv
+    if getattr(model, "preserve_vertex_order", False) and len(model.positions):
+        # Keep the exact vertex order of the imported mesh.  Do not use np.unique here:
+        # it would sort the vertices and merge distinct vertices that share coordinates.
+        all_pos = np.asarray(model.positions, np.float64)
+        stored_pos = all_pos.copy()
+        for mesh, vdrw in zip(model.meshes, prepared):
+            ids = mesh.vertex_ids
+            if ids is None:
+                raise J3DError("Vertex order preservation requires vertex ids on every mesh")
+            ids = np.asarray(ids, np.int64)
+            if len(ids) != len(mesh.verts):
+                raise J3DError("Vertex id count does not match the mesh vertex count")
+            for k in np.unique(vdrw):
+                weighted, idx = drws[int(k)]
+                if weighted:
+                    continue
+                m = vdrw == k
+                stored_pos[ids[m]] = (all_pos[ids[m]] @ inv_world[idx][:3, :3].T
+                                      + inv_world[idx][:3, 3])
+        pos_u, pos_fmt, pos_dt = quantize(VA_POS, stored_pos)
+        for mesh, info in zip(model.meshes, per_mesh):
+            ids = np.asarray(mesh.vertex_ids, np.int64)
+            if len(ids) and int(ids.max()) >= len(pos_u):
+                raise J3DError("Vertex id out of range")
+            info["pos_idx"] = ids
+    else:
+        pos_u, pos_inv, pos_fmt, pos_dt = uniq_attr(VA_POS, [i["stored"] for i in per_mesh])
+        offs = 0
+        for info in per_mesh:
+            nv = len(info["stored"])
+            info["pos_idx"] = pos_inv[offs:offs + nv]
+            offs += nv
 
     def collect(attr, key_fn):
         sel = [(i, key_fn(m, i)) for i, m in enumerate(model.meshes)]
@@ -452,6 +483,8 @@ def write(model):
     # ------------------------- EVP1 ----------------------------
     evp = bytearray(b"EVP1") + struct.pack(">IHH", 0, len(envelopes), 0xFFFF)
     if envelopes:
+        if any(len(e) > MAX_ENVELOPE_WEIGHTS for e in envelopes):
+            raise J3DError(f"EVP1 supports at most {MAX_ENVELOPE_WEIGHTS} weights per envelope")
         counts = bytes(len(e) for e in envelopes)
         idx = struct.pack(f">{sum(len(e) for e in envelopes)}H", *[j for e in envelopes for j, _ in e])
         wts = struct.pack(f">{sum(len(e) for e in envelopes)}f", *[w for e in envelopes for _, w in e])

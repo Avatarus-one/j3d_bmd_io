@@ -15,7 +15,8 @@ from .j3d import material as mat3
 from .j3d import model as j3d
 
 
-def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=True, report=None):
+def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=True,
+               report=None, single_mesh=True):
     with open(filepath, "rb") as f:
         raw = f.read()
     bmd = j3d.parse(raw)
@@ -30,8 +31,18 @@ def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=Tru
     bone_names = [b for b in arm_obj["bmd_bone_names"]]
 
     meshes = j3d.extract_meshes(bmd)
-    for k, md in enumerate(meshes):
-        _create_mesh_object(coll, arm_obj, bone_names, bmd, md, materials, base, scale, k)
+    mesh_count = len(meshes)
+    if single_mesh:
+        merged = j3d.merge_meshes(bmd, meshes)
+        if merged is not None:
+            _create_mesh_object(coll, arm_obj, bone_names, bmd, merged, materials,
+                                base, scale, 0, single=True)
+            mesh_count = 1
+        else:
+            mesh_count = 0
+    else:
+        for k, md in enumerate(meshes):
+            _create_mesh_object(coll, arm_obj, bone_names, bmd, md, materials, base, scale, k)
 
     # keep the raw model data that is not editable in Blender
     # texture order matters in-game (texture animations switch textures by index)
@@ -44,8 +55,9 @@ def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=Tru
     arm_obj["bmd_scale"] = float(scale)
     arm_obj["bmd_bone_axis"] = bone_axis
     if report:
-        report({"INFO"}, f"Imported {base}: {len(bmd.joints)} joints, {len(meshes)} meshes, "
-                         f"{len(bmd.materials)} materials, {len(bmd.textures)} textures")
+        report({"INFO"}, f"Imported {base}: {len(bmd.joints)} joints, {mesh_count} mesh"
+                         f"{'' if mesh_count == 1 else 'es'}, {len(bmd.materials)} materials, "
+                         f"{len(bmd.textures)} textures")
     return arm_obj
 
 
@@ -306,7 +318,7 @@ def _create_armature(context, coll, bmd, base, scale, bone_axis):
     joints = bmd.joints
     names = _unique_names(joints)
     arm = bpy.data.armatures.new(base)
-    obj = bpy.data.objects.new(base, arm)
+    obj = bpy.data.objects.new(f"{base}_armature", arm)
     coll.objects.link(obj)
     obj.show_in_front = True
 
@@ -376,8 +388,9 @@ def _create_armature(context, coll, bmd, base, scale, bone_axis):
 # meshes
 # --------------------------------------------------------------------------
 
-def _create_mesh_object(coll, arm_obj, bone_names, bmd, md, materials, base, scale, k):
-    shape_name = f"{base}_shape{md.shape_index:02d}"
+def _create_mesh_object(coll, arm_obj, bone_names, bmd, md, materials, base, scale, k,
+                        single=False):
+    shape_name = base if single else f"{base}_shape{md.shape_index:02d}"
     verts = bc.point_to_blender(md.verts, scale)
     # GX front faces are wound the opposite way to Blender's: flip every triangle and
     # permute the per-corner attributes to match.
@@ -421,15 +434,31 @@ def _create_mesh_object(coll, arm_obj, bone_names, bmd, md, materials, base, sca
         except Exception as exc:
             print(f"[BMD] custom normals failed for {shape_name}: {exc}")
 
-    mat_idx = md.material_index
-    if 0 <= mat_idx < len(materials):
-        me.materials.append(materials[mat_idx])
+    if single:
+        # Keep the original material indices.  The exporter groups faces by the
+        # source shape node, so one material slot per source material is enough.
+        for mat in materials:
+            me.materials.append(mat)
+        if md.face_material is not None and len(md.face_material):
+            me.polygons.foreach_set("material_index", md.face_material.astype(np.int32))
+    else:
+        mat_idx = md.material_index
+        if 0 <= mat_idx < len(materials):
+            me.materials.append(materials[mat_idx])
 
     obj = bpy.data.objects.new(shape_name, me)
     coll.objects.link(obj)
-    obj["bmd_shape_index"] = int(md.shape_index)
-    obj["bmd_joint"] = int(md.joint)
-    obj["bmd_order"] = int(k)
+    if single:
+        # The single mesh keeps the source node number on each face.  The small table
+        # below is only used to restore the shape/joint/material grouping on export.
+        attr = me.attributes.new("bmd_node", "INT", "FACE")
+        attr.data.foreach_set("value", md.face_node.astype(np.int32))
+        obj["bmd_shape_nodes"] = json.dumps(
+            [[int(j), int(m), int(s), i] for i, (j, m, s) in enumerate(bmd.shape_nodes)])
+    else:
+        obj["bmd_shape_index"] = int(md.shape_index)
+        obj["bmd_joint"] = int(md.joint)
+        obj["bmd_order"] = int(k)
     obj.parent = arm_obj
     mod = obj.modifiers.new("Armature", "ARMATURE")
     mod.object = arm_obj

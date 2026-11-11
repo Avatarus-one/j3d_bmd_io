@@ -31,7 +31,10 @@ the ZIP. The operators appear under File -> Import / Export:
 
 ## Models
 1. **Import** with the default scale `0.01` (100 game units = 1 m). You get an armature (one bone per
-   joint), one mesh object per shape (vertex groups + Armature modifier), materials and images.
+   joint), materials and images. **Import as Single Mesh** is enabled by default: you get one mesh
+   object whose vertices keep the original BMD `VTX1` position order (`vertex i` is source position
+   `i`). Disable it to get one mesh object per shape instead. This single-mesh mode is the one to use
+   when another tool addresses vertices by their original index.
 2. Edit meshes / textures. Append new bones rather than re-ordering existing ones.
 3. **Export** with the armature and meshes selected (*Selected Only*) and **Scale = 100** (inverse of
    the import scale).
@@ -39,6 +42,10 @@ the ZIP. The operators appear under File -> Import / Export:
 ### What is preserved
 * Joint order, hierarchy and parameters of unchanged bones, INF1 flags (Maya mode on Uri). Animations
   address joints by index, so the order matters.
+* In **Import as Single Mesh** mode, the original vertex order is kept through a BMD -> Blender ->
+  BMD round trip: exported positions are written in the imported order and distinct vertices that
+  share the same coordinates are no longer merged. Export from that mode also restores the source
+  shape nodes (one shape per original INF1 node) using a small per-face node index.
 * **All** textures in their original order with wrap / filter / LOD settings, including textures no
   material uses (e.g. eye textures swapped by texture animations). Duplicate names are allowed.
 * The complete material block (TEV stages, colour channels, texture matrices, fog, blend ...) is kept
@@ -138,8 +145,10 @@ matching collision mesh.
 ## Known limitations
 * No TEV shading in Blender; the Blender materials are only a preview.
 * Joint scales other than 1 are exact only for unchanged bones.
-* At most 4 bone weights per vertex. Shapes are written as triangle lists (no strips), so files are
-  larger than the originals. MDL3 (BDL display lists) is not written.
+* By default all bone influences are preserved (the BMD `EVP1` limit is 255 per vertex). Enable
+  **Limit 4 Weights per Vertex** on export to cap skinning at 4 influences, which may be required by
+  engines that assume standard 4-bone skinning. Shapes are written as triangle lists (no strips), so
+  files are larger than the originals. MDL3 (BDL display lists) is not written.
 * Only `bck` (joint animations) is supported, not `btk` / `btp` / `bpk` / `brk` / `bca`.
 * Not tested in a real Blender session: the `bpy` layer was exercised with a mock, the J3D code against
   the real files. Please report API errors with the console output.

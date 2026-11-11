@@ -31,6 +31,17 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
                          description="Blender units per J3D unit (use the inverse value when exporting)")
     bone_axis: EnumProperty(name="Bone Orientation", items=bc.BONE_AXIS_ITEMS, default="X")
     import_textures: BoolProperty(name="Import Textures", default=True)
+    single_mesh: BoolProperty(
+        name="Import as Single Mesh", default=True,
+        description="Import all shapes into one mesh; vertices keep the original BMD VTX1 order")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop(self, "scale")
+        layout.prop(self, "bone_axis")
+        layout.prop(self, "import_textures")
+        layout.prop(self, "single_mesh")
 
     def execute(self, context):
         from . import blender_import
@@ -43,7 +54,8 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
         for p in paths:
             try:
                 blender_import.import_bmd(context, p, self.scale, self.bone_axis,
-                                          self.import_textures, self.report)
+                                          self.import_textures, report=self.report,
+                                          single_mesh=self.single_mesh)
             except J3DError as exc:
                 self.report({"ERROR"}, f"{os.path.basename(p)}: {exc}")
                 return {"CANCELLED"}
@@ -76,9 +88,26 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
     keep_vertex_formats: BoolProperty(name="Keep Original Vertex Formats", default=True,
                                       description="Encode normals / UVs / positions like the imported "
                                                   "file (e.g. 16-bit) instead of 32-bit floats")
+    limit_weights: BoolProperty(
+        name="Limit 4 Weights per Vertex", default=False,
+        description="Limit exported vertices to 4 bone influences. Leave off to preserve all "
+                    "influences (BMD EVP1 supports up to 255 weights per vertex); more than 4 may "
+                    "not work in engines that assume standard 4-bone skinning")
     allow_missing_textures: BoolProperty(name="Allow Missing Textures", default=False,
                                          description="Export even if textures of the imported model "
                                                      "are gone (shifts texture indices!)")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop(self, "scale")
+        layout.prop(self, "use_selection")
+        layout.prop(self, "apply_modifiers")
+        layout.prop(self, "default_format")
+        layout.prop(self, "source_file")
+        layout.prop(self, "keep_vertex_formats")
+        layout.prop(self, "limit_weights")
+        layout.prop(self, "allow_missing_textures")
 
     def execute(self, context):
         from . import blender_export
@@ -87,7 +116,7 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
             blender_export.export_bmd(context, self.filepath, self.scale, self.use_selection,
                                       self.apply_modifiers, self.default_format, self.source_file,
                                       self.allow_missing_textures, self.keep_vertex_formats,
-                                      self.report)
+                                      self.report, self.limit_weights)
         except (blender_export.ExportError, J3DError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
