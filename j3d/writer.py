@@ -27,6 +27,7 @@ class ExportMesh:
         self.faces = None            # (T,3) indices into verts
         self.vertex_ids = None       # (V,) global position ids (preserve_vertex_order)
         self.loop_normals = None     # (3T,3)
+        self.loop_normal_indices = None  # (3T,) indices into the global normal array
         self.loop_colors = [None, None]  # (3T,4) 0..1
         self.loop_uvs = [None] * 8   # (3T,2) GX convention
         self.sort_key = 0            # export order of shapes (original shape index)
@@ -49,8 +50,14 @@ class ExportModel:
         # global position table used by the "single mesh / original order" path
         self.positions = []
         self.preserve_vertex_order = False
-        # BMD-Optimizer-compatible position compression (s16 when it fits)
-        self.optimize_positions = False
+        # Explicit per-attribute format overrides.  None/AUTO keeps the imported
+        # format (or float32 when there is no imported format).
+        #   (component_count, GX type, fraction) or "OPTIMIZE" for positions
+        self.format_overrides = {}
+        # Size of the canonical (vertex, normal) table used by the exporter.
+        self.normal_count = 0
+        # Formats actually written: {attr: (component_count, type, fraction)}
+        self.exported_formats = {}
 
 
 def _build_strips(tri):
@@ -228,23 +235,38 @@ def write(model):
         per_mesh.append(info)
 
     def quantize(attr, arr):
-        """Encode an array like the imported file did (e.g. s16 / 14 frac bits) if it fits."""
-        if attr == VA_POS and getattr(model, "optimize_positions", False):
-            values = np.asarray(arr, np.float64)
+        """Encode one attribute using its explicit override or imported format."""
+        default_cnt = 0 if attr == VA_NRM else 1
+        override = (getattr(model, "format_overrides", None) or {}).get(attr)
 
-            if values.size and np.isfinite(values).all():
-                # BMD-Optimizer compression: use signed 16-bit positions with
-                # the largest fraction (at most 6) that does not overflow.
-                # Unlike the original tool made by Yoshi2, this never clamps
-                # coordinates.
-                for fraction in range(6, -1, -1):
-                    q = np.rint(values * float(1 << fraction))
-                    if q.min() >= -32768 and q.max() <= 32767:
-                        return q.astype(np.int64), (1, 3, fraction), ">i2"
-                print("[BMD] Optimize BMD skipped: positions exceed the s16 range")
+        if override == "OPTIMIZE":
+            if attr == VA_POS:
+                values = np.asarray(arr, np.float64)
+
+                if values.size and np.isfinite(values).all():
+                    # BMD-Optimizer compression: use signed 16-bit positions with
+                    # the largest fraction (at most 6) that does not overflow.
+                    # Unlike the original tool made by Yoshi2, this never clamps
+                    # coordinates.
+                    for fraction in range(6, -1, -1):
+                        q = np.rint(values * float(1 << fraction))
+                        if q.min() >= -32768 and q.max() <= 32767:
+                            return q.astype(np.int64), (1, 3, fraction), ">i2"
+                    print("[BMD] Optimize Positions skipped: positions exceed the s16 range")
+            override = None
+
+        if override is not None:
+            cnt, typ, frac = override
+            if typ in _INT_TYPES:
+                dt = _INT_TYPES[typ]
+                info = np.iinfo(np.dtype(dt))
+                q = np.rint(np.asarray(arr, np.float64) * float(1 << frac))
+                if len(q) == 0 or (q.min() >= info.min - 1 and q.max() <= info.max + 1):
+                    q = np.clip(q, info.min, info.max)
+                    return q.astype(np.int64), (cnt, typ, frac), dt
+            return np.asarray(arr, np.float32), (cnt, 4, 0), ">f4"
 
         fmt = (model.vtx_formats or {}).get(attr)
-        default_cnt = 0 if attr == VA_NRM else 1
         if fmt and fmt[1] in _INT_TYPES:
             dt = _INT_TYPES[fmt[1]]
             info = np.iinfo(np.dtype(dt))
@@ -305,7 +327,48 @@ def write(model):
             o += len(a)
         return u, res, fmt, dt
 
-    nrm = collect(VA_NRM, lambda m, i: per_mesh[i].get("normals"))
+    def preserved_normals():
+        """Write normals at their canonical indices instead of sorting them.
+
+        ``np.unique`` would reorder and merge the normal array, which invalidates
+        the destination indices written by the BLS exporter.  The Blender export
+        layer supplies the same (vertex, normal) layout that the BLS exporter
+        computes independently.
+        """
+        sel = [i for i, info in enumerate(per_mesh) if info.get("normals") is not None]
+        if not sel:
+            return None
+        indices = []
+        for i in sel:
+            idx = getattr(model.meshes[i], "loop_normal_indices", None)
+            if idx is None:
+                return None
+            idx = np.asarray(idx, np.int64).reshape(-1)
+            if len(idx) != len(per_mesh[i]["normals"]):
+                return None
+            if len(idx) and (int(idx.min()) < 0 or int(idx.max()) > 0xFFFF):
+                return None
+            indices.append(idx)
+        count = int(getattr(model, "normal_count", 0))
+        count = max([count] + [int(a.max()) + 1 for a in indices if len(a)])
+        if count <= 0 or count > 0x10000:
+            return None
+        table = np.zeros((count, 3), np.float32)
+        assigned = np.zeros(count, bool)
+        res = {}
+        for i, idx in zip(sel, indices):
+            vals = per_mesh[i]["normals"]
+            uniq, first = np.unique(idx, return_index=True)
+            keep = ~assigned[uniq]
+            table[uniq[keep]] = vals[first[keep]]
+            assigned[uniq[keep]] = True
+            res[i] = idx
+        u, fmt, dt = quantize(VA_NRM, table)
+        return u, res, fmt, dt
+
+    nrm = preserved_normals()
+    if nrm is None:
+        nrm = collect(VA_NRM, lambda m, i: per_mesh[i].get("normals"))
     cols = []
     for c in range(2):
         sel = [(i, m.loop_colors[c]) for i, m in enumerate(model.meshes) if m.loop_colors[c] is not None]
@@ -495,6 +558,8 @@ def write(model):
     pad_to(chunk, 32)
     struct.pack_into(">I", chunk, 4, len(chunk))
     vtx_chunk = bytes(chunk)
+    model.exported_formats = {
+        a: (c, ty, fr) for _slot, a, c, ty, fr, _raw in arrays}
 
     # ------------------------- EVP1 ----------------------------
     evp = bytearray(b"EVP1") + struct.pack(">IHH", 0, len(envelopes), 0xFFFF)

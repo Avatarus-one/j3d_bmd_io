@@ -402,7 +402,6 @@ def _create_mesh_object(coll, arm_obj, bone_names, bmd, md, materials, base, sca
     me = bpy.data.meshes.new(shape_name)
     me.from_pydata(verts.tolist(), [], faces.tolist())
     me.update()
-    n_loops = len(faces) * 3
 
     # smooth shading so custom normals take effect
     try:

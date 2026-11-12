@@ -20,10 +20,50 @@ class ExportError(Exception):
     pass
 
 
+def _natural_normal_layout(me):
+    """Build the canonical normal index of every mesh corner.
+
+    The layout groups corners by (vertex, normal) and is derived only from the
+    Blender mesh.  The BLS exporter implements the same algorithm independently,
+    so a BMD and a BLS exported from the same mesh address the same normal array
+    without sharing metadata.
+    """
+    count = len(me.loops)
+    if not count:
+        return np.zeros(0, np.int32), 0
+    raw = np.empty(count * 3, np.float32)
+    me.corner_normals.foreach_get("vector", raw)
+    normals = np.round(raw.reshape(-1, 3).astype(np.float64), 6)
+    verts = np.empty(count, np.int32)
+    me.loops.foreach_get("vertex_index", verts)
+    keys = np.empty((count, 4), np.float64)
+    keys[:, 0] = verts
+    keys[:, 1:] = normals
+    unique, inverse = np.unique(keys, axis=0, return_inverse=True)
+    return inverse.reshape(-1).astype(np.int32), len(unique)
+
+
+def _format_override(choice, components, fraction):
+    """Translate a UI format choice into a writer override."""
+    if choice == "AUTO":
+        return None
+    if choice == "F32":
+        return (components, 4, 0)
+    if choice == "S16":
+        return (components, 3, int(fraction))
+    if choice == "S16_OPT":
+        return "OPTIMIZE"
+    if choice.startswith("S16_"):
+        return (components, 3, int(choice[4:]))
+    return None
+
+
 def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifiers=False,
                default_format="AUTO", source_file="", allow_missing_textures=False,
                keep_vertex_formats=True, report=None, limit_weights=False,
-               optimize_bmd=False):
+               optimize_bmd=False, bls_compatible=False,
+               position_format="AUTO", normal_format="AUTO", uv_format="AUTO",
+               position_frac=6, normal_frac=14, uv_frac=14):
     scene_objs = context.selected_objects if use_selection else [
         o for o in context.scene.objects if o.visible_get()]
     mesh_objs = [o for o in scene_objs if o.type == "MESH"]
@@ -41,7 +81,28 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
 
     mesh_objs.sort(key=lambda o: (o.get("bmd_shape_index", 1e9), o.get("bmd_order", 1e9), o.name))
     model = writer.ExportModel()
-    model.optimize_positions = bool(optimize_bmd)
+
+    # Backwards-compatible shortcuts for callers of the old API.
+    if optimize_bmd and position_format == "AUTO":
+        position_format = "S16_OPT"
+    if bls_compatible:
+        position_format = "F32"
+        normal_format = "F32"
+
+    model.format_overrides = {
+        j3d.VA_POS: _format_override(position_format, 1, position_frac),
+        j3d.VA_NRM: _format_override(normal_format, 0, normal_frac),
+    }
+    uv_override = _format_override(uv_format, 1, uv_frac)
+    for t in range(8):
+        model.format_overrides[j3d.VA_TEX0 + t] = uv_override
+
+    if optimize_bmd:
+        model.format_overrides[j3d.VA_POS] = "OPTIMIZE"
+    if bls_compatible:
+        model.format_overrides[j3d.VA_POS] = (1, 4, 0)
+        model.format_overrides[j3d.VA_NRM] = (0, 4, 0)
+
     model.preserve_vertex_order = any(
         o.data is not None and o.data.attributes.get("bmd_node") is not None for o in mesh_objs)
     bone_index = _build_joints(model, arm_obj, scale)
@@ -64,6 +125,14 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
         if sv:
             model.sub_version = bytes.fromhex(sv)
     data = writer.write(model)
+    exported_formats = {
+        str(attr): [components, typ, frac]
+        for attr, (components, typ, frac) in getattr(model, "exported_formats", {}).items()
+    }
+    if exported_formats:
+        serialized = json.dumps(exported_formats, separators=(",", ":"))
+        for obj in mesh_objs:
+            obj["bmd_export_formats"] = serialized
     with open(filepath, "wb") as f:
         f.write(data)
     if report:
@@ -260,6 +329,14 @@ def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_we
     except Exception as exc:
         print(f"[BMD] could not read normals of {obj.name}: {exc}")
 
+    normal_indices = None
+    if normals is not None:
+        normal_indices, natural_count = _natural_normal_layout(me)
+        # Each object owns a separate slice of the global normal array; objects
+        # are exported one after another, so their local indices must not collide.
+        normal_indices = normal_indices + model.normal_count
+        model.normal_count += natural_count
+
     # UV layers -> GX texcoord sets
     uv_layers = {}
     for i, layer in enumerate(me.uv_layers):
@@ -367,6 +444,8 @@ def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_we
         lp = tri_loops[sel].reshape(-1)
         if normals is not None:
             em.loop_normals = normals[lp]
+            if normal_indices is not None:
+                em.loop_normal_indices = normal_indices[lp]
         for c in range(2):
             if colors[c] is not None:
                 em.loop_colors[c] = colors[c][lp]

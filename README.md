@@ -47,6 +47,9 @@ the ZIP. The operators appear under File -> Import / Export:
   BMD round trip: exported positions are written in the imported order and distinct vertices that
   share the same coordinates are no longer merged. Export from that mode also restores the source
   shape nodes (one shape per original INF1 node) using a small per-face node index.
+* Normals use a canonical layout instead of being globally sorted. Every corner
+  is addressed by its `(vertex, normal)` pair, so the normal array keeps a
+  stable order and index.
 * **All** textures in their original order with wrap / filter / LOD settings, including textures no
   material uses (e.g. eye textures swapped by texture animations). Duplicate names are allowed.
 * The complete material block (TEV stages, colour channels, texture matrices, fog, blend ...) is kept
@@ -69,19 +72,50 @@ tools: all rigid entries first, then one weighted entry per envelope in order, t
 envelopes once more as filler. Every export is checked against these rules before it is written
 (`validate_engine_layout`); an export that would crash the game raises an error instead.
 
-### Output format
-To stay as close as possible to what the game's own tools produce, the exporter writes normals / UVs /
-positions in the encoding of the imported file (e.g. 16-bit normals with 14 fraction bits; switch off
-with *Keep Original Vertex Formats*), uses triangle **strips** only, stores shape bounds in model
-space (radius measured from the origin) and puts a bounding box on the root joint only.
+### Vertex formats
+Positions, normals and UVs have separate dropdowns with two choices each: **Float32** and **s16**.
+When **s16** is selected, a **Fraction** field appears next to it.
 
-### Optimize BMD
-Enable **Optimize BMD** to compress exported positions to signed 16-bit values, in the style of
-BMD-Optimizer by Yoshi2. The exporter selects the largest fraction (up to 6) that keeps every
-coordinate in the s16 range, so coordinates are never silently clamped. If the model is too large for
-s16, the exporter falls back to the normal vertex format instead of corrupting or distorting the file.
-Unlike the standalone tool this replaces, it works in memory, is safe for already-compressed input,
-supports all vertex attributes, and never rewrites the source file.
+When the export dialog opens, the lists are preselected from:
+
+1. the formats of the last successful export of the selected mesh;
+2. otherwise, the formats of the imported BMD;
+3. otherwise, Float32 for a new mesh.
+
+The fraction is restored together with the format. This means an imported BMD exports with its
+original arrays by default, while a new mesh defaults to float32.
+
+**Positions**
+
+| Option | Format |
+| --- | --- |
+| Float32 | float32 |
+| s16 | signed 16-bit; fraction defaults to 6 |
+
+s16 positions are not compatible with BLS: `J3DDeformer` only deforms float32 positions. If the
+coordinates do not fit the selected fraction, the exporter falls back to float32 for that array.
+
+**Normals**
+
+| Option | Format |
+| --- | --- |
+| Float32 | float32 |
+| s16 | signed 16-bit; fraction defaults to 14 |
+
+BLS normal deformation additionally requires float32 normals; positions can still deform with s16
+normals.
+
+**UVs**
+
+| Option | Format |
+| --- | --- |
+| Float32 | float32 |
+| s16 | signed 16-bit; fraction defaults to 14 |
+
+The UV choice applies to every UV set in the mesh. Colors are always written as `u8` (`RGBA8`).
+
+The exporter still uses triangle **strips** only, stores shape bounds in model space (radius measured
+from the origin) and puts a bounding box on the root joint only.
 
 ## Textures and HD texture packs
 The importer stores the original encoded texture bytes (all mips, palettes) on each image. On export,
@@ -152,6 +186,11 @@ matching collision mesh.
   winding defines the face normal, so make sure floors face upwards.
 
 ## Known limitations
+* **BLS compatibility:** BMD export does not preserve the original normal index table. Original BLS
+  shape keys that address the old normal indices are not remapped after a BMD re-export. They may
+  stop working or produce incorrect normals; rebuild the BLS data from the updated mesh after
+  modifying the BMD. Conversely, BLS data rebuilt from Blender targets the canonical normal layout
+  of the exported BMD and is not guaranteed to match the original BMD's normal indices.
 * No TEV shading in Blender; the Blender materials are only a preview.
 * Joint scales other than 1 are exact only for unchanged bones.
 * By default all bone influences are preserved (the BMD `EVP1` limit is 255 per vertex). Enable

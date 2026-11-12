@@ -1,5 +1,6 @@
 """J3D BMD Import/Export for Blender (Zelda: Twilight Princess / Dusklight)."""
 
+import json
 import os
 
 import bpy
@@ -14,6 +15,95 @@ from . import blender_common as bc
 def blender_anim_items():
     from .blender_anim import LOOP_ITEMS
     return LOOP_ITEMS
+
+
+def _target_armature(obj):
+    if obj is None:
+        return None
+    if obj.parent is not None and obj.parent.type == "ARMATURE":
+        return obj.parent
+    for mod in obj.modifiers:
+        if mod.type == "ARMATURE" and mod.object is not None:
+            return mod.object
+    return None
+
+
+def _decode_vtx_formats(raw):
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+        return {int(attr): tuple(fmt) for attr, fmt in value.items()}
+    except (TypeError, ValueError, AttributeError):
+        return {}
+
+
+def _detect_vertex_formats(context):
+    """Find formats of the last successful export, then of the imported BMD."""
+    preferred = []
+    active = context.active_object
+    if active is not None:
+        preferred.append(active)
+    for obj in context.selected_objects:
+        if obj not in preferred:
+            preferred.append(obj)
+
+    # 1. Formats remembered from a previous successful export.
+    for obj in preferred:
+        if obj.type == "MESH":
+            raw = obj.get("bmd_export_formats")
+            if raw:
+                formats = _decode_vtx_formats(raw)
+                if formats:
+                    return formats
+
+    # 2. Formats of the imported BMD (stored on the armature).
+    for obj in preferred:
+        if obj.type == "ARMATURE":
+            raw = obj.get("bmd_vtx_formats")
+            if raw:
+                formats = _decode_vtx_formats(raw)
+                if formats:
+                    return formats
+
+    # 3. Imported BMD formats through the armature of a selected mesh.
+    for obj in preferred:
+        if obj.type == "MESH":
+            armature = _target_armature(obj)
+            if armature is not None:
+                raw = armature.get("bmd_vtx_formats")
+                if raw:
+                    formats = _decode_vtx_formats(raw)
+                    if formats:
+                        return formats
+
+    # 4. Nothing selected: use the scene's single remembered export, or its
+    #    single imported model.  This covers file-menu invocation with a lost
+    #    selection.
+    meshes = [
+        obj for obj in context.scene.objects
+        if obj.type == "MESH" and obj.get("bmd_export_formats")]
+    if len(meshes) == 1:
+        formats = _decode_vtx_formats(meshes[0].get("bmd_export_formats"))
+        if formats:
+            return formats
+
+    armatures = [
+        obj for obj in context.scene.objects
+        if obj.type == "ARMATURE" and obj.get("bmd_vtx_formats")]
+    if len(armatures) == 1:
+        formats = _decode_vtx_formats(armatures[0].get("bmd_vtx_formats"))
+        if formats:
+            return formats
+
+    return {}
+
+
+def _format_choice(fmt, default_frac):
+    if not fmt:
+        return "F32", default_frac
+    _components, typ, frac = fmt
+    if typ == 3:
+        return "S16", int(frac)
+    return "F32", default_frac
 
 
 class IMPORT_OT_bmd(Operator, ImportHelper):
@@ -88,22 +178,62 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
                                 description="Path of the file this model was imported from. Only needed "
                                             "when the path remembered at import no longer exists; used "
                                             "to restore textures that are gone from Blender")
-    keep_vertex_formats: BoolProperty(name="Keep Original Vertex Formats", default=True,
-                                      description="Encode normals / UVs / positions like the imported "
-                                                  "file (e.g. 16-bit) instead of 32-bit floats")
+    position_format: EnumProperty(
+        name="Positions",
+        items=[
+            ("F32", "Float32", "Write positions as float32"),
+            ("S16", "s16", "Write positions as signed 16-bit"),
+        ],
+        default="F32")
+    position_frac: IntProperty(
+        name="Fraction", default=6, min=0, max=15,
+        description="Fraction bits for 16-bit positions")
+    normal_format: EnumProperty(
+        name="Normals",
+        items=[
+            ("F32", "Float32", "Write normals as float32"),
+            ("S16", "s16", "Write normals as signed 16-bit"),
+        ],
+        default="F32")
+    normal_frac: IntProperty(
+        name="Fraction", default=14, min=0, max=15,
+        description="Fraction bits for 16-bit normals")
+    uv_format: EnumProperty(
+        name="UVs",
+        items=[
+            ("F32", "Float32", "Write UVs as float32"),
+            ("S16", "s16", "Write UVs as signed 16-bit"),
+        ],
+        default="F32")
+    uv_frac: IntProperty(
+        name="Fraction", default=14, min=0, max=15,
+        description="Fraction bits for 16-bit UVs")
     limit_weights: BoolProperty(
         name="Limit 4 Weights per Vertex", default=False,
         description="Limit exported vertices to 4 bone influences. Leave off to preserve all "
                     "influences (BMD EVP1 supports up to 255 weights per vertex); more than 4 may "
                     "not work in engines that assume standard 4-bone skinning")
-    optimize_bmd: BoolProperty(
-        name="Optimize BMD", default=False,
-        description="Compress positions to signed 16-bit values with the largest safe "
-                    "fraction (Yoshi2's BMD-Optimizer style). Falls back to floats when the "
-                    "coordinates do not fit")
     allow_missing_textures: BoolProperty(name="Allow Missing Textures", default=False,
                                          description="Export even if textures of the imported model "
                                                      "are gone (shifts texture indices!)")
+
+    def _apply_detected_formats(self, context):
+        formats = _detect_vertex_formats(context)
+        self.position_format, self.position_frac = _format_choice(
+            formats.get(9), self.position_frac)
+        self.normal_format, self.normal_frac = _format_choice(
+            formats.get(10), self.normal_frac)
+        uv_attr = next((attr for attr in range(13, 21) if attr in formats), 13)
+        self.uv_format, self.uv_frac = _format_choice(
+            formats.get(uv_attr), self.uv_frac)
+
+    def invoke(self, context, _event):
+        self._apply_detected_formats(context)
+        result = ExportHelper.invoke(self, context, _event)
+        # File-select operators can restore their last-used properties while
+        # opening; apply the detected formats once more before the panel draws.
+        self._apply_detected_formats(context)
+        return result
 
     def draw(self, context):
         layout = self.layout
@@ -113,20 +243,35 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
         layout.prop(self, "apply_modifiers")
         layout.prop(self, "default_format")
         layout.prop(self, "source_file")
-        layout.prop(self, "keep_vertex_formats")
         layout.prop(self, "limit_weights")
-        layout.prop(self, "optimize_bmd")
         layout.prop(self, "allow_missing_textures")
+
+        formats = layout.box()
+        formats.label(text="Vertex Formats", icon="MESH_DATA")
+        formats.prop(self, "position_format")
+        if self.position_format == "S16":
+            formats.prop(self, "position_frac")
+            formats.label(text="16-bit positions: BLS blend shapes will not deform",
+                          icon="ERROR")
+        formats.prop(self, "normal_format")
+        if self.normal_format == "S16":
+            formats.prop(self, "normal_frac")
+        formats.prop(self, "uv_format")
+        if self.uv_format == "S16":
+            formats.prop(self, "uv_frac")
 
     def execute(self, context):
         from . import blender_export
         from .j3d.common import J3DError
         scale = 100.0 if self.convert_units else 1.0
         try:
-            blender_export.export_bmd(context, self.filepath, scale, self.use_selection,
-                                      self.apply_modifiers, self.default_format, self.source_file,
-                                      self.allow_missing_textures, self.keep_vertex_formats,
-                                      self.report, self.limit_weights, self.optimize_bmd)
+            blender_export.export_bmd(
+                context, self.filepath, scale, self.use_selection,
+                self.apply_modifiers, self.default_format, self.source_file,
+                self.allow_missing_textures, True,
+                self.report, self.limit_weights, False, False,
+                self.position_format, self.normal_format, self.uv_format,
+                self.position_frac, self.normal_frac, self.uv_frac)
         except (blender_export.ExportError, J3DError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
