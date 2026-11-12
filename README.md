@@ -30,14 +30,15 @@ the ZIP. The operators appear under File -> Import / Export:
 *J3D Model (.bmd)* and *J3D Animation (.bck)*. Files can also be dragged into the viewport.
 
 ## Models
-1. **Import** with the default scale `0.01` (100 game units = 1 m). You get an armature (one bone per
-   joint), materials and images. **Import as Single Mesh** is enabled by default: you get one mesh
-   object whose vertices keep the original BMD `VTX1` position order (`vertex i` is source position
-   `i`). Disable it to get one mesh object per shape instead. This single-mesh mode is the one to use
-   when another tool addresses vertices by their original index.
+1. **Import** with **Convert Units** enabled (default): the model is scaled to
+   `0.01` (100 J3D units = 1 m). You get an armature (one bone per joint),
+   materials and images. 
+   **Import as Single Mesh** is enabled by default: you get one mesh object whose 
+   vertices keep the original BMD `VTX1` position order (`vertex i` is source 
+   position `i`).
 2. Edit meshes / textures. Append new bones rather than re-ordering existing ones.
-3. **Export** with the armature and meshes selected (*Selected Only*) and **Scale = 100** (inverse of
-   the import scale).
+3. **Export** with the armature and meshes selected (*Selected Only*). **Convert
+   Units** is enabled by default and writes J3D units back (`100`).
 
 ### What is preserved
 * Joint order, hierarchy and parameters of unchanged bones, INF1 flags (Maya mode on Uri). Animations

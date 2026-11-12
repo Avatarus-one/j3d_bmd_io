@@ -27,8 +27,9 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
     files: CollectionProperty(type=OperatorFileListElement, options={"HIDDEN", "SKIP_SAVE"})
     directory: StringProperty(subtype="DIR_PATH", options={"HIDDEN"})
 
-    scale: FloatProperty(name="Scale", default=0.01, min=1e-6, soft_max=10.0, precision=4,
-                         description="Blender units per J3D unit (use the inverse value when exporting)")
+    convert_units: BoolProperty(
+        name="Convert Units", default=True,
+        description="Convert J3D model units to Blender units (scale 0.01). ")
     bone_axis: EnumProperty(name="Bone Orientation", items=bc.BONE_AXIS_ITEMS, default="X")
     import_textures: BoolProperty(name="Import Textures", default=True)
     single_mesh: BoolProperty(
@@ -38,7 +39,7 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
     def draw(self, context):
         layout = self.layout
         layout.use_property_split = True
-        layout.prop(self, "scale")
+        layout.prop(self, "convert_units")
         layout.prop(self, "bone_axis")
         layout.prop(self, "import_textures")
         layout.prop(self, "single_mesh")
@@ -46,6 +47,7 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
     def execute(self, context):
         from . import blender_import
         from .j3d.common import J3DError
+        scale = 0.01 if self.convert_units else 1.0
         paths = []
         if self.files:
             paths = [os.path.join(self.directory, f.name) for f in self.files]
@@ -53,7 +55,7 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
             paths = [self.filepath]
         for p in paths:
             try:
-                blender_import.import_bmd(context, p, self.scale, self.bone_axis,
+                blender_import.import_bmd(context, p, scale, self.bone_axis,
                                           self.import_textures, report=self.report,
                                           single_mesh=self.single_mesh)
             except J3DError as exc:
@@ -71,8 +73,9 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
     filename_ext = ".bmd"
     filter_glob: StringProperty(default="*.bmd", options={"HIDDEN"})
 
-    scale: FloatProperty(name="Scale", default=100.0, min=1e-6, soft_max=1000.0, precision=3,
-                         description="J3D units per Blender unit (inverse of the import scale)")
+    convert_units: BoolProperty(
+        name="Convert Units", default=True,
+        description="Convert Blender units to J3D model units (scale 100). ")
     use_selection: BoolProperty(name="Selected Only", default=True,
                                 description="Export only selected objects (select the armature and meshes)")
     apply_modifiers: BoolProperty(name="Apply Modifiers", default=False,
@@ -100,7 +103,7 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
     def draw(self, context):
         layout = self.layout
         layout.use_property_split = True
-        layout.prop(self, "scale")
+        layout.prop(self, "convert_units")
         layout.prop(self, "use_selection")
         layout.prop(self, "apply_modifiers")
         layout.prop(self, "default_format")
@@ -112,8 +115,9 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
     def execute(self, context):
         from . import blender_export
         from .j3d.common import J3DError
+        scale = 100.0 if self.convert_units else 1.0
         try:
-            blender_export.export_bmd(context, self.filepath, self.scale, self.use_selection,
+            blender_export.export_bmd(context, self.filepath, scale, self.use_selection,
                                       self.apply_modifiers, self.default_format, self.source_file,
                                       self.allow_missing_textures, self.keep_vertex_formats,
                                       self.report, self.limit_weights)
