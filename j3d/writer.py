@@ -49,6 +49,8 @@ class ExportModel:
         # global position table used by the "single mesh / original order" path
         self.positions = []
         self.preserve_vertex_order = False
+        # BMD-Optimizer-compatible position compression (s16 when it fits)
+        self.optimize_positions = False
 
 
 def _build_strips(tri):
@@ -227,6 +229,20 @@ def write(model):
 
     def quantize(attr, arr):
         """Encode an array like the imported file did (e.g. s16 / 14 frac bits) if it fits."""
+        if attr == VA_POS and getattr(model, "optimize_positions", False):
+            values = np.asarray(arr, np.float64)
+
+            if values.size and np.isfinite(values).all():
+                # BMD-Optimizer compression: use signed 16-bit positions with
+                # the largest fraction (at most 6) that does not overflow.
+                # Unlike the original tool made by Yoshi2, this never clamps
+                # coordinates.
+                for fraction in range(6, -1, -1):
+                    q = np.rint(values * float(1 << fraction))
+                    if q.min() >= -32768 and q.max() <= 32767:
+                        return q.astype(np.int64), (1, 3, fraction), ">i2"
+                print("[BMD] Optimize BMD skipped: positions exceed the s16 range")
+
         fmt = (model.vtx_formats or {}).get(attr)
         default_cnt = 0 if attr == VA_NRM else 1
         if fmt and fmt[1] in _INT_TYPES:

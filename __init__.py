@@ -96,6 +96,11 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
         description="Limit exported vertices to 4 bone influences. Leave off to preserve all "
                     "influences (BMD EVP1 supports up to 255 weights per vertex); more than 4 may "
                     "not work in engines that assume standard 4-bone skinning")
+    optimize_bmd: BoolProperty(
+        name="Optimize BMD", default=False,
+        description="Compress positions to signed 16-bit values with the largest safe "
+                    "fraction (Yoshi2's BMD-Optimizer style). Falls back to floats when the "
+                    "coordinates do not fit")
     allow_missing_textures: BoolProperty(name="Allow Missing Textures", default=False,
                                          description="Export even if textures of the imported model "
                                                      "are gone (shifts texture indices!)")
@@ -110,6 +115,7 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
         layout.prop(self, "source_file")
         layout.prop(self, "keep_vertex_formats")
         layout.prop(self, "limit_weights")
+        layout.prop(self, "optimize_bmd")
         layout.prop(self, "allow_missing_textures")
 
     def execute(self, context):
@@ -120,7 +126,7 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
             blender_export.export_bmd(context, self.filepath, scale, self.use_selection,
                                       self.apply_modifiers, self.default_format, self.source_file,
                                       self.allow_missing_textures, self.keep_vertex_formats,
-                                      self.report, self.limit_weights)
+                                      self.report, self.limit_weights, self.optimize_bmd)
         except (blender_export.ExportError, J3DError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}

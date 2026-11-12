@@ -75,6 +75,14 @@ positions in the encoding of the imported file (e.g. 16-bit normals with 14 frac
 with *Keep Original Vertex Formats*), uses triangle **strips** only, stores shape bounds in model
 space (radius measured from the origin) and puts a bounding box on the root joint only.
 
+### Optimize BMD
+Enable **Optimize BMD** to compress exported positions to signed 16-bit values, in the style of
+BMD-Optimizer by Yoshi2. The exporter selects the largest fraction (up to 6) that keeps every
+coordinate in the s16 range, so coordinates are never silently clamped. If the model is too large for
+s16, the exporter falls back to the normal vertex format instead of corrupting or distorting the file.
+Unlike the standalone tool this replaces, it works in memory, is safe for already-compressed input,
+supports all vertex attributes, and never rewrites the source file.
+
 ## Textures and HD texture packs
 The importer stores the original encoded texture bytes (all mips, palettes) on each image. On export,
 images that still match the imported pixels are written back **byte-identically**, so texture packs

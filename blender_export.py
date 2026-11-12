@@ -22,7 +22,8 @@ class ExportError(Exception):
 
 def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifiers=False,
                default_format="AUTO", source_file="", allow_missing_textures=False,
-               keep_vertex_formats=True, report=None, limit_weights=False):
+               keep_vertex_formats=True, report=None, limit_weights=False,
+               optimize_bmd=False):
     scene_objs = context.selected_objects if use_selection else [
         o for o in context.scene.objects if o.visible_get()]
     mesh_objs = [o for o in scene_objs if o.type == "MESH"]
@@ -40,6 +41,7 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
 
     mesh_objs.sort(key=lambda o: (o.get("bmd_shape_index", 1e9), o.get("bmd_order", 1e9), o.name))
     model = writer.ExportModel()
+    model.optimize_positions = bool(optimize_bmd)
     model.preserve_vertex_order = any(
         o.data is not None and o.data.attributes.get("bmd_node") is not None for o in mesh_objs)
     bone_index = _build_joints(model, arm_obj, scale)
