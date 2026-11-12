@@ -10,6 +10,7 @@ import bpy
 import numpy as np
 
 from . import blender_common as bc
+from . import normal_metadata
 from .j3d import gx_texture as gx
 from .j3d import material as mat3
 from .j3d import model as j3d
@@ -18,6 +19,25 @@ from .j3d import writer
 
 class ExportError(Exception):
     pass
+
+
+def _same_geometry(original, evaluated):
+    """True when the modifier result has identical topology and positions."""
+    if original is evaluated:
+        return True
+    if (len(original.vertices) != len(evaluated.vertices) or
+            len(original.loops) != len(evaluated.loops) or
+            len(original.polygons) != len(evaluated.polygons)):
+        return False
+    if normal_metadata.topology_hash(original) != normal_metadata.topology_hash(evaluated):
+        return False
+
+    count = len(original.vertices) * 3
+    original_co = np.empty(count, np.float64)
+    evaluated_co = np.empty(count, np.float64)
+    original.vertices.foreach_get("co", original_co)
+    evaluated.vertices.foreach_get("co", evaluated_co)
+    return bool(np.allclose(original_co, evaluated_co, rtol=0.0, atol=1e-6))
 
 
 def _natural_normal_layout(me):
@@ -103,16 +123,19 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
         model.format_overrides[j3d.VA_POS] = (1, 4, 0)
         model.format_overrides[j3d.VA_NRM] = (0, 4, 0)
 
-    model.preserve_vertex_order = any(
-        o.data is not None and o.data.attributes.get("bmd_node") is not None for o in mesh_objs)
+    model.preserve_vertex_order = (
+        len(mesh_objs) == 1 or
+        any(o.data is not None and o.data.attributes.get("bmd_node") is not None
+            for o in mesh_objs))
     bone_index = _build_joints(model, arm_obj, scale)
 
     mats = _MaterialCollector(model, default_format)
     if arm_obj is not None and "bmd_textures" in arm_obj:
         mats.preload_original_textures(arm_obj, source_file, allow_missing_textures, report)
+    normal_updates = []
     for obj in mesh_objs:
         _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modifiers,
-                            context, limit_weights)
+                            context, limit_weights, normal_updates)
     mats.finish()
     # keep the original shape order: the game addresses shapes and materials by index
     model.meshes.sort(key=lambda m: (m.sort_key, m.order))
@@ -125,6 +148,19 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
         if sv:
             model.sub_version = bytes.fromhex(sv)
     data = writer.write(model)
+    for obj, indices, position_offset, vertex_order in normal_updates:
+        if obj.data is None:
+            continue
+        if indices is None:
+            normal_metadata.clear_metadata(obj.data)
+            continue
+        try:
+            normal_metadata.write_metadata(
+                obj.data, indices, model.normal_count, source="export",
+                position_offset=position_offset, vertex_order=vertex_order)
+        except ValueError as exc:
+            print(f"[BMD] could not update normal metadata for {obj.name}: {exc}")
+
     exported_formats = {
         str(attr): [components, typ, frac]
         for attr, (components, typ, frac) in getattr(model, "exported_formats", {}).items()
@@ -270,10 +306,11 @@ def _eval_mesh(obj, apply_modifiers, context):
 
 
 def _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modifiers, context,
-                        limit_weights=False):
+                        limit_weights=False, normal_updates=None):
     me, cleanup = _eval_mesh(obj, apply_modifiers, context)
     try:
-        _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_weights)
+        _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_weights,
+                          normal_updates)
     finally:
         if cleanup:
             ev, disabled = cleanup
@@ -282,7 +319,8 @@ def _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modi
                 m.show_viewport = True
 
 
-def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_weights=False):
+def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_weights=False,
+                      normal_updates=None):
     me.calc_loop_triangles()
     nt = len(me.loop_triangles)
     if nt == 0:
@@ -463,6 +501,19 @@ def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_we
                 em.joint = int(obj["bmd_joint"])
         em.material = mats.index_for(mat, em)
         model.meshes.append(em)
+
+    if normal_updates is not None:
+        # Modifiers that leave topology and positions unchanged still describe
+        # the same BLS target.  If they change either, the metadata computed
+        # from the original mesh can no longer match the exported BMD.
+        same_geometry = _same_geometry(obj.data, me)
+        vertex_order = bool(model.preserve_vertex_order and same_geometry)
+        normal_updates.append((
+            obj,
+            normal_indices.copy() if vertex_order and normal_indices is not None else None,
+            base_vertex if vertex_order else 0,
+            vertex_order,
+        ))
 
 
 # --------------------------------------------------------------------------

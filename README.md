@@ -50,6 +50,12 @@ the ZIP. The operators appear under File -> Import / Export:
 * Normals use a canonical layout instead of being globally sorted. Every corner
   is addressed by its `(vertex, normal)` pair, so the normal array keeps a
   stable order and index.
+* The importer stores the original per-corner normal indices, position order
+  information and a topology hash on the mesh (`bmd_normal_index`,
+  `bmd_normal_meta`). BMD export updates this metadata to the normal layout of
+  the newly written file. With *Apply Modifiers*, metadata is kept only when the
+  evaluated mesh has identical topology and vertex positions; otherwise it is
+  invalidated.
 * **All** textures in their original order with wrap / filter / LOD settings, including textures no
   material uses (e.g. eye textures swapped by texture animations). Duplicate names are allowed.
 * The complete material block (TEV stages, colour channels, texture matrices, fog, blend ...) is kept
@@ -186,11 +192,8 @@ matching collision mesh.
   winding defines the face normal, so make sure floors face upwards.
 
 ## Known limitations
-* **BLS compatibility:** BMD export does not preserve the original normal index table. Original BLS
-  shape keys that address the old normal indices are not remapped after a BMD re-export. They may
-  stop working or produce incorrect normals; rebuild the BLS data from the updated mesh after
-  modifying the BMD. Conversely, BLS data rebuilt from Blender targets the canonical normal layout
-  of the exported BMD and is not guaranteed to match the original BMD's normal indices.
+* **BLS compatibility:** If a BMD is modified and re-exported, its BLS file must be exported again.
+  A modified BLS can still target the original BMD when the mesh was imported with `j3d_bmd_io`.
 * No TEV shading in Blender; the Blender materials are only a preview.
 * Joint scales other than 1 are exact only for unchanged bones.
 * By default all bone influences are preserved (the BMD `EVP1` limit is 255 per vertex). Enable

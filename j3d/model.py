@@ -98,6 +98,7 @@ class MeshData:
         self.face_node = None        # (T,) int32, source INF1 node (merged mode)
         self.face_material = None    # (T,) int32, source material index (merged mode)
         self.loop_normals = None     # (3T,3) float32 or None
+        self.loop_normal_indices = None  # (3T,) int32 or None, original VTX1 indices
         self.loop_colors = [None, None]  # (3T,4) float32 or None
         self.loop_uvs = [None] * 8   # (3T,2) float32 or None  (GX convention: v down)
 
@@ -660,6 +661,7 @@ def build_mesh(bmd, node, mesh_index=0):
     nrm_i = col(VA_NRM)
     if nrm_i is not None and VA_NRM in bmd.arrays:
         na = bmd.arrays[VA_NRM]
+        mesh.loop_normal_indices = nrm_i[loops].astype(np.int32)
         nrm = na[np.minimum(nrm_i[loops], len(na) - 1)].astype(np.float64)
         loop_drw = drw[loops]
         for k in drw_ids:
@@ -731,7 +733,9 @@ def merge_meshes(bmd, meshes):
 
     all_faces, face_node, face_material = [], [], []
     normals_all = True
+    normal_indices_all = True
     loop_normals = []
+    loop_normal_indices = []
     colors_present = [any(m.loop_colors[c] is not None for m in meshes) for c in range(2)]
     loop_colors = [[], []]
     uvs_present = [any(m.loop_uvs[t] is not None for m in meshes) for t in range(8)]
@@ -773,6 +777,10 @@ def merge_meshes(bmd, meshes):
             normals_all = False
         else:
             loop_normals.append(mesh.loop_normals)
+        if mesh.loop_normal_indices is None:
+            normal_indices_all = False
+        else:
+            loop_normal_indices.append(mesh.loop_normal_indices)
         for c in range(2):
             if colors_present[c]:
                 loop_colors[c].append(
@@ -802,6 +810,9 @@ def merge_meshes(bmd, meshes):
     merged.face_node = np.asarray(face_node, np.int32)
     merged.face_material = np.asarray(face_material, np.int32)
     merged.loop_normals = np.concatenate(loop_normals, 0) if normals_all and loop_normals else None
+    merged.loop_normal_indices = (
+        np.concatenate(loop_normal_indices, 0)
+        if normal_indices_all and loop_normal_indices else None)
     merged.loop_colors = [
         np.concatenate(loop_colors[c], 0) if loop_colors[c] else None for c in range(2)
     ]

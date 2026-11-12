@@ -10,6 +10,7 @@ import numpy as np
 from mathutils import Matrix
 
 from . import blender_common as bc
+from . import normal_metadata
 from .j3d import gx_texture as gx
 from .j3d import material as mat3
 from .j3d import model as j3d
@@ -397,11 +398,15 @@ def _create_mesh_object(coll, arm_obj, bone_names, bmd, md, materials, base, sca
     faces = md.faces[:, [0, 2, 1]]
     perm = (np.arange(len(faces))[:, None] * 3 + np.array([0, 2, 1])).reshape(-1)
     md.loop_normals = None if md.loop_normals is None else md.loop_normals[perm]
+    md.loop_normal_indices = (
+        None if md.loop_normal_indices is None
+        else md.loop_normal_indices[perm])
     md.loop_colors = [None if c is None else c[perm] for c in md.loop_colors]
     md.loop_uvs = [None if u is None else u[perm] for u in md.loop_uvs]
     me = bpy.data.meshes.new(shape_name)
     me.from_pydata(verts.tolist(), [], faces.tolist())
     me.update()
+    n_loops = len(faces) * 3
 
     # smooth shading so custom normals take effect
     try:
@@ -432,6 +437,15 @@ def _create_mesh_object(coll, arm_obj, bone_names, bmd, md, materials, base, sca
             me.normals_split_custom_set((n / ln).tolist())
         except Exception as exc:
             print(f"[BMD] custom normals failed for {shape_name}: {exc}")
+
+    if md.loop_normal_indices is not None and len(md.loop_normal_indices) == n_loops:
+        normal_count = len(bmd.arrays.get(j3d.VA_NRM, ()))
+        try:
+            normal_metadata.write_metadata(
+                me, md.loop_normal_indices, normal_count, source="import",
+                position_offset=0, vertex_order=single)
+        except ValueError as exc:
+            print(f"[BMD] could not store normal metadata for {shape_name}: {exc}")
 
     if single:
         # Keep the original material indices.  The exporter groups faces by the
