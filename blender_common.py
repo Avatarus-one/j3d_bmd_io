@@ -55,10 +55,11 @@ class BMDImageProps(PropertyGroup):
                          description="Texture format used when exporting this image")
     mip_count: IntProperty(name="Mip Levels", default=0, min=0, max=12,
                            description="Number of mip levels (0 = automatic / keep imported)")
-    external: BoolProperty(name="Runtime Texture", default=False,
-                           description="Placeholder without image data: the game supplies the picture at "
-                                       "runtime (data offset 0 in the file). The pixels shown in Blender "
-                                       "are meaningless; untick to export this image as a normal texture")
+    external: BoolProperty(name="External / Runtime Texture", default=False,
+                           description="No image data is embedded in the BMD (data offset 0). The game "
+                                       "supplies the picture at runtime; stage models load it from the "
+                                       "stage's texc folder. Untick to embed the current image into the "
+                                       "exported BMD as a normal texture")
 
 
 def axis_fix(arm_obj):

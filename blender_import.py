@@ -10,6 +10,7 @@ import numpy as np
 from mathutils import Matrix
 
 from . import blender_common as bc
+from . import external_textures
 from . import normal_metadata
 from .j3d import gx_texture as gx
 from .j3d import material as mat3
@@ -17,11 +18,16 @@ from .j3d import model as j3d
 
 
 def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=True,
-               report=None, single_mesh=True):
+               report=None, single_mesh=True, texc_dir=None):
     with open(filepath, "rb") as f:
         raw = f.read()
     bmd = j3d.parse(raw)
     base = os.path.splitext(os.path.basename(filepath))[0]
+
+    if import_textures and any(t.external for t in bmd.textures):
+        missing_external = external_textures.load_for_bmd(bmd, filepath, texc_dir)
+    else:
+        missing_external = []
 
     coll = bpy.data.collections.new(base)
     context.scene.collection.children.link(coll)
@@ -59,6 +65,10 @@ def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=Tru
         report({"INFO"}, f"Imported {base}: {len(bmd.joints)} joints, {mesh_count} mesh"
                          f"{'' if mesh_count == 1 else 'es'}, {len(bmd.materials)} materials, "
                          f"{len(bmd.textures)} textures")
+        if missing_external:
+            report({"WARNING"},
+                   f"{len(missing_external)} external texture(s) not found, using "
+                   f"placeholders: {', '.join(missing_external)}")
     return arm_obj
 
 
@@ -89,6 +99,11 @@ def _create_images(bmd, base):
         img["bmd_lod_bias"] = int(t.lod_bias)
         img["bmd_flags10"] = t.flags10.hex()
         img["bmd_orig_format"] = gx.FORMAT_NAMES.get(t.format, str(t.format))
+        if t.external:
+            external_size = t.external_size or (w, h)
+            img["bmd_external_size"] = [int(external_size[0]), int(external_size[1])]
+        if t.external_path:
+            img["bmd_external_path"] = t.external_path
         if t.raw_data is not None:  # original bytes: re-used verbatim by the exporter if untouched
             img["bmd_raw"] = base64.b64encode(zlib.compress(t.raw_data, 6)).decode("ascii")
             img["bmd_raw_fmt"] = int(t.format)

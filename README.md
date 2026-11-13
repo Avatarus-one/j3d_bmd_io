@@ -130,16 +130,49 @@ that match textures by content keep working. Only edited images, or images whose
 you changed, are re-encoded (CMPR, RGB5A3, RGBA32, RGB565, IA8, IA4, I8, I4). Palette formats are
 decoded on import and re-encoded as CMPR / RGB5A3 only if you change the image.
 
+### External stage textures (`STG_00/texc`)
+Some stage models keep their texture pixels outside the BMD. In `TEX1`, such an entry has
+`imageOffset = 0`; the game loads the picture at runtime from the stage's `texc` folder
+(for example `STG_00/texc/I_Kusa_A.bti`). The BMD still stores the sampling settings
+(wrap mode, filters, LOD, size), the texture name and the material bindings.
+
+On import the add-on searches for the textures automatically:
+* `STG_00/texc`
+* `STG_00/archive/texc`
+
+On import the add-on follows the stage layout:
+
+```text
+<root>/
+  STG_00/
+    texc/            external .bti textures
+    archive/texc/    alternative .bti location
+  R00_00/
+    bmdr/model.bmd            .bmd location
+	archive/bmdr/model.bmd    alternative .bmd location
+```
+
+If some textures are still missing, the import opens **Import Settings** first. Its
+**External Textures** section lists the BMD file(s) and their external textures, plus
+a **texc Path** field.
+
+Imported external images show the real pixels and remember their source file
+(`bmd_external_path`, shown in *Image Editor -> Image -> J3D (BMD) Texture*). On export
+they stay **external**: the BMD gets a header-only `TEX1` entry again and the `.bti`
+files are not embedded. To embed the current picture (for example to make the room
+self-contained), untick **External / Runtime Texture** for that image before exporting.
+
 ### Runtime textures (placeholders)
 
-Some texture slots in stage and character models contain no image data at all: their data
-offset in the TEX1 header is 0 and the game fills the slot at runtime (for example texture
-pattern animations). The importer detects them, creates a grey placeholder image and ticks
-**Runtime Texture** in the image panel. The exporter writes them back as header-only entries
-(data offset 0). Never untick the option for such an image unless you really want to ship a
-fixed texture there - otherwise the game shows the embedded picture instead of the runtime
-one (in older versions of this add-on this showed up as green/black checkerboard patterns,
-because header bytes were read as pixels).
+Some texture slots in stage and character models contain no image data and no matching
+external file: their data offset in the TEX1 header is 0 and the game fills the slot at
+runtime (for example texture pattern animations). The importer detects them, creates a
+grey placeholder image and ticks **External / Runtime Texture** in the image panel. The
+exporter writes them back as header-only entries (data offset 0). Never untick the option
+for such an image unless you really want to ship a fixed texture there - otherwise the
+game shows the embedded picture instead of the runtime one (in older versions of this
+add-on this showed up as green/black checkerboard patterns, because header bytes were
+read as pixels).
 
 ### Materials
 * Material tab -> *J3D (BMD) Material*: **Render Mode** (Auto keeps imported values; Opaque / Cutout /

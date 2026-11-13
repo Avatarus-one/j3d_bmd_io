@@ -6,10 +6,12 @@ import os
 import bpy
 from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty,
                        StringProperty)
-from bpy.types import Operator, OperatorFileListElement, Panel
+from bpy.types import Operator, OperatorFileListElement, Panel, PropertyGroup
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from . import blender_common as bc
+
+_PENDING_BMD_IMPORT = None
 
 
 def blender_anim_items():
@@ -136,13 +138,69 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
 
     def execute(self, context):
         from . import blender_import
+        from . import external_textures
+        from .j3d import model as j3d
         from .j3d.common import J3DError
+        global _PENDING_BMD_IMPORT
+
         scale = 0.01 if self.convert_units else 1.0
         paths = []
         if self.files:
             paths = [os.path.join(self.directory, f.name) for f in self.files]
         if not paths:
             paths = [self.filepath]
+
+        if self.import_textures:
+            missing = []
+            suggested = None
+            files = []
+            for p in paths:
+                try:
+                    with open(p, "rb") as handle:
+                        bmd = j3d.parse(handle.read())
+                    names, folder = external_textures.check_external_textures(bmd, p)
+                except (OSError, J3DError) as exc:
+                    self.report({"ERROR"}, f"{os.path.basename(p)}: {exc}")
+                    return {"CANCELLED"}
+
+                external_names = list(dict.fromkeys(
+                    t.name for t in bmd.textures if t.external))
+                files.append({
+                    "path": p,
+                    "external": external_names,
+                    "missing": names,
+                })
+                for name in names:
+                    if name not in missing:
+                        missing.append(name)
+                if names and suggested is None and folder is not None:
+                    suggested = folder
+
+            if missing and not bpy.app.background:
+                _PENDING_BMD_IMPORT = {
+                    "paths": paths,
+                    "scale": scale,
+                    "bone_axis": self.bone_axis,
+                    "import_textures": self.import_textures,
+                    "single_mesh": self.single_mesh,
+                    "files": files,
+                    "missing": missing,
+                    "suggested": suggested,
+                }
+                try:
+                    bpy.ops.import_scene.bmd_texc("INVOKE_DEFAULT")
+                except RuntimeError as exc:
+                    # The dialog could not be shown; keep going with placeholders.
+                    consumed = _PENDING_BMD_IMPORT is None
+                    _PENDING_BMD_IMPORT = None
+                    if consumed:
+                        return {"FINISHED"}
+                    self.report({"WARNING"},
+                                "Import Settings could not be shown; missing external "
+                                f"textures will use placeholders: {exc}")
+                else:
+                    return {"FINISHED"}
+
         for p in paths:
             try:
                 blender_import.import_bmd(context, p, scale, self.bone_axis,
@@ -152,6 +210,142 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
                 self.report({"ERROR"}, f"{os.path.basename(p)}: {exc}")
                 return {"CANCELLED"}
         return {"FINISHED"}
+
+
+class BMDImportFileState(PropertyGroup):
+    expanded: BoolProperty(default=True)
+
+
+class IMPORT_OT_bmd_texc(Operator):
+    bl_idname = "import_scene.bmd_texc"
+    bl_label = "Import Settings"
+    bl_description = "Choose the folder that contains the external .bti textures"
+    bl_options = {"REGISTER", "UNDO", "INTERNAL"}
+
+    texc_dir: StringProperty(
+        name="texc Path", subtype="DIR_PATH", default="",
+        description="Path to external .bti textures (Normally inside STG_00)")
+    file_states: CollectionProperty(type=BMDImportFileState, options={"HIDDEN"})
+
+    @classmethod
+    def poll(cls, context):
+        return bool(_PENDING_BMD_IMPORT)
+
+    def invoke(self, context, _event):
+        pending = _PENDING_BMD_IMPORT
+        self.texc_dir = str(pending["suggested"]) if pending and pending.get("suggested") else ""
+        self.file_states.clear()
+        if pending:
+            files = pending.get("files") or [
+                {"path": path} for path in pending.get("paths", ())]
+            for _info in files:
+                self.file_states.add()
+        return context.window_manager.invoke_props_dialog(
+            self, width=560, confirm_text="Import")
+
+    def draw(self, context):
+        layout = self.layout
+        pending = _PENDING_BMD_IMPORT
+
+        if not pending:
+            layout.label(text="No pending BMD import", icon="ERROR")
+            return
+
+        from . import external_textures
+
+        files = pending.get("files")
+        if not files:
+            # Compatibility with a pending import created before the tree was added.
+            files = [{
+                "path": path,
+                "external": list(pending.get("missing", ())),
+                "missing": list(pending.get("missing", ())),
+            } for path in pending.get("paths", ())]
+
+        section = layout.box()
+        section.label(text="External Textures", icon="IMAGE_DATA")
+        section.label(text="This BMD file references external textures:")
+
+        tree = section.box()
+        for index, info in enumerate(files):
+            if index:
+                tree.separator()
+
+            state = self.file_states[index] if index < len(self.file_states) else None
+            expanded = state.expanded if state is not None else True
+
+            header = tree.row(align=True)
+            header.alignment = "LEFT"
+            if state is not None:
+                header.prop(
+                    state, "expanded", text=os.path.basename(info["path"]),
+                    icon="TRIA_DOWN" if expanded else "TRIA_RIGHT", emboss=False)
+            else:
+                header.label(
+                    text=os.path.basename(info["path"]),
+                    icon="TRIA_DOWN" if expanded else "TRIA_RIGHT")
+            if not expanded:
+                continue
+
+            external = info.get("external") or ()
+            if not external:
+                row = tree.row(align=True)
+                row.label(text="", icon="BLANK1")
+                row.label(text="No external textures", icon="INFO")
+                continue
+
+            availability = external_textures.texture_availability(
+                info["path"], external, self.texc_dir or None)
+            for name in external:
+                row = tree.row(align=True)
+                row.label(text="", icon="BLANK1")
+                row.label(text=name, icon="IMAGE_DATA")
+                status = row.row()
+                status.alignment = "RIGHT"
+                if availability.get(name) is not None:
+                    status.label(text="OK", icon="CHECKMARK")
+                else:
+                    status.label(text="missing", icon="ERROR")
+
+        section.separator()
+        field = section.column()
+        field.use_property_split = True
+        field.prop(self, "texc_dir")
+
+    def execute(self, context):
+        global _PENDING_BMD_IMPORT
+        from . import blender_import
+        from .j3d.common import J3DError
+
+        pending = _PENDING_BMD_IMPORT
+        if not pending:
+            self.report({"ERROR"}, "No pending BMD import")
+            return {"CANCELLED"}
+
+        texc_dir = self.texc_dir.strip() or None
+        if texc_dir and not os.path.isdir(texc_dir):
+            self.report({"WARNING"},
+                        f"texc folder not found: {texc_dir}; missing textures will use "
+                        "placeholders")
+            texc_dir = None
+
+        for path in pending["paths"]:
+            try:
+                blender_import.import_bmd(
+                    context, path, pending["scale"], pending["bone_axis"],
+                    pending["import_textures"], report=self.report,
+                    single_mesh=pending["single_mesh"], texc_dir=texc_dir)
+            except J3DError as exc:
+                _PENDING_BMD_IMPORT = None
+                self.report({"ERROR"}, f"{os.path.basename(path)}: {exc}")
+                return {"CANCELLED"}
+
+        _PENDING_BMD_IMPORT = None
+        return {"FINISHED"}
+
+    def cancel(self, context):
+        global _PENDING_BMD_IMPORT
+        _PENDING_BMD_IMPORT = None
 
 
 class EXPORT_OT_bmd(Operator, ExportHelper):
@@ -444,6 +638,9 @@ class IMAGE_PT_bmd(Panel):
         self.layout.prop(img.bmd, "format")
         self.layout.prop(img.bmd, "mip_count")
         self.layout.prop(img.bmd, "external")
+        external_path = img.get("bmd_external_path")
+        if external_path:
+            self.layout.label(text=f"External: {os.path.basename(external_path)}")
 
 
 def menu_import(self, context):
@@ -458,8 +655,8 @@ def menu_export(self, context):
     self.layout.operator(EXPORT_OT_kcl.bl_idname, text="TP Collision (.kcl)")
 
 
-_classes = (IMPORT_OT_bmd, EXPORT_OT_bmd, IMPORT_OT_bck, EXPORT_OT_bck, IMPORT_OT_kcl, EXPORT_OT_kcl,
-            MATERIAL_PT_bmd, IMAGE_PT_bmd)
+_classes = (IMPORT_OT_bmd, BMDImportFileState, IMPORT_OT_bmd_texc, EXPORT_OT_bmd, IMPORT_OT_bck,
+            EXPORT_OT_bck, IMPORT_OT_kcl, EXPORT_OT_kcl, MATERIAL_PT_bmd, IMAGE_PT_bmd)
 _file_handlers = []
 
 

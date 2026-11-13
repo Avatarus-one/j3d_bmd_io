@@ -65,6 +65,8 @@ class Texture:
         # True for placeholder entries without image data (data offset 0 in the header).  The game
         # fills these slots at runtime (e.g. texture-pattern animations); they must stay empty.
         self.external = False
+        self.external_path = None
+        self.external_size = None  # original BMD header size (w, h)
         self.pal_enabled = 0
         self.pal_format = 0
         self.pal_count = 0
@@ -392,6 +394,7 @@ def _parse_tex1(d, off):
         if data_off == 0:
             # No image data in the file: reading from the header itself would yield garbage.
             t.external = True
+            t.external_size = (w, h)
             t.rgba = np.full((h, w, 4), 128, np.uint8)
             textures.append(t)
             continue

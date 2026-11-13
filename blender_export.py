@@ -610,6 +610,13 @@ class _MaterialCollector:
             t.external = True
             t.format = gx.NAME_TO_FORMAT.get(orig, gx.CMPR)
             t.max_lod = int(image.get("bmd_max_lod", 0))
+            external_size = image.get("bmd_external_size")
+            if external_size and len(external_size) == 2:
+                ext_w, ext_h = int(external_size[0]), int(external_size[1])
+                if (ext_w, ext_h) != (w, h):
+                    # The image itself can be a 1x1 placeholder; the header keeps
+                    # the original texture size because no pixels are written.
+                    t.rgba = np.full((ext_h, ext_w, 4), 255, np.uint8)
         elif not reused:
             want = props.format if props.format != "AUTO" else (
                 self.default_format if self.default_format != "AUTO" else None)
