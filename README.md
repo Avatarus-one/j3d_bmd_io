@@ -138,19 +138,7 @@ Some stage models keep their texture pixels outside the BMD. In `TEX1`, such an 
 
 On import the add-on searches for the textures automatically:
 * `STG_00/texc`
-* `STG_00/archive/texc`
-
-On import the add-on follows the stage layout:
-
-```text
-<root>/
-  STG_00/
-    texc/            external .bti textures
-    archive/texc/    alternative .bti location
-  R00_00/
-    bmdr/model.bmd            .bmd location
-	archive/bmdr/model.bmd    alternative .bmd location
-```
+* `STG_00/../texc`
 
 If some textures are still missing, the import opens **Import Settings** first. Its
 **External Textures** section lists the BMD file(s) and their external textures, plus

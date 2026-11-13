@@ -20,7 +20,11 @@ def _folder_stem(path):
 
 
 def _texc_children(folder):
-    """Return ``texc`` and ``archive/texc`` folders directly inside *folder*."""
+    """Return ``texc`` folders directly inside *folder* or one level below.
+
+    The extra folder is not necessarily called ``archive``; any folder name is
+    accepted, for example ``STG_00/files/texc``.
+    """
     found = []
     try:
         children = list(Path(folder).iterdir())
@@ -32,56 +36,61 @@ def _texc_children(folder):
             continue
         if _folder_stem(child) == "texc":
             found.append(child)
-        elif _folder_stem(child) == "archive":
-            try:
-                grandchildren = list(child.iterdir())
-            except OSError:
-                continue
-            found.extend(
-                grandchild for grandchild in grandchildren
-                if grandchild.is_dir() and _folder_stem(grandchild) == "texc")
+            continue
+        try:
+            grandchildren = list(child.iterdir())
+        except OSError:
+            continue
+        found.extend(
+            grandchild for grandchild in grandchildren
+            if grandchild.is_dir() and _folder_stem(grandchild) == "texc")
     return found
 
 
-def _search_root(bmd_path):
-    """Return the folder that contains the stage folder.
+def _search_roots(bmd_path):
+    """Return the possible folders that contain the stage folder.
 
-    ``.../R00_00/bmdr/model.bmd``          -> the folder above ``R00_00``
-    ``.../R00_00/archive/bmdr/model.bmd``  -> one level further up, because the
-    archive folder adds a level while ``STG_00`` stays next to ``R00_00``.
+    The BMD is normally at ``<root>/<room>/bmdr/model.bmd``, but an extra
+    structural folder may be present: ``<root>/<room>/<extra>/bmdr/model.bmd``.
+    That folder can have any name, so both roots are tried instead of looking
+    for a folder called ``archive``.
     """
     parents = Path(bmd_path).resolve().parents
-    index = 2
-    if len(parents) > 1 and _folder_stem(parents[1]) == "archive":
-        index = 3
-    if len(parents) <= index:
-        return parents[-1] if parents else Path(bmd_path).resolve().parent
-    return parents[index]
+    roots = []
+    for index in (2, 3):
+        if len(parents) > index:
+            roots.append(parents[index])
+    if not roots:
+        roots.append(parents[-1] if parents else Path(bmd_path).resolve().parent)
+    return roots
 
 
 def find_texc_directories(bmd_path):
-    """Find STG_00/texc and STG_00/archive/texc next to the room folder."""
-    root = _search_root(bmd_path)
+    """Find ``STG_00/texc`` folders next to the room folder.
+
+    Both ``STG_00/texc`` and ``STG_00/<any folder>/texc`` are accepted.
+    """
     result = []
     seen = set()
 
-    stages = [root] if _folder_stem(root) == "stg_00" else []
-    try:
-        stages.extend(
-            child for child in root.iterdir()
-            if child.is_dir() and _folder_stem(child) == "stg_00")
-    except OSError:
-        pass
+    for root in _search_roots(bmd_path):
+        stages = [root] if _folder_stem(root) == "stg_00" else []
+        try:
+            stages.extend(
+                child for child in root.iterdir()
+                if child.is_dir() and _folder_stem(child) == "stg_00")
+        except OSError:
+            continue
 
-    for stage in stages:
-        for candidate in _texc_children(stage):
-            try:
-                key = str(candidate.resolve()).casefold()
-            except OSError:
-                key = str(candidate).casefold()
-            if key not in seen:
-                seen.add(key)
-                result.append(candidate)
+        for stage in stages:
+            for candidate in _texc_children(stage):
+                try:
+                    key = str(candidate.resolve()).casefold()
+                except OSError:
+                    key = str(candidate).casefold()
+                if key not in seen:
+                    seen.add(key)
+                    result.append(candidate)
 
     return result
 
