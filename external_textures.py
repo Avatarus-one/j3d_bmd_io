@@ -143,12 +143,18 @@ def _read_bti(path):
         palette = gx.decode_palette(pal_format, raw_palette, pal_count)
 
     level_size = gx.level_size(fmt, width, height)
+    total = gx.total_size(fmt, width, height, mip_count)
     image = data[data_offset:data_offset + level_size]
     if len(image) < level_size:
         raise J3DError(f"Texture file is truncated: {path}")
 
+    raw = data[data_offset:data_offset + total]
+    if len(raw) != total:
+        raw = None
+
     rgba = gx.decode(fmt, image, width, height, palette)
-    return fmt, width, height, mip_count, pal_enabled, pal_format, pal_count, rgba
+    return (fmt, width, height, mip_count, pal_enabled, pal_format, pal_count, rgba,
+            raw, raw_palette, data)
 
 
 def apply_texture(texture, texc_dir):
@@ -156,8 +162,8 @@ def apply_texture(texture, texc_dir):
     if path is None:
         return False
 
-    fmt, width, height, mip_count, pal_enabled, pal_format, pal_count, rgba = (
-        _read_bti(path))
+    (fmt, width, height, mip_count, pal_enabled, pal_format, pal_count, rgba,
+     raw_data, raw_palette, full_data) = _read_bti(path)
 
     if texture.external_size:
         expected_width, expected_height = texture.external_size
@@ -174,6 +180,9 @@ def apply_texture(texture, texc_dir):
     texture.pal_enabled = pal_enabled
     texture.pal_format = pal_format
     texture.pal_count = pal_count
+    texture.raw_data = raw_data
+    texture.raw_palette = raw_palette
+    texture.raw_bti = full_data
     texture.external_path = str(path)
     # Keep the sampling fields from the BMD header: they are part of the
     # material setup even when the pixels come from an external .bti.
@@ -181,10 +190,13 @@ def apply_texture(texture, texc_dir):
 
 
 def use_placeholder(texture):
-    """Replace missing external pixels with a 1x1 white placeholder."""
+    """Replace missing external pixels with a placeholder."""
     if texture.external_size is None:
         texture.external_size = (int(texture.rgba.shape[1]), int(texture.rgba.shape[0]))
     texture.rgba = np.full((1, 1, 4), 255, np.uint8)
+    texture.raw_data = None
+    texture.raw_palette = None
+    texture.raw_bti = None
     texture.external_path = None
 
 
@@ -235,7 +247,7 @@ def check_external_textures(bmd, bmd_path, texc_dir=None):
 def load_for_bmd(bmd, bmd_path, texc_dir=None):
     """Load external textures; return the names replaced by placeholders.
 
-    Missing textures do not abort the import: they get a 1x1 white placeholder
+    Missing textures do not abort the import: they get a placeholder
     so the model can still be imported and edited.
     """
     names = [t.name for t in bmd.textures if t.external]

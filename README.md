@@ -158,21 +158,43 @@ a **texc Path** field.
 
 Imported external images show the real pixels and remember their source file
 (`bmd_external_path`, shown in *Image Editor -> Image -> J3D (BMD) Texture*). On export
-they stay **external**: the BMD gets a header-only `TEX1` entry again and the `.bti`
-files are not embedded. To embed the current picture (for example to make the room
-self-contained), untick **External / Runtime Texture** for that image before exporting.
+they stay **external**: the BMD gets a header-only `TEX1` entry again unless you untick
+**External Texture** (for example to make the room self-contained).
+
+When several imported BMDs contain the same texture name, the importer reuses an
+existing image if its pixels and sampling settings are identical. Same-named textures
+that differ get a separate image (and Blender's `.001` suffix). Imported external
+textures keep the original `.bti` bytes, so an unchanged texture exports exactly as it
+was imported.
+
+Any image can be converted into an external texture: select it in the Image Editor and
+tick **External Texture** in the *J3D (BMD) Texture* panel. Use *File > Export > J3D
+Textures (.bti)* to write the external textures to a folder.
+Checkboxes of textures that do not need writing (`Up to date`) or cannot be written
+(`Conflict`, `Error`) are disabled. Different textures that would use the same `.bti`
+file name are shown as `conflict` and are not overwritten. The exporter uses the
+texture name as a lowercase `.bti` file name and only overwrites files whose contents
+changed. The BTI keeps the image format, mip count, wrap/filter settings and palette
+data when they can be reused.
+
+### Dusklight warning
+
+Dusklight resolves external textures from the archive's file table. It replaces entries
+that already exist in an archive; it cannot add a new file entry. To add a newly
+externalized texture, rebuild and replace the whole .arc archive with the `.bti`
+included in its `texc` folder.
 
 ### Runtime textures (placeholders)
 
 Some texture slots in stage and character models contain no image data and no matching
 external file: their data offset in the TEX1 header is 0 and the game fills the slot at
 runtime (for example texture pattern animations). The importer detects them, creates a
-grey placeholder image and ticks **External / Runtime Texture** in the image panel. The
-exporter writes them back as header-only entries (data offset 0). Never untick the option
-for such an image unless you really want to ship a fixed texture there - otherwise the
-game shows the embedded picture instead of the runtime one (in older versions of this
-add-on this showed up as green/black checkerboard patterns, because header bytes were
-read as pixels).
+grey placeholder image and ticks **External Texture** in the image panel. The exporter
+writes them back as header-only entries (data offset 0). Never untick the option for
+such an image unless you really want to ship a fixed texture there - otherwise the game
+shows the embedded picture instead of the runtime one (in older versions of this add-on
+this showed up as green/black checkerboard patterns, because header bytes were read as
+pixels).
 
 ### Materials
 * Material tab -> *J3D (BMD) Material*: **Render Mode** (Auto keeps imported values; Opaque / Cutout /

@@ -1,8 +1,10 @@
 """Create Blender data from a parsed J3D model."""
 
 import base64
+import hashlib
 import json
 import os
+import uuid
 import zlib
 
 import bpy
@@ -32,7 +34,10 @@ def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=Tru
     coll = bpy.data.collections.new(base)
     context.scene.collection.children.link(coll)
 
-    images = _create_images(bmd, base) if import_textures else {}
+    if import_textures:
+        images = _create_images(bmd, base, uuid.uuid4().hex)
+    else:
+        images = {}
     materials = [_create_material(bmd, i, m, images) for i, m in enumerate(bmd.materials)]
     arm_obj = _create_armature(context, coll, bmd, base, scale, bone_axis)
     bone_names = [b for b in arm_obj["bmd_bone_names"]]
@@ -76,11 +81,93 @@ def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=Tru
 # textures & materials
 # --------------------------------------------------------------------------
 
-def _create_images(bmd, base):
+def _texture_signature(t):
+    header = (
+        bool(t.external),
+        int(t.format), int(t.mip_count), int(t.wrap_s), int(t.wrap_t),
+        int(t.min_filter), int(t.mag_filter), int(t.min_lod), int(t.max_lod),
+        int(t.lod_bias), int(t.transparency), bytes(t.flags10),
+        int(t.pal_enabled), int(t.pal_format), int(t.pal_count),
+        tuple(int(v) for v in (t.external_size or ())),
+    )
+    digest = hashlib.sha1()
+    digest.update(repr(header).encode("utf-8", "surrogatepass"))
+    digest.update(t.rgba.tobytes())
+    return digest.hexdigest()
+
+
+def _image_texture_signature(image):
+    height, width = image.size[1], image.size[0]
+    if width == 0 or height == 0:
+        return None
+    buf = np.empty(width * height * 4, np.float32)
+    image.pixels.foreach_get(buf)
+    pixels = np.clip(np.rint(buf.reshape(height, width, 4)[::-1] * 255.0),
+                     0, 255).astype(np.uint8)
+    fmt = gx.NAME_TO_FORMAT.get(str(image.get("bmd_orig_format", "")), None)
+    if fmt is None:
+        fmt = gx.NAME_TO_FORMAT.get(str(image.bmd.format), None)
+    if fmt is None:
+        fmt = int(image.get("bmd_raw_fmt", 0))
+    flags = str(image.get("bmd_flags10", "00000000"))
+    try:
+        flags_bytes = bytes.fromhex(flags)
+    except ValueError:
+        flags_bytes = b"\0\0\0\0"
+    header = (
+        bool(image.bmd.external),
+        int(fmt), int(image.bmd.mip_count),
+        int(image.get("bmd_wrap_s", 1)), int(image.get("bmd_wrap_t", 1)),
+        int(image.get("bmd_min_filter", 1)), int(image.get("bmd_mag_filter", 1)),
+        int(image.get("bmd_min_lod", 0)), int(image.get("bmd_max_lod", 0)),
+        int(image.get("bmd_lod_bias", 0)), int(image.get("bmd_transparency", 0)),
+        flags_bytes,
+        int(image.get("bmd_pal_en", 0)), int(image.get("bmd_pal_fmt", 0)),
+        int(image.get("bmd_pal_count", 0)),
+        tuple(int(v) for v in (image.get("bmd_external_size") or ())),
+    )
+    digest = hashlib.sha1()
+    digest.update(repr(header).encode("utf-8", "surrogatepass"))
+    digest.update(pixels.tobytes())
+    return digest.hexdigest()
+
+
+def _create_images(bmd, base, import_id):
     images = {}
+    candidates = {}
+    for image in bpy.data.images:
+        name = image.get("bmd_name")
+        if (not name or not image.get("bmd_key")
+                or image.get("bmd_import_id") == import_id):
+            continue
+        candidates.setdefault(str(name), []).append(image)
+    candidate_signatures = {}
+    current_keys = {t.key for t in bmd.textures}
+
+    def reusable(t):
+        same_name = candidates.get(t.name)
+        if not same_name:
+            return None
+        signature = _texture_signature(t)
+        for image in same_name:
+            image_key = image.get("bmd_key")
+            if image_key != t.key and image_key in current_keys:
+                continue
+            key = image.name
+            if key not in candidate_signatures:
+                candidate_signatures[key] = _image_texture_signature(image)
+            if candidate_signatures[key] == signature:
+                return image
+        return None
+
     for t in bmd.textures:
+        existing = reusable(t)
+        if existing is not None:
+            images[t.key] = existing
+            continue
         h, w = t.rgba.shape[:2]
         img = bpy.data.images.new(t.key, w, h, alpha=True)
+        img["bmd_import_id"] = import_id
         px = (t.rgba[::-1].astype(np.float32) / 255.0).reshape(-1)
         img.pixels.foreach_set(px)
         try:
@@ -114,6 +201,8 @@ def _create_images(bmd, base):
                 img["bmd_pal_fmt"] = int(t.pal_format)
                 img["bmd_pal_count"] = int(t.pal_count)
             img["bmd_pal_en"] = int(t.pal_enabled)
+        if t.raw_bti is not None:
+            img["bmd_raw_bti"] = base64.b64encode(zlib.compress(t.raw_bti, 6)).decode("ascii")
         fmt_name = gx.FORMAT_NAMES.get(t.format, "AUTO")
         try:
             img.bmd.format = fmt_name if fmt_name in {i[0] for i in bc.FORMAT_ITEMS} else "AUTO"

@@ -55,11 +55,11 @@ class BMDImageProps(PropertyGroup):
                          description="Texture format used when exporting this image")
     mip_count: IntProperty(name="Mip Levels", default=0, min=0, max=12,
                            description="Number of mip levels (0 = automatic / keep imported)")
-    external: BoolProperty(name="External / Runtime Texture", default=False,
-                           description="No image data is embedded in the BMD (data offset 0). The game "
-                                       "supplies the picture at runtime; stage models load it from the "
-                                       "stage's texc folder. Untick to embed the current image into the "
-                                       "exported BMD as a normal texture")
+    external: BoolProperty(name="External Texture", default=False,
+                           description="Store this texture outside the BMD (header-only TEX1 "
+                                       "entry). Use File > Export > J3D Textures (.bti) to write "
+                                       "external textures to a folder. Tick this for any BMD, "
+                                       "disk or scene texture to make it external")
 
 
 def axis_fix(arm_obj):
@@ -165,10 +165,17 @@ def texture_key(image):
 
 
 def clean_texture_name(image):
-    name = image.get("bmd_name")
-    if name:
-        return str(name)
+    # The name stored in the BMD is authoritative: duplicate internal textures
+    # may legitimately share it (indices, not names, identify them).
+    stored = image.get("bmd_name")
+    if stored:
+        return str(stored)
     name = image.name
+    # Blender appends .001, .002 ... to duplicate image datablock names; that
+    # suffix is not part of the texture name for images without a stored name.
+    base, sep, suffix = name.rpartition(".")
+    if sep and len(suffix) == 3 and suffix.isdigit():
+        name = base
     low = name.lower()
     for ext in (".png", ".jpg", ".jpeg", ".tga", ".bmp", ".tif", ".tiff", ".dds", ".webp"):
         if low.endswith(ext):

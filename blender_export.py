@@ -1,6 +1,7 @@
 """Collect Blender data into an :class:`ExportModel` and write it as BMD3."""
 
 import base64
+import hashlib
 import json
 import math
 import os
@@ -11,10 +12,12 @@ import numpy as np
 
 from . import blender_common as bc
 from . import normal_metadata
+from .j3d import bti as bti_writer
 from .j3d import gx_texture as gx
 from .j3d import material as mat3
 from .j3d import model as j3d
 from .j3d import writer
+from .j3d.common import J3DError
 
 
 class ExportError(Exception):
@@ -76,6 +79,13 @@ def _format_override(choice, components, fraction):
     if choice.startswith("S16_"):
         return (components, 3, int(choice[4:]))
     return None
+
+
+def _bti_filename(name):
+    """Texture name -> safe lowercase ``.bti`` file name."""
+    safe = "".join("_" if ch in '<>:"/\\|?*' else ch for ch in str(name))
+    safe = safe.strip().rstrip(".")
+    return (safe or "texture").lower() + ".bti"
 
 
 def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifiers=False,
@@ -520,6 +530,450 @@ def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_we
 # materials & textures
 # --------------------------------------------------------------------------
 
+def _reuse_raw(image, t, w, h):
+    """Use the original encoded bytes when the image still looks like the imported one."""
+    raw = image.get("bmd_raw")
+    if not raw:
+        return False
+    props = image.bmd
+    orig = image.get("bmd_orig_format")
+    mips0 = int(image.get("bmd_raw_mips", 0))
+    if props.format not in ("AUTO", orig) or props.mip_count not in (0, mips0):
+        return False
+    try:
+        data = zlib.decompress(base64.b64decode(raw))
+        rfmt = int(image["bmd_raw_fmt"])
+        rw, rh = (int(v) for v in image["bmd_raw_size"])
+        if (rw, rh) != (w, h):
+            return False
+        pal_raw, pal = None, None
+        if image.get("bmd_raw_pal"):
+            pal_raw = zlib.decompress(base64.b64decode(image["bmd_raw_pal"]))
+            pal = gx.decode_palette(int(image["bmd_pal_fmt"]), pal_raw,
+                                    int(image["bmd_pal_count"]))
+        ref = gx.decode(rfmt, data, rw, rh, pal).astype(np.int16)
+        cur = t.rgba.astype(np.int16)
+        diff = np.abs(ref - cur)
+        visible = ((ref[..., 3] > 0) | (cur[..., 3] > 0))[..., None]
+        worst = max(int(diff[..., 3].max()), int(np.where(visible, diff[..., :3], 0).max()))
+        if worst > 1:
+            return False
+    except Exception as exc:
+        print(f"[BMD] cannot reuse original texture data of {image.name}: {exc}")
+        return False
+    t.raw_data, t.raw_palette = data, pal_raw
+    t.format, t.mip_count = rfmt, mips0
+    t.max_lod = int(image.get("bmd_max_lod", (mips0 - 1) * 8))
+    t.pal_enabled = int(image.get("bmd_pal_en", 0))
+    t.pal_format = int(image.get("bmd_pal_fmt", 0))
+    t.pal_count = int(image.get("bmd_pal_count", 0))
+    raw_bti = image.get("bmd_raw_bti")
+    if raw_bti:
+        try:
+            t.raw_bti = zlib.decompress(base64.b64decode(raw_bti))
+        except Exception as exc:
+            print(f"[BMD] cannot read original .bti data of {image.name}: {exc}")
+            t.raw_bti = None
+    return True
+
+
+def texture_from_image(image, wrap_ext="REPEAT", default_format="AUTO"):
+    """Build an export :class:`j3d.Texture` from a Blender image."""
+    name = bc.clean_texture_name(image)
+    t = j3d.Texture(name)
+    t.key = bc.texture_key(image)
+    w, h = image.size
+    if w == 0 or h == 0:
+        raise ExportError(f"Image '{image.name}' has no pixel data")
+    buf = np.empty(w * h * 4, np.float32)
+    image.pixels.foreach_get(buf)
+    t.rgba = np.clip(np.rint(buf.reshape(h, w, 4)[::-1] * 255.0), 0, 255).astype(np.uint8)
+    props = image.bmd
+    orig = image.get("bmd_orig_format")
+    external = bool(props.external)
+    reused = _reuse_raw(image, t, w, h)
+    if external:
+        # Header-only TEX1 entry; the pixels live in a .bti file.
+        t.external = True
+        if not reused:
+            want = props.format if props.format != "AUTO" else orig
+            fmt = gx.NAME_TO_FORMAT.get(want)
+            if fmt is None or fmt in (gx.C4, gx.C8, gx.C14X2):
+                fmt = gx.RGB5A3 if gx.has_partial_alpha(t.rgba) else gx.CMPR
+            t.format = fmt
+            t.max_lod = int(image.get("bmd_max_lod", 0))
+        external_size = image.get("bmd_external_size")
+        if external_size and len(external_size) == 2:
+            ext_w, ext_h = int(external_size[0]), int(external_size[1])
+            if (ext_w, ext_h) != (w, h):
+                # The image itself can be a 1x1 placeholder; the header keeps
+                # the original texture size because no pixels are written.
+                t.rgba = np.full((ext_h, ext_w, 4), 255, np.uint8)
+    elif not reused:
+        want = props.format if props.format != "AUTO" else (
+            default_format if default_format != "AUTO" else None)
+        if want is None:
+            if orig in gx.NAME_TO_FORMAT and gx.NAME_TO_FORMAT[orig] not in (gx.C4, gx.C8, gx.C14X2):
+                fmt = gx.NAME_TO_FORMAT[orig]
+            else:
+                fmt = gx.RGB5A3 if gx.has_partial_alpha(t.rgba) else gx.CMPR
+        else:
+            fmt = gx.NAME_TO_FORMAT[want]
+        t.format = fmt
+    has_a = gx.has_alpha(t.rgba)
+    t.transparency = int(image.get("bmd_transparency", 2 if has_a else 0))
+    if reused:
+        mips = t.mip_count
+    else:
+        mips = props.mip_count
+        if mips <= 0:
+            mips = 1
+            if "bmd_min_filter" not in image and min(w, h) >= 16:
+                mips = min(gx.max_mip_count(w, h), 4)
+        t.mip_count = mips
+    ext_wrap = {"EXTEND": 0, "CLIP": 0, "REPEAT": 1, "MIRROR": 2}.get(wrap_ext, 1)
+    t.wrap_s = int(image.get("bmd_wrap_s", ext_wrap))
+    t.wrap_t = int(image.get("bmd_wrap_t", ext_wrap))
+    t.min_filter = int(image.get("bmd_min_filter", 5 if mips > 1 else 1))
+    t.mag_filter = int(image.get("bmd_mag_filter", 1))
+    t.min_lod = int(image.get("bmd_min_lod", 0))
+    t.lod_bias = int(image.get("bmd_lod_bias", 0))
+    fl = image.get("bmd_flags10")
+    t.flags10 = bytes.fromhex(fl) if fl else bytes([1 if mips > 1 else 0, 0, 0, 0])
+    if mips > 1:
+        t.flags10 = bytes([1]) + t.flags10[1:]
+    return t
+
+
+def _object_armature(obj):
+    if obj.parent is not None and obj.parent.type == "ARMATURE":
+        return obj.parent
+    for modifier in obj.modifiers:
+        if modifier.type == "ARMATURE" and modifier.object is not None:
+            return modifier.object
+    return None
+
+
+def _model_label(arm):
+    source = str(arm.get("bmd_source", ""))
+    if source:
+        return os.path.basename(source)
+    if arm.users_collection:
+        return arm.users_collection[0].name
+    return arm.name
+
+
+def _disambiguate_labels(groups):
+    counts = {}
+    for group in groups:
+        counts[group["label"]] = counts.get(group["label"], 0) + 1
+    for group in groups:
+        if counts.get(group["label"], 0) <= 1:
+            continue
+        source = group.get("source", "")
+        if source:
+            folder = os.path.dirname(source)
+            parent = os.path.dirname(folder)
+            if os.path.basename(folder).casefold() == "archive":
+                parent = os.path.dirname(parent)
+            group["label"] = f"{os.path.basename(parent)}/{group['label']}"
+        else:
+            arm = group.get("arm")
+            group["label"] = f"{group['label']} ({arm.name if arm else 'scene'})"
+    used = set()
+    for group in groups:
+        label = group["label"]
+        if label in used:
+            i = 2
+            while f"{label} ({i})" in used:
+                i += 1
+            label = f"{label} ({i})"
+            group["label"] = label
+        used.add(label)
+
+
+def scene_bti_groups():
+    """Group every external image in the scene by imported BMD/model."""
+    models = [obj for obj in bpy.data.objects
+              if obj.type == "ARMATURE" and ("bmd_textures" in obj or "bmd_source" in obj)]
+    models.sort(key=lambda arm: arm.name)
+
+    groups = []
+    seen_by_arm = {}
+    for arm in models:
+        group = {
+            "label": _model_label(arm),
+            "source": str(arm.get("bmd_source", "")),
+            "arm": arm,
+            "images": [],
+        }
+        seen = set()
+        seen_by_arm[arm] = seen
+        groups.append(group)
+        for name in arm.get("bmd_textures", ()):
+            image = bpy.data.images.get(name)
+            if image is not None and image.bmd.external and image.name not in seen:
+                seen.add(image.name)
+                group["images"].append(image)
+
+    model_by_arm = {group["arm"]: group for group in groups}
+    for obj in bpy.data.objects:
+        if obj.type != "MESH":
+            continue
+        arm = _object_armature(obj)
+        group = model_by_arm.get(arm)
+        if group is None:
+            continue
+        seen = seen_by_arm[arm]
+        for slot in obj.material_slots:
+            material = slot.material
+            if material is None or material.node_tree is None:
+                continue
+            for node in material.node_tree.nodes:
+                if node.type != "TEX_IMAGE":
+                    continue
+                image = node.image
+                if image is not None and image.bmd.external and image.name not in seen:
+                    seen.add(image.name)
+                    group["images"].append(image)
+
+    assigned = {image.name for group in groups for image in group["images"]}
+    orphans = [image for image in bpy.data.images
+               if image.bmd.external and image.name not in assigned]
+    if orphans:
+        groups.append({
+            "label": "Scene",
+            "source": "",
+            "arm": None,
+            "images": orphans,
+        })
+
+    groups = [group for group in groups if group["images"]]
+    _disambiguate_labels(groups)
+    return groups
+
+
+def _image_signature(image):
+    """Content signature used to deduplicate same-named textures."""
+    w, h = image.size
+    if w == 0 or h == 0:
+        return None
+    buf = np.empty(w * h * 4, np.float32)
+    image.pixels.foreach_get(buf)
+    pixels = np.clip(np.rint(buf * 255.0), 0, 255).astype(np.uint8)
+    props = image.bmd
+    header = (
+        int(w), int(h), str(props.format), int(props.mip_count),
+        image.get("bmd_orig_format"),
+        int(image.get("bmd_wrap_s", 1)), int(image.get("bmd_wrap_t", 1)),
+        int(image.get("bmd_min_filter", 1)), int(image.get("bmd_mag_filter", 1)),
+        int(image.get("bmd_min_lod", 0)), image.get("bmd_flags10"),
+        tuple(int(v) for v in (image.get("bmd_external_size") or ())),
+    )
+    digest = hashlib.sha1()
+    digest.update(str(header).encode("utf-8", "surrogatepass"))
+    digest.update(pixels.tobytes())
+    return digest.hexdigest()
+
+
+def bti_export_plan(images, directory, with_payload=True,
+                    seen_target=None, seen_source=None):
+    """Describe what the .bti exporter will do for each image.
+
+    Statuses: ``new``, ``update``, ``unchanged``, ``conflict``, ``error`` and
+    ``no_folder``.  Duplicate instances of the same texture (same source file
+    or identical content) receive the owner's status and identity; only the
+    owner is written.
+    """
+    if seen_target is None:
+        seen_target = {}
+    if seen_source is None:
+        seen_source = {}
+    plan = []
+    directory = os.path.abspath(directory) if directory else ""
+    signatures = {}
+    for image in images:
+        name = bc.clean_texture_name(image)
+        filename = _bti_filename(name)
+        source = image.get("bmd_external_path")
+        source_key = os.path.normcase(os.path.abspath(source)) if source else None
+        entry = {
+            "image": image,
+            "name": name,
+            "filename": filename,
+            "path": None,
+            "status": "error",
+            "error": None,
+            "payload": None,
+            "source": source_key,
+            "signature": None,
+            "identity": None,
+            "owner": True,
+        }
+
+        signature = signatures.get(image.name)
+        if signature is None:
+            signature = _image_signature(image)
+            signatures[image.name] = signature
+        entry["signature"] = signature
+
+        key = filename.casefold()
+        previous = seen_target.get(key)
+        source_owner = seen_source.get(source_key) if source_key is not None else None
+
+        if source_owner is not None:
+            entry["status"] = source_owner["status"]
+            entry["identity"] = source_owner["identity"]
+            entry["owner"] = False
+            plan.append(entry)
+            continue
+        if previous is not None:
+            same_content = signature is not None and previous.get("signature") == signature
+            if same_content:
+                entry["status"] = previous["status"]
+                entry["identity"] = previous["identity"]
+                entry["owner"] = False
+            else:
+                entry["status"] = "conflict"
+                entry["owner"] = False
+            plan.append(entry)
+            continue
+
+        entry["identity"] = (
+            ("source", source_key) if source_key is not None
+            else ("content", key, signature)
+        )
+
+        if not directory:
+            entry["status"] = "no_folder"
+            seen_target[key] = entry
+            if source_key is not None:
+                seen_source[source_key] = entry
+            plan.append(entry)
+            continue
+
+        entry["path"] = os.path.join(directory, filename)
+        try:
+            t = texture_from_image(image)
+        except (ExportError, J3DError) as exc:
+            entry["error"] = str(exc)
+            seen_target[key] = entry
+            if source_key is not None:
+                seen_source[source_key] = entry
+            plan.append(entry)
+            continue
+        if not with_payload and not os.path.isfile(entry["path"]):
+            entry["status"] = "new"
+            seen_target[key] = entry
+            if source_key is not None:
+                seen_source[source_key] = entry
+            plan.append(entry)
+            continue
+        try:
+            payload = bti_writer.build_bti(t)
+        except J3DError as exc:
+            entry["error"] = str(exc)
+            seen_target[key] = entry
+            if source_key is not None:
+                seen_source[source_key] = entry
+            plan.append(entry)
+            continue
+        entry["payload"] = payload
+        if os.path.isfile(entry["path"]):
+            try:
+                with open(entry["path"], "rb") as f:
+                    same = f.read() == payload
+            except OSError:
+                same = False
+            entry["status"] = "unchanged" if same else "update"
+        else:
+            entry["status"] = "new"
+        seen_target[key] = entry
+        if source_key is not None:
+            seen_source[source_key] = entry
+        plan.append(entry)
+    return plan
+
+
+def bti_scene_plan(groups, directory, with_payload=True):
+    """Run :func:`bti_export_plan` across scene groups with global dedup."""
+    seen_target = {}
+    seen_source = {}
+    return [bti_export_plan(group["images"], directory, with_payload,
+                            seen_target, seen_source)
+            for group in groups]
+
+
+def export_bti_textures(context, directory, report=None, selected=None):
+    """Write every selected external texture of the scene to *directory*."""
+    groups = scene_bti_groups()
+    if not groups:
+        raise ExportError("No external textures found in the scene")
+
+    directory = os.path.abspath(directory)
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as exc:
+        raise ExportError(f"Cannot create the texture folder: {exc}") from exc
+
+    plans = bti_scene_plan(groups, directory, with_payload=True)
+    selected_identities = set()
+    if selected is not None:
+        for entries in plans:
+            for entry in entries:
+                if entry["image"].name in selected and entry.get("identity") is not None:
+                    selected_identities.add(entry["identity"])
+
+    written = unchanged = conflicts = errors = 0
+    for group, entries in zip(groups, plans):
+        for entry in entries:
+            status = entry["status"]
+            if status in ("new", "update") and entry.get("owner"):
+                if selected is not None and entry.get("identity") not in selected_identities:
+                    continue
+                try:
+                    with open(entry["path"], "wb") as f:
+                        f.write(entry["payload"])
+                except OSError as exc:
+                    raise ExportError(f"Cannot write '{entry['path']}': {exc}") from exc
+                written += 1
+            elif status == "unchanged" and entry.get("owner"):
+                unchanged += 1
+            elif status == "conflict":
+                conflicts += 1
+                if report:
+                    report({"WARNING"},
+                           f"Skipping '{entry['name']}' from {group['label']}: another "
+                           "texture with the same .bti file name is different")
+            elif status == "error" and entry.get("owner"):
+                errors += 1
+                if report:
+                    report({"WARNING"},
+                           f"Cannot export external texture '{entry['name']}': {entry['error']}")
+
+    if report:
+        parts = [f"{written} written"]
+        if unchanged:
+            parts.append(f"{unchanged} up to date")
+        if conflicts:
+            parts.append(f"{conflicts} conflicts")
+        if errors:
+            parts.append(f"{errors} failed")
+        report({"INFO"}, "; ".join(parts) + f" in {directory}")
+    return written, unchanged
+
+
+def default_bti_directory(context):
+    """Suggested output folder for the separate .bti exporter."""
+    for group in scene_bti_groups():
+        for image in group["images"]:
+            path = image.get("bmd_external_path")
+            if path:
+                return os.path.dirname(path)
+    blend_dir = bpy.path.abspath("//")
+    return blend_dir or os.path.abspath(".")
+
+
 class _MaterialCollector:
     def __init__(self, model, default_format):
         self.model = model
@@ -589,108 +1043,13 @@ class _MaterialCollector:
                 "'Allow Missing Textures' if you removed them on purpose).")
 
     def _texture_for(self, image, wrap_ext):
-        name = bc.clean_texture_name(image)
         key = bc.texture_key(image)
         if key in self.images:
             return key
-        t = j3d.Texture(name)
-        t.key = key
-        w, h = image.size
-        if w == 0 or h == 0:
-            raise ExportError(f"Image '{image.name}' has no pixel data")
-        buf = np.empty(w * h * 4, np.float32)
-        image.pixels.foreach_get(buf)
-        t.rgba = np.clip(np.rint(buf.reshape(h, w, 4)[::-1] * 255.0), 0, 255).astype(np.uint8)
-        props = image.bmd
-        orig = image.get("bmd_orig_format")
-        external = bool(props.external)
-        reused = False if external else self._try_reuse_raw(image, t, w, h)
-        if external:
-            # Placeholder slot: header only.  Keep the original format / LOD settings.
-            t.external = True
-            t.format = gx.NAME_TO_FORMAT.get(orig, gx.CMPR)
-            t.max_lod = int(image.get("bmd_max_lod", 0))
-            external_size = image.get("bmd_external_size")
-            if external_size and len(external_size) == 2:
-                ext_w, ext_h = int(external_size[0]), int(external_size[1])
-                if (ext_w, ext_h) != (w, h):
-                    # The image itself can be a 1x1 placeholder; the header keeps
-                    # the original texture size because no pixels are written.
-                    t.rgba = np.full((ext_h, ext_w, 4), 255, np.uint8)
-        elif not reused:
-            want = props.format if props.format != "AUTO" else (
-                self.default_format if self.default_format != "AUTO" else None)
-            if want is None:
-                if orig in gx.NAME_TO_FORMAT and gx.NAME_TO_FORMAT[orig] not in (gx.C4, gx.C8, gx.C14X2):
-                    fmt = gx.NAME_TO_FORMAT[orig]
-                else:
-                    fmt = gx.RGB5A3 if gx.has_partial_alpha(t.rgba) else gx.CMPR
-            else:
-                fmt = gx.NAME_TO_FORMAT[want]
-            t.format = fmt
-        has_a = gx.has_alpha(t.rgba)
-        t.transparency = int(image.get("bmd_transparency", 2 if has_a else 0))
-        if reused:
-            mips = t.mip_count
-        else:
-            mips = props.mip_count
-            if mips <= 0:
-                mips = 1
-                if "bmd_min_filter" not in image and min(w, h) >= 16:
-                    mips = min(gx.max_mip_count(w, h), 4)
-            t.mip_count = mips
-        ext_wrap = {"EXTEND": 0, "CLIP": 0, "REPEAT": 1, "MIRROR": 2}.get(wrap_ext, 1)
-        t.wrap_s = int(image.get("bmd_wrap_s", ext_wrap))
-        t.wrap_t = int(image.get("bmd_wrap_t", ext_wrap))
-        t.min_filter = int(image.get("bmd_min_filter", 5 if mips > 1 else 1))
-        t.mag_filter = int(image.get("bmd_mag_filter", 1))
-        t.min_lod = int(image.get("bmd_min_lod", 0))
-        t.lod_bias = int(image.get("bmd_lod_bias", 0))
-        fl = image.get("bmd_flags10")
-        t.flags10 = bytes.fromhex(fl) if fl else bytes([1 if mips > 1 else 0, 0, 0, 0])
-        if mips > 1:
-            t.flags10 = bytes([1]) + t.flags10[1:]
+        t = texture_from_image(image, wrap_ext, self.default_format)
         self.images[key] = t
         self.model.textures.append(t)
         return key
-
-    def _try_reuse_raw(self, image, t, w, h):
-        """Use the original encoded bytes when the image still looks like the imported one."""
-        raw = image.get("bmd_raw")
-        if not raw:
-            return False
-        props = image.bmd
-        orig = image.get("bmd_orig_format")
-        mips0 = int(image.get("bmd_raw_mips", 0))
-        if props.format not in ("AUTO", orig) or props.mip_count not in (0, mips0):
-            return False
-        try:
-            data = zlib.decompress(base64.b64decode(raw))
-            rfmt = int(image["bmd_raw_fmt"])
-            rw, rh = (int(v) for v in image["bmd_raw_size"])
-            if (rw, rh) != (w, h):
-                return False
-            pal_raw, pal = None, None
-            if image.get("bmd_raw_pal"):
-                pal_raw = zlib.decompress(base64.b64decode(image["bmd_raw_pal"]))
-                pal = gx.decode_palette(int(image["bmd_pal_fmt"]), pal_raw, int(image["bmd_pal_count"]))
-            ref = gx.decode(rfmt, data, rw, rh, pal).astype(np.int16)
-            cur = t.rgba.astype(np.int16)
-            diff = np.abs(ref - cur)
-            visible = ((ref[..., 3] > 0) | (cur[..., 3] > 0))[..., None]
-            worst = max(int(diff[..., 3].max()), int(np.where(visible, diff[..., :3], 0).max()))
-            if worst > 1:
-                return False
-        except Exception as exc:
-            print(f"[BMD] cannot reuse original texture data of {image.name}: {exc}")
-            return False
-        t.raw_data, t.raw_palette = data, pal_raw
-        t.format, t.mip_count = rfmt, mips0
-        t.max_lod = int(image.get("bmd_max_lod", (mips0 - 1) * 8))
-        t.pal_enabled = int(image.get("bmd_pal_en", 0))
-        t.pal_format = int(image.get("bmd_pal_fmt", 0))
-        t.pal_count = int(image.get("bmd_pal_count", 0))
-        return True
 
     def _image_nodes(self, bl_mat):
         """{slot: (image, extension)} from nodes named bmd_tex<N>, else first image node."""

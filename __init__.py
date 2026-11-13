@@ -13,6 +13,15 @@ from . import blender_common as bc
 
 _PENDING_BMD_IMPORT = None
 
+_BTI_STATUS = {
+    "new": ("New", "EXPORT"),
+    "update": ("Modified", "FILE_REFRESH"),
+    "unchanged": ("Up to date", "FILE_TICK"),
+    "conflict": ("Conflict", "ERROR"),
+    "error": ("Error", "ERROR"),
+    "no_folder": ("Select folder", "INFO"),
+}
+
 
 def blender_anim_items():
     from .blender_anim import LOOP_ITEMS
@@ -214,6 +223,15 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
 
 class BMDImportFileState(PropertyGroup):
     expanded: BoolProperty(default=True)
+
+
+class BMDExportGroupState(PropertyGroup):
+    expanded: BoolProperty(default=True)
+    selected: BoolProperty(default=True)
+
+
+class BMDExportTextureState(PropertyGroup):
+    selected: BoolProperty(default=True)
 
 
 class IMPORT_OT_bmd_texc(Operator):
@@ -472,6 +490,249 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
         return {"FINISHED"}
 
 
+class EXPORT_OT_bti(Operator):
+    """Export external textures of the whole scene as .bti files"""
+    bl_idname = "export_scene.bti"
+    bl_label = "Export J3D Textures"
+    bl_options = {"REGISTER"}
+
+    directory: StringProperty(
+        name="Folder", subtype="DIR_PATH", default="",
+        description="Folder for the .bti files")
+    group_states: CollectionProperty(type=BMDExportGroupState, options={"HIDDEN"})
+    texture_states: CollectionProperty(type=BMDExportTextureState, options={"HIDDEN"})
+
+    def invoke(self, context, _event):
+        from . import blender_export
+        if not self.directory:
+            self.directory = blender_export.default_bti_directory(context)
+        self._groups = blender_export.scene_bti_groups()
+        self.group_states.clear()
+        self.texture_states.clear()
+        total = 0
+        for group in self._groups:
+            self.group_states.add()
+            total += len(group["images"])
+            for _image in group["images"]:
+                self.texture_states.add()
+        self._last_group_selected = [True] * len(self._groups)
+        self._last_texture_selected = [True] * total
+        self._plan_key = None
+        self._plans = None
+        return context.window_manager.invoke_props_dialog(
+            self, width=600, confirm_text="Export")
+
+    @staticmethod
+    def _texture_offsets(groups):
+        offsets = []
+        index = 0
+        for group in groups:
+            offsets.append((index, index + len(group["images"])))
+            index += len(group["images"])
+        return offsets
+
+    @staticmethod
+    def _entry_enabled(entry):
+        return entry["status"] in ("new", "update")
+
+    def _apply_group_toggles(self, groups, plans):
+        last_values = getattr(self, "_last_group_selected", None)
+        if last_values is None or len(last_values) != len(groups):
+            last_values = [True] * len(groups)
+            self._last_group_selected = last_values
+        total = sum(len(entries) for entries in plans)
+        last_textures = getattr(self, "_last_texture_selected", None)
+        if last_textures is None or len(last_textures) != total:
+            last_textures = [True] * total
+            self._last_texture_selected = last_textures
+        offsets = self._texture_offsets(groups)
+        for index, _group in enumerate(groups):
+            if index >= len(self.group_states):
+                continue
+            state = self.group_states[index]
+            start, end = offsets[index]
+            if state.selected == last_values[index]:
+                if not state.selected:
+                    # A disabled file keeps all its texture checkboxes off.
+                    for ti in range(start, min(end, len(self.texture_states))):
+                        self.texture_states[ti].selected = False
+                        if ti < len(last_textures):
+                            last_textures[ti] = False
+                continue
+            # The user toggled the file checkbox: selecting it enables all
+            # exportable textures, clearing it disables every texture of this
+            # file without touching identical textures in other files.
+            entries = plans[index] if index < len(plans) else []
+            for ti in range(start, min(end, len(self.texture_states))):
+                entry = entries[ti - start] if ti - start < len(entries) else None
+                value = bool(state.selected and entry is not None
+                             and self._entry_enabled(entry))
+                self.texture_states[ti].selected = value
+                if ti < len(last_textures):
+                    last_textures[ti] = value
+            last_values[index] = state.selected
+
+    def _sync_texture_states(self, groups, plans):
+        flat_entries = [entry for entries in plans for entry in entries]
+        last_values = getattr(self, "_last_texture_selected", None)
+        if last_values is None or len(last_values) != len(flat_entries):
+            last_values = [True] * len(flat_entries)
+            self._last_texture_selected = last_values
+        offsets = self._texture_offsets(groups)
+        file_enabled = []
+        for index, _group in enumerate(groups):
+            enabled = (index < len(self.group_states)
+                       and self.group_states[index].selected)
+            start, end = offsets[index]
+            file_enabled.extend([enabled] * (end - start))
+        # Excluded files and non-exportable textures are inactive and off.
+        for index, entry in enumerate(flat_entries):
+            active = (index < len(file_enabled) and file_enabled[index]
+                      and self._entry_enabled(entry))
+            if not active:
+                if index < len(self.texture_states) and self.texture_states[index].selected:
+                    self.texture_states[index].selected = False
+                if index < len(last_values):
+                    last_values[index] = False
+        # Identical textures sync only while their files are enabled.
+        identities = {}
+        for index, entry in enumerate(flat_entries):
+            identity = entry.get("identity")
+            if (identity is not None and index < len(file_enabled)
+                    and file_enabled[index] and self._entry_enabled(entry)):
+                identities.setdefault(identity, []).append(index)
+        for indices in identities.values():
+            new_value = None
+            for index in indices:
+                if (index < len(self.texture_states) and index < len(last_values)
+                        and self.texture_states[index].selected != last_values[index]):
+                    new_value = self.texture_states[index].selected
+                    break
+            if new_value is None:
+                continue
+            for index in indices:
+                if index < len(self.texture_states):
+                    self.texture_states[index].selected = new_value
+                if index < len(last_values):
+                    last_values[index] = new_value
+
+    def _selected_image_names(self, groups):
+        if groups is None or len(self.texture_states) == 0:
+            return None
+        selected = set()
+        index = 0
+        for gi, group in enumerate(groups):
+            file_enabled = (self.group_states[gi].selected
+                            if gi < len(self.group_states) else True)
+            for image in group["images"]:
+                if (file_enabled and index < len(self.texture_states)
+                        and self.texture_states[index].selected):
+                    selected.add(image.name)
+                index += 1
+        return selected
+
+    def draw(self, context):
+        from . import blender_export
+        layout = self.layout
+
+        groups = getattr(self, "_groups", None)
+        if groups is None:
+            groups = blender_export.scene_bti_groups()
+            self._groups = groups
+
+        directory = self.directory.strip()
+        key = (directory,
+               tuple(tuple(image.name for image in group["images"]) for group in groups))
+        if getattr(self, "_plan_key", None) != key:
+            self._plans = blender_export.bti_scene_plan(
+                groups, directory, with_payload=False)
+            self._plan_key = key
+        plans = self._plans or []
+
+        self._apply_group_toggles(groups, plans)
+        self._sync_texture_states(groups, plans)
+
+        if groups:
+            tree = layout.box()
+            states = self.group_states
+            textures = self.texture_states
+            offsets = self._texture_offsets(groups)
+            for index, group in enumerate(groups):
+                if index:
+                    tree.separator()
+                state = states[index] if index < len(states) else None
+                entries = plans[index] if index < len(plans) else []
+                start, _end = offsets[index]
+                expanded = state.expanded if state is not None else True
+
+                header = tree.row(align=True)
+                header.alignment = "LEFT"
+                if state is not None:
+                    check = header.row()
+                    check.prop(state, "selected", text="")
+                    header.prop(state, "expanded", text=group["label"],
+                                icon="TRIA_DOWN" if expanded else "TRIA_RIGHT",
+                                emboss=False)
+                else:
+                    header.label(text=group["label"],
+                                 icon="TRIA_DOWN" if expanded else "TRIA_RIGHT")
+                if not expanded:
+                    continue
+                file_enabled = state.selected if state is not None else True
+                for offset, entry in enumerate(entries):
+                    ti = start + offset
+                    active = file_enabled and self._entry_enabled(entry)
+                    row = tree.row(align=True)
+                    row.active = active
+                    row.label(text="", icon="BLANK1")
+                    if ti < len(textures):
+                        check = row.row()
+                        check.enabled = active
+                        check.prop(textures[ti], "selected", text="")
+                    row.label(text=entry["name"], icon="IMAGE_DATA")
+                    status = row.row()
+                    status.alignment = "RIGHT"
+                    text, icon = _BTI_STATUS.get(entry["status"], ("?", "INFO"))
+                    status.label(text=text, icon=icon)
+        else:
+            layout.label(text="No external textures found in the scene", icon="INFO")
+
+        layout.separator()
+        field = layout.column()
+        field.use_property_split = True
+        field.prop(self, "directory")
+        hint = layout.row()
+        hint.active = False
+        hint.label(text="Unchanged .bti files are not overwritten", icon="INFO")
+
+    def execute(self, context):
+        from . import blender_export
+        from .j3d.common import J3DError
+        directory = self.directory.strip()
+        if not directory:
+            self.report({"ERROR"}, "Select an output folder")
+            return {"CANCELLED"}
+        groups = getattr(self, "_groups", None)
+        if groups is not None:
+            key = (directory,
+                   tuple(tuple(image.name for image in group["images"]) for group in groups))
+            if getattr(self, "_plan_key", None) != key:
+                self._plans = blender_export.bti_scene_plan(
+                    groups, directory, with_payload=False)
+                self._plan_key = key
+            plans = self._plans or []
+            self._apply_group_toggles(groups, plans)
+            self._sync_texture_states(groups, plans)
+        selected = self._selected_image_names(groups)
+        try:
+            blender_export.export_bti_textures(context, directory, self.report,
+                                               selected=selected)
+        except (blender_export.ExportError, J3DError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
 class IMPORT_OT_kcl(Operator, ImportHelper):
     """Import a Twilight Princess collision mesh (room.kcl, optionally with room.plc)"""
     bl_idname = "import_scene.kcl"
@@ -651,12 +912,15 @@ def menu_import(self, context):
 
 def menu_export(self, context):
     self.layout.operator(EXPORT_OT_bmd.bl_idname, text="J3D Model (.bmd)")
+    self.layout.operator(EXPORT_OT_bti.bl_idname, text="J3D Textures (.bti)")
     self.layout.operator(EXPORT_OT_bck.bl_idname, text="J3D Animation (.bck)")
     self.layout.operator(EXPORT_OT_kcl.bl_idname, text="TP Collision (.kcl)")
 
 
-_classes = (IMPORT_OT_bmd, BMDImportFileState, IMPORT_OT_bmd_texc, EXPORT_OT_bmd, IMPORT_OT_bck,
-            EXPORT_OT_bck, IMPORT_OT_kcl, EXPORT_OT_kcl, MATERIAL_PT_bmd, IMAGE_PT_bmd)
+_classes = (IMPORT_OT_bmd, BMDImportFileState, IMPORT_OT_bmd_texc,
+            BMDExportGroupState, BMDExportTextureState, EXPORT_OT_bmd, EXPORT_OT_bti,
+            IMPORT_OT_bck, EXPORT_OT_bck, IMPORT_OT_kcl, EXPORT_OT_kcl, MATERIAL_PT_bmd,
+            IMAGE_PT_bmd)
 _file_handlers = []
 
 

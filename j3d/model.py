@@ -62,6 +62,7 @@ class Texture:
         # original encoded data (all mips) - written back verbatim if the image is unchanged
         self.raw_data = None
         self.raw_palette = None
+        self.raw_bti = None
         # True for placeholder entries without image data (data offset 0 in the header).  The game
         # fills these slots at runtime (e.g. texture-pattern animations); they must stay empty.
         self.external = False
