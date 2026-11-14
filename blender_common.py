@@ -1,6 +1,7 @@
 """Shared helpers for the Blender import / export operators."""
 
 import math
+import os
 
 import numpy as np
 import bpy
@@ -65,6 +66,39 @@ class BMDImageProps(PropertyGroup):
 def axis_fix(arm_obj):
     """Bone frame correction that was used when the armature was imported."""
     return R_FIX if arm_obj.get("bmd_bone_axis", "X") == "X" else np.eye(4)
+
+
+def mesh_object_poll(_self, obj):
+    """PointerProperty poll for mesh objects."""
+    return obj is not None and obj.type == "MESH"
+
+
+def target_armature(obj):
+    """Return the armature that deforms *obj*, if any."""
+    if obj is None:
+        return None
+
+    if obj.parent is not None and obj.parent.type == "ARMATURE":
+        return obj.parent
+
+    for modifier in obj.modifiers:
+        if modifier.type == "ARMATURE" and modifier.object is not None:
+            return modifier.object
+
+    return None
+
+
+def model_label(arm):
+    """Human-readable label for an imported BMD model/armature."""
+    source = str(arm.get("bmd_source", ""))
+
+    if source:
+        return os.path.basename(source)
+
+    if arm.users_collection:
+        return arm.users_collection[0].name
+
+    return arm.name
 
 
 def j3d_local_to_blender(L, s, fix, is_root=False):

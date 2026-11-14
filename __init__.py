@@ -1,12 +1,15 @@
-"""J3D BMD Import/Export for Blender (Zelda: Twilight Princess / Dusklight)."""
+"""J3D BMD Import/Export for Blender (Zelda: Twilight Princess / Dusklight).
+
+Includes BMD/BDL models, BCK animations, BLS shape keys and KCL collision.
+"""
 
 import json
 import os
 
 import bpy
 from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty,
-                       StringProperty)
-from bpy.types import Operator, OperatorFileListElement, Panel, PropertyGroup
+                       PointerProperty, StringProperty)
+from bpy.types import Operator, OperatorFileListElement, Panel, PropertyGroup, UIList
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from . import blender_common as bc
@@ -22,21 +25,12 @@ _BTI_STATUS = {
     "no_folder": ("Select folder", "INFO"),
 }
 
+MAX_BTI_TREE_ROWS = 12
+
 
 def blender_anim_items():
     from .blender_anim import LOOP_ITEMS
     return LOOP_ITEMS
-
-
-def _target_armature(obj):
-    if obj is None:
-        return None
-    if obj.parent is not None and obj.parent.type == "ARMATURE":
-        return obj.parent
-    for mod in obj.modifiers:
-        if mod.type == "ARMATURE" and mod.object is not None:
-            return mod.object
-    return None
 
 
 def _decode_vtx_formats(raw):
@@ -78,7 +72,7 @@ def _detect_vertex_formats(context):
     # 3. Imported BMD formats through the armature of a selected mesh.
     for obj in preferred:
         if obj.type == "MESH":
-            armature = _target_armature(obj)
+            armature = bc.target_armature(obj)
             if armature is not None:
                 raw = armature.get("bmd_vtx_formats")
                 if raw:
@@ -120,7 +114,7 @@ def _format_choice(fmt, default_frac):
 class IMPORT_OT_bmd(Operator, ImportHelper):
     """Import a J3D BMD3/BDL4 model"""
     bl_idname = "import_scene.bmd"
-    bl_label = "Import J3D BMD"
+    bl_label = "Import BMD"
     bl_options = {"REGISTER", "UNDO", "PRESET"}
 
     filename_ext = ".bmd"
@@ -147,7 +141,7 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
 
     def execute(self, context):
         from . import blender_import
-        from . import external_textures
+        from . import blender_bti
         from .j3d import model as j3d
         from .j3d.common import J3DError
         global _PENDING_BMD_IMPORT
@@ -167,7 +161,7 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
                 try:
                     with open(p, "rb") as handle:
                         bmd = j3d.parse(handle.read())
-                    names, folder = external_textures.check_external_textures(bmd, p)
+                    names, folder = blender_bti.check_external_textures(bmd, p)
                 except (OSError, J3DError) as exc:
                     self.report({"ERROR"}, f"{os.path.basename(p)}: {exc}")
                     return {"CANCELLED"}
@@ -234,6 +228,16 @@ class BMDExportTextureState(PropertyGroup):
     selected: BoolProperty(default=True)
 
 
+class BMDExportTreeRow(PropertyGroup):
+    kind: StringProperty()
+    group_index: IntProperty()
+    texture_index: IntProperty()
+    label: StringProperty()
+    enabled: BoolProperty(default=True)
+    status_text: StringProperty()
+    status_icon: StringProperty(default="INFO")
+
+
 class IMPORT_OT_bmd_texc(Operator):
     bl_idname = "import_scene.bmd_texc"
     bl_label = "Import Settings"
@@ -269,7 +273,7 @@ class IMPORT_OT_bmd_texc(Operator):
             layout.label(text="No pending BMD import", icon="ERROR")
             return
 
-        from . import external_textures
+        from . import blender_bti
 
         files = pending.get("files")
         if not files:
@@ -312,7 +316,7 @@ class IMPORT_OT_bmd_texc(Operator):
                 row.label(text="No external textures", icon="INFO")
                 continue
 
-            availability = external_textures.texture_availability(
+            availability = blender_bti.texture_availability(
                 info["path"], external, self.texc_dir or None)
             for name in external:
                 row = tree.row(align=True)
@@ -369,7 +373,7 @@ class IMPORT_OT_bmd_texc(Operator):
 class EXPORT_OT_bmd(Operator, ExportHelper):
     """Export meshes (and their armature) as a J3D BMD3 model"""
     bl_idname = "export_scene.bmd"
-    bl_label = "Export J3D BMD"
+    bl_label = "Export BMD"
     bl_options = {"REGISTER", "PRESET"}
 
     filename_ext = ".bmd"
@@ -490,10 +494,193 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
         return {"FINISHED"}
 
 
+class BMD_UL_bti_tree(UIList):
+    """Flattened BTI texture tree with scrolling."""
+
+    bl_idname = "BMD_UL_bti_tree"
+
+    def filter_items(self, context, data, propname):
+        rows = getattr(data, propname)
+        flags = []
+        for row in rows:
+            if row.kind == "group":
+                flags.append(self.bitflag_filter_item)
+                continue
+            if (row.group_index < len(data.group_states) and
+                    not data.group_states[row.group_index].expanded):
+                flags.append(0)
+            else:
+                flags.append(self.bitflag_filter_item)
+        return flags, []
+
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_propname, index, flt_flag=0):
+        if item.kind == "group":
+            state = (data.group_states[item.group_index]
+                     if item.group_index < len(data.group_states) else None)
+            row = layout.row(align=True)
+            row.alignment = "LEFT"
+            if state is not None:
+                check = row.row()
+                check.prop(state, "selected", text="")
+                row.prop(state, "expanded", text=item.label,
+                         icon="TRIA_DOWN" if state.expanded else "TRIA_RIGHT",
+                         emboss=False)
+            else:
+                row.label(text=item.label, icon="TRIA_DOWN")
+            return
+
+        group_selected = True
+        if item.group_index < len(data.group_states):
+            group_selected = data.group_states[item.group_index].selected
+        active = bool(group_selected and item.enabled)
+        row = layout.row(align=True)
+        row.active = active
+        row.label(text="", icon="BLANK1")
+        check = row.row()
+        check.enabled = active
+        if item.texture_index < len(data.texture_states):
+            check.prop(data.texture_states[item.texture_index], "selected", text="")
+        row.label(text=item.label, icon="IMAGE_DATA")
+        status = row.row()
+        status.alignment = "RIGHT"
+        status.label(text=item.status_text, icon=item.status_icon or "INFO")
+
+
+class IMPORT_OT_bti(Operator, ImportHelper):
+    """Import J3D textures (.bti) as Blender images"""
+    bl_idname = "import_image.bti"
+    bl_label = "Import BTI"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filename_ext = ".bti"
+    filter_glob: StringProperty(default="*.bti", options={"HIDDEN"})
+    filepath: StringProperty(
+        name="File Path",
+        description="Filepath used for importing the file",
+        maxlen=1024,
+        subtype="FILE_PATH",
+        options={"SKIP_SAVE", "HIDDEN"},
+    )
+    files: CollectionProperty(type=OperatorFileListElement,
+                              options={"HIDDEN", "SKIP_SAVE"})
+    directory: StringProperty(subtype="DIR_PATH", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        if self.filepath:
+            return self.execute(context)
+
+        return ImportHelper.invoke(self, context, event)
+
+    def execute(self, context):
+        from . import bti_import
+        from .j3d.common import J3DError
+        paths = ([os.path.join(self.directory, file.name) for file in self.files]
+                 if self.files else [])
+
+        if not paths:
+            paths = [self.filepath]
+
+        if not paths[0]:
+            self.report({"ERROR"}, "No texture file selected")
+            return {"CANCELLED"}
+
+        for path in paths:
+            try:
+                bti_import.import_bti(context, path, self.report)
+            except (J3DError, OSError) as exc:
+                self.report({"ERROR"}, f"{os.path.basename(path)}: {exc}")
+                return {"CANCELLED"}
+
+        return {"FINISHED"}
+
+
+class IMPORT_OT_bti_node(Operator, ImportHelper):
+    """Import a .bti texture and assign it to the active Image Texture node"""
+    bl_idname = "import_image.bti_node"
+    bl_label = "Import BTI"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filename_ext = ".bti"
+    filter_glob: StringProperty(default="*.bti", options={"HIDDEN"})
+    filepath: StringProperty(
+        name="File Path",
+        description="Filepath used for importing the file",
+        maxlen=1024,
+        subtype="FILE_PATH",
+        options={"SKIP_SAVE", "HIDDEN"},
+    )
+    files: CollectionProperty(type=OperatorFileListElement,
+                              options={"HIDDEN", "SKIP_SAVE"})
+    directory: StringProperty(subtype="DIR_PATH", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        space = getattr(context, "space_data", None)
+        self._node_tree = None
+        self._node_name = ""
+        self._node_location = (0.0, 0.0)
+
+        if (space is not None and getattr(space, "type", None) == "NODE_EDITOR"
+                and getattr(space, "tree_type", None) == "ShaderNodeTree"):
+            tree = getattr(space, "edit_tree", None)
+
+            if tree is not None:
+                self._node_tree = tree
+                self._node_location = getattr(
+                    space, "cursor_location", (0.0, 0.0))
+                node = tree.nodes.active
+                self._node_name = node.name if node is not None else ""
+
+        return ImportHelper.invoke(self, context, event)
+
+    def execute(self, context):
+        from . import bti_import
+        from .j3d.common import J3DError
+        paths = ([os.path.join(self.directory, file.name) for file in self.files]
+                 if self.files else [])
+
+        if not paths:
+            paths = [self.filepath]
+
+        if not paths[0]:
+            self.report({"ERROR"}, "No texture file selected")
+            return {"CANCELLED"}
+
+        image = None
+
+        for path in paths:
+            try:
+                image = bti_import.import_bti(context, path, self.report)
+            except (J3DError, OSError) as exc:
+                self.report({"ERROR"}, f"{os.path.basename(path)}: {exc}")
+                return {"CANCELLED"}
+
+        tree = getattr(self, "_node_tree", None)
+
+        if tree is not None and image is not None:
+            node = (tree.nodes.get(self._node_name)
+                    if self._node_name else None)
+
+            if node is None or node.type != "TEX_IMAGE":
+                node = tree.nodes.new("ShaderNodeTexImage")
+                node.location = getattr(
+                    self, "_node_location", (0.0, 0.0))
+
+            node.image = image
+
+            for other in tree.nodes:
+                other.select = False
+
+            node.select = True
+            tree.nodes.active = node
+
+        return {"FINISHED"}
+
+
 class EXPORT_OT_bti(Operator):
     """Export external textures of the whole scene as .bti files"""
     bl_idname = "export_scene.bti"
-    bl_label = "Export J3D Textures"
+    bl_label = "Export BTI"
     bl_options = {"REGISTER"}
 
     directory: StringProperty(
@@ -501,12 +688,14 @@ class EXPORT_OT_bti(Operator):
         description="Folder for the .bti files")
     group_states: CollectionProperty(type=BMDExportGroupState, options={"HIDDEN"})
     texture_states: CollectionProperty(type=BMDExportTextureState, options={"HIDDEN"})
+    tree_rows: CollectionProperty(type=BMDExportTreeRow, options={"HIDDEN"})
+    active_tree_row: IntProperty(default=0, min=0)
 
     def invoke(self, context, _event):
-        from . import blender_export
+        from . import bti_export
         if not self.directory:
-            self.directory = blender_export.default_bti_directory(context)
-        self._groups = blender_export.scene_bti_groups()
+            self.directory = bti_export.default_bti_directory(context)
+        self._groups = bti_export.scene_bti_groups()
         self.group_states.clear()
         self.texture_states.clear()
         total = 0
@@ -530,6 +719,29 @@ class EXPORT_OT_bti(Operator):
             offsets.append((index, index + len(group["images"])))
             index += len(group["images"])
         return offsets
+
+    def _rebuild_tree_rows(self, groups, plans):
+        offsets = self._texture_offsets(groups)
+        self.tree_rows.clear()
+        for gi, group in enumerate(groups):
+            group_row = self.tree_rows.add()
+            group_row.kind = "group"
+            group_row.group_index = gi
+            group_row.label = group["label"]
+            entries = plans[gi] if gi < len(plans) else []
+            start = offsets[gi][0]
+            for ti, entry in enumerate(entries):
+                row = self.tree_rows.add()
+                row.kind = "texture"
+                row.group_index = gi
+                row.texture_index = start + ti
+                row.label = entry["name"]
+                row.enabled = self._entry_enabled(entry)
+                text, icon = _BTI_STATUS.get(entry["status"], ("?", "INFO"))
+                row.status_text = text
+                row.status_icon = icon
+        if self.active_tree_row >= len(self.tree_rows):
+            self.active_tree_row = max(0, len(self.tree_rows) - 1)
 
     @staticmethod
     def _entry_enabled(entry):
@@ -632,68 +844,43 @@ class EXPORT_OT_bti(Operator):
         return selected
 
     def draw(self, context):
-        from . import blender_export
+        from . import bti_export
         layout = self.layout
 
         groups = getattr(self, "_groups", None)
         if groups is None:
-            groups = blender_export.scene_bti_groups()
+            groups = bti_export.scene_bti_groups()
             self._groups = groups
 
         directory = self.directory.strip()
         key = (directory,
                tuple(tuple(image.name for image in group["images"]) for group in groups))
         if getattr(self, "_plan_key", None) != key:
-            self._plans = blender_export.bti_scene_plan(
+            self._plans = bti_export.bti_scene_plan(
                 groups, directory, with_payload=False)
             self._plan_key = key
+            self._rebuild_tree_rows(groups, self._plans or [])
         plans = self._plans or []
 
         self._apply_group_toggles(groups, plans)
         self._sync_texture_states(groups, plans)
 
         if groups:
-            tree = layout.box()
-            states = self.group_states
-            textures = self.texture_states
-            offsets = self._texture_offsets(groups)
-            for index, group in enumerate(groups):
-                if index:
-                    tree.separator()
-                state = states[index] if index < len(states) else None
-                entries = plans[index] if index < len(plans) else []
-                start, _end = offsets[index]
-                expanded = state.expanded if state is not None else True
-
-                header = tree.row(align=True)
-                header.alignment = "LEFT"
-                if state is not None:
-                    check = header.row()
-                    check.prop(state, "selected", text="")
-                    header.prop(state, "expanded", text=group["label"],
-                                icon="TRIA_DOWN" if expanded else "TRIA_RIGHT",
-                                emboss=False)
-                else:
-                    header.label(text=group["label"],
-                                 icon="TRIA_DOWN" if expanded else "TRIA_RIGHT")
-                if not expanded:
-                    continue
-                file_enabled = state.selected if state is not None else True
-                for offset, entry in enumerate(entries):
-                    ti = start + offset
-                    active = file_enabled and self._entry_enabled(entry)
-                    row = tree.row(align=True)
-                    row.active = active
-                    row.label(text="", icon="BLANK1")
-                    if ti < len(textures):
-                        check = row.row()
-                        check.enabled = active
-                        check.prop(textures[ti], "selected", text="")
-                    row.label(text=entry["name"], icon="IMAGE_DATA")
-                    status = row.row()
-                    status.alignment = "RIGHT"
-                    text, icon = _BTI_STATUS.get(entry["status"], ("?", "INFO"))
-                    status.label(text=text, icon=icon)
+            visible = 0
+            for gi, _group in enumerate(groups):
+                visible += 1
+                state = (self.group_states[gi]
+                         if gi < len(self.group_states) else None)
+                if state is None or state.expanded:
+                    visible += len(plans[gi]) if gi < len(plans) else 0
+            rows = min(max(1, visible), MAX_BTI_TREE_ROWS)
+            layout.template_list(
+                "BMD_UL_bti_tree", "",
+                self, "tree_rows",
+                self, "active_tree_row",
+                rows=rows,
+                maxrows=MAX_BTI_TREE_ROWS,
+            )
         else:
             layout.label(text="No external textures found in the scene", icon="INFO")
 
@@ -706,7 +893,7 @@ class EXPORT_OT_bti(Operator):
         hint.label(text="Unchanged .bti files are not overwritten", icon="INFO")
 
     def execute(self, context):
-        from . import blender_export
+        from . import bti_export
         from .j3d.common import J3DError
         directory = self.directory.strip()
         if not directory:
@@ -717,7 +904,7 @@ class EXPORT_OT_bti(Operator):
             key = (directory,
                    tuple(tuple(image.name for image in group["images"]) for group in groups))
             if getattr(self, "_plan_key", None) != key:
-                self._plans = blender_export.bti_scene_plan(
+                self._plans = bti_export.bti_scene_plan(
                     groups, directory, with_payload=False)
                 self._plan_key = key
             plans = self._plans or []
@@ -725,9 +912,9 @@ class EXPORT_OT_bti(Operator):
             self._sync_texture_states(groups, plans)
         selected = self._selected_image_names(groups)
         try:
-            blender_export.export_bti_textures(context, directory, self.report,
-                                               selected=selected)
-        except (blender_export.ExportError, J3DError) as exc:
+            bti_export.export_bti_textures(context, directory, self.report,
+                                           selected=selected)
+        except (bti_export.ExportError, J3DError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         return {"FINISHED"}
@@ -736,7 +923,7 @@ class EXPORT_OT_bti(Operator):
 class IMPORT_OT_kcl(Operator, ImportHelper):
     """Import a Twilight Princess collision mesh (room.kcl, optionally with room.plc)"""
     bl_idname = "import_scene.kcl"
-    bl_label = "Import TP Collision (.kcl)"
+    bl_label = "Import KCL"
     bl_options = {"REGISTER", "UNDO", "PRESET"}
 
     filename_ext = ".kcl"
@@ -794,7 +981,7 @@ class EXPORT_OT_kcl(Operator, ExportHelper):
 class IMPORT_OT_bck(Operator, ImportHelper):
     """Import a J3D joint animation (.bck) onto the active armature"""
     bl_idname = "import_anim.bck"
-    bl_label = "Import J3D Animation"
+    bl_label = "Import BCK"
     bl_options = {"REGISTER", "UNDO"}
 
     filename_ext = ".bck"
@@ -828,7 +1015,7 @@ class IMPORT_OT_bck(Operator, ImportHelper):
 class EXPORT_OT_bck(Operator, ExportHelper):
     """Export the active action of the active armature as a J3D .bck animation"""
     bl_idname = "export_anim.bck"
-    bl_label = "Export J3D Animation"
+    bl_label = "Export BCK"
     bl_options = {"REGISTER", "PRESET"}
 
     filename_ext = ".bck"
@@ -904,10 +1091,79 @@ class IMAGE_PT_bmd(Panel):
             self.layout.label(text=f"External: {os.path.basename(external_path)}")
 
 
+def menu_node_import_bti(self, context):
+    space = getattr(context, "space_data", None)
+
+    if (space is None or getattr(space, "type", None) != "NODE_EDITOR"
+            or getattr(space, "tree_type", None) != "ShaderNodeTree"):
+        return
+
+    self.layout.operator(IMPORT_OT_bti_node.bl_idname,
+                         text="Import J3D Texture (.bti)", icon="IMPORT")
+
+
+def _draw_format_box(layout, title, items):
+    box = layout.box()
+    box.label(text=title)
+    column = box.column(align=True)
+    for idname, text, icon in items:
+        column.operator(idname, text=text, icon=icon)
+
+
+class BMD_PT_j3d(Panel):
+    bl_idname = "BMD_PT_j3d"
+    bl_label = "Import / Export"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "J3D"
+
+    def draw(self, context):
+        layout = self.layout
+
+        _draw_format_box(layout, "Model (.bmd/.bdl)", (
+            (IMPORT_OT_bmd.bl_idname, "Import Model", "IMPORT"),
+            (EXPORT_OT_bmd.bl_idname, "Export Model", "EXPORT"),
+        ))
+
+        _draw_format_box(layout, "Animation (.bck)", (
+            (IMPORT_OT_bck.bl_idname, "Import Animation", "IMPORT"),
+            (EXPORT_OT_bck.bl_idname, "Export Animation", "EXPORT"),
+        ))
+
+        from . import bls_import_ui
+        bls_items = [
+            ("bmd_shape_keys.import_files", "Import Shape Keys", "IMPORT"),
+            ("bmd_shape_keys.import_folder", "Import Shape Keys (Folder)", "IMPORT"),
+            ("bmd_shape_keys.export_files", "Export Shape Keys", "EXPORT"),
+        ]
+        if bls_import_ui.has_pending_import():
+            bls_items.append(
+                ("bmd_shape_keys.settings", "Import Settings", "PREFERENCES"))
+        _draw_format_box(layout, "Shape Keys (.bls)", bls_items)
+
+        _draw_format_box(layout, "Textures (.bti)", (
+            (IMPORT_OT_bti.bl_idname, "Import Texture", "IMPORT"),
+            (EXPORT_OT_bti.bl_idname, "Export Textures", "EXPORT"),
+        ))
+
+        _draw_format_box(layout, "Collision (.kcl)", (
+            (IMPORT_OT_kcl.bl_idname, "Import Collision", "IMPORT"),
+            (EXPORT_OT_kcl.bl_idname, "Export Collision", "EXPORT"),
+        ))
+
+
 def menu_import(self, context):
     self.layout.operator(IMPORT_OT_bmd.bl_idname, text="J3D Model (.bmd/.bdl)")
     self.layout.operator(IMPORT_OT_bck.bl_idname, text="J3D Animation (.bck)")
+    self.layout.operator(IMPORT_OT_bti.bl_idname, text="J3D Texture (.bti)")
     self.layout.operator(IMPORT_OT_kcl.bl_idname, text="TP Collision (.kcl)")
+    self.layout.operator("bmd_shape_keys.import_files", text="J3D Shape Keys (.bls)")
+    self.layout.operator("bmd_shape_keys.import_folder",
+                         text="J3D Shape Keys from Folder (.bls)")
+
+
+def menu_image_import_bti(self, context):
+    self.layout.operator(IMPORT_OT_bti.bl_idname, text="Import J3D Texture (.bti)")
 
 
 def menu_export(self, context):
@@ -915,12 +1171,15 @@ def menu_export(self, context):
     self.layout.operator(EXPORT_OT_bti.bl_idname, text="J3D Textures (.bti)")
     self.layout.operator(EXPORT_OT_bck.bl_idname, text="J3D Animation (.bck)")
     self.layout.operator(EXPORT_OT_kcl.bl_idname, text="TP Collision (.kcl)")
+    self.layout.operator("bmd_shape_keys.export_files", text="J3D Shape Keys (.bls)")
 
 
 _classes = (IMPORT_OT_bmd, BMDImportFileState, IMPORT_OT_bmd_texc,
-            BMDExportGroupState, BMDExportTextureState, EXPORT_OT_bmd, EXPORT_OT_bti,
+            BMDExportGroupState, BMDExportTextureState, BMDExportTreeRow,
+            BMD_UL_bti_tree, EXPORT_OT_bmd, IMPORT_OT_bti,
+            IMPORT_OT_bti_node, EXPORT_OT_bti,
             IMPORT_OT_bck, EXPORT_OT_bck, IMPORT_OT_kcl, EXPORT_OT_kcl, MATERIAL_PT_bmd,
-            IMAGE_PT_bmd)
+            IMAGE_PT_bmd, BMD_PT_j3d)
 _file_handlers = []
 
 
@@ -959,7 +1218,39 @@ def _make_file_handlers():
             def poll_drop(cls, context):
                 return poll_file_object_drop(context)
 
-        return [BMD_FH_import, BCK_FH_import, KCL_FH_import]
+        class BLS_FH_import(bpy.types.FileHandler):
+            bl_idname = "BLS_FH_import"
+            bl_label = "J3D Shape Keys"
+            bl_import_operator = "bmd_shape_keys.import_files"
+            bl_file_extensions = ".bls"
+
+            @classmethod
+            def poll_drop(cls, context):
+                return poll_file_object_drop(context)
+
+        class BTI_FH_import(bpy.types.FileHandler):
+            bl_idname = "BTI_FH_import"
+            bl_label = "J3D BTI Texture"
+            bl_import_operator = "import_image.bti"
+            bl_file_extensions = ".bti"
+
+            @classmethod
+            def poll_drop(cls, context):
+                area = context.area
+
+                if area is not None:
+                    if area.type == "IMAGE_EDITOR":
+                        return True
+
+                    if area.type == "NODE_EDITOR":
+                        space = context.space_data
+                        return (space is not None and
+                                getattr(space, "tree_type", None) == "ShaderNodeTree")
+
+                return poll_file_object_drop(context)
+
+        return [BMD_FH_import, BCK_FH_import, KCL_FH_import, BLS_FH_import,
+                BTI_FH_import]
     except Exception:
         return []
 
@@ -969,20 +1260,50 @@ def register():
     bc.register_classes()
     for c in _classes:
         bpy.utils.register_class(c)
+
+    from . import bls_import_ui, bls_export_ui
+    for c in bls_import_ui.CLASSES:
+        bpy.utils.register_class(c)
+    for c in bls_export_ui.CLASSES:
+        bpy.utils.register_class(c)
+    bpy.types.Scene.bmd_shape_keys_settings = PointerProperty(
+        type=bls_import_ui.BMD_SK_Settings)
+    bpy.types.Scene.bmd_shape_keys_export_settings = PointerProperty(
+        type=bls_export_ui.BMD_SK_ExportSettings)
+    bpy.types.Scene.bmd_shape_keys_last_info = StringProperty(
+        name="Last BLS import", default="")
+
     _file_handlers = _make_file_handlers()
     for fh in _file_handlers:
         bpy.utils.register_class(fh)
     bpy.types.TOPBAR_MT_file_import.append(menu_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_export)
+    bpy.types.IMAGE_MT_image.append(menu_image_import_bti)
+    bpy.types.NODE_MT_context_menu.append(menu_node_import_bti)
 
 
 def unregister():
     global _file_handlers
+    bpy.types.NODE_MT_context_menu.remove(menu_node_import_bti)
+    bpy.types.IMAGE_MT_image.remove(menu_image_import_bti)
     bpy.types.TOPBAR_MT_file_export.remove(menu_export)
     bpy.types.TOPBAR_MT_file_import.remove(menu_import)
     for fh in _file_handlers:
         bpy.utils.unregister_class(fh)
     _file_handlers = []
+
+    from . import bls_import_ui, bls_export_ui
+    if hasattr(bpy.types.Scene, "bmd_shape_keys_last_info"):
+        del bpy.types.Scene.bmd_shape_keys_last_info
+    if hasattr(bpy.types.Scene, "bmd_shape_keys_export_settings"):
+        del bpy.types.Scene.bmd_shape_keys_export_settings
+    if hasattr(bpy.types.Scene, "bmd_shape_keys_settings"):
+        del bpy.types.Scene.bmd_shape_keys_settings
+    for c in reversed(bls_export_ui.CLASSES):
+        bpy.utils.unregister_class(c)
+    for c in reversed(bls_import_ui.CLASSES):
+        bpy.utils.unregister_class(c)
+
     for c in reversed(_classes):
         bpy.utils.unregister_class(c)
     bc.unregister_classes()

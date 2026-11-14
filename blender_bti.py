@@ -6,8 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .j3d import gx_texture as gx
-from .j3d.common import J3DError, u16, u32
+from .j3d import bti as bti_parser
+from .j3d.common import J3DError
 
 
 def _name_key(name):
@@ -126,72 +126,36 @@ def _candidate_folders(bmd_path, texc_dir=None):
     return folders
 
 
-def _read_bti(path):
-    """Return image data and metadata from a .bti file."""
-    data = Path(path).read_bytes()
-    if len(data) < 0x20:
-        raise J3DError(f"Texture file is too small: {path}")
-
-    fmt = data[0]
-    width = u16(data, 2)
-    height = u16(data, 4)
-    mip_count = max(1, data[0x18])
-    data_offset = u32(data, 0x1C)
-    pal_enabled = data[8]
-    pal_format = data[9]
-    pal_count = u16(data, 0x0A)
-    pal_offset = u32(data, 0x0C)
-
-    if data_offset == 0:
-        raise J3DError(f"Texture file has no image data: {path}")
-
-    palette = None
-    raw_palette = None
-    if fmt in (gx.C4, gx.C8, gx.C14X2) and pal_count:
-        raw_palette = data[pal_offset:pal_offset + pal_count * 2]
-        palette = gx.decode_palette(pal_format, raw_palette, pal_count)
-
-    level_size = gx.level_size(fmt, width, height)
-    total = gx.total_size(fmt, width, height, mip_count)
-    image = data[data_offset:data_offset + level_size]
-    if len(image) < level_size:
-        raise J3DError(f"Texture file is truncated: {path}")
-
-    raw = data[data_offset:data_offset + total]
-    if len(raw) != total:
-        raw = None
-
-    rgba = gx.decode(fmt, image, width, height, palette)
-    return (fmt, width, height, mip_count, pal_enabled, pal_format, pal_count, rgba,
-            raw, raw_palette, data)
-
-
 def apply_texture(texture, texc_dir):
     path = find_texture_file(texc_dir, texture.name)
     if path is None:
         return False
 
-    (fmt, width, height, mip_count, pal_enabled, pal_format, pal_count, rgba,
-     raw_data, raw_palette, full_data) = _read_bti(path)
+    try:
+        parsed = bti_parser.parse_bti(Path(path).read_bytes(), name=texture.name)
+    except J3DError as exc:
+        raise J3DError(f"{path}: {exc}") from exc
 
     if texture.external_size:
         expected_width, expected_height = texture.external_size
     else:
         expected_height, expected_width = texture.rgba.shape[:2]
+
+    width, height = parsed.rgba.shape[1], parsed.rgba.shape[0]
     if (width, height) != (expected_width, expected_height):
         raise J3DError(
             f"Texture dimensions differ from the BMD header: {path} "
             f"({width}x{height} != {expected_width}x{expected_height})")
 
-    texture.format = fmt
-    texture.rgba = rgba
-    texture.mip_count = mip_count
-    texture.pal_enabled = pal_enabled
-    texture.pal_format = pal_format
-    texture.pal_count = pal_count
-    texture.raw_data = raw_data
-    texture.raw_palette = raw_palette
-    texture.raw_bti = full_data
+    texture.format = parsed.format
+    texture.rgba = parsed.rgba
+    texture.mip_count = parsed.mip_count
+    texture.pal_enabled = parsed.pal_enabled
+    texture.pal_format = parsed.pal_format
+    texture.pal_count = parsed.pal_count
+    texture.raw_data = parsed.raw_data
+    texture.raw_palette = parsed.raw_palette
+    texture.raw_bti = parsed.raw_bti
     texture.external_path = str(path)
     # Keep the sampling fields from the BMD header: they are part of the
     # material setup even when the pixels come from an external .bti.

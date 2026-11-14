@@ -3,9 +3,22 @@
 All images are handled as (height, width, 4) uint8 RGBA arrays, row 0 = top.
 """
 
+import struct
+from collections import namedtuple
+
 import numpy as np
 
 from .common import J3DError
+
+TEXTURE_HEADER_SIZE = 0x20
+TEXTURE_HEADER_STRUCT = ">BBHHBBBBHI4BBBbbBBhI"
+
+TextureHeader = namedtuple("TextureHeader", (
+    "format", "transparency", "width", "height", "wrap_s", "wrap_t",
+    "pal_enabled", "pal_format", "pal_count", "pal_offset",
+    "flags10", "min_filter", "mag_filter", "min_lod", "max_lod",
+    "mip_count", "unknown", "lod_bias", "data_offset",
+))
 
 I4, I8, IA4, IA8, RGB565, RGB5A3, RGBA32 = 0, 1, 2, 3, 4, 5, 6
 C4, C8, C14X2 = 8, 9, 10
@@ -26,6 +39,24 @@ BLOCK = {
 }
 
 PAL_IA8, PAL_RGB565, PAL_RGB5A3 = 0, 1, 2
+
+
+def unpack_texture_header(data, offset=0):
+    """Read the shared GX texture header used by TEX1 entries and .bti files."""
+    values = list(struct.unpack_from(TEXTURE_HEADER_STRUCT, data, offset))
+    values[10:14] = [bytes(values[10:14])]
+    return TextureHeader(*values)
+
+
+def pack_texture_header(header):
+    """Serialise a :class:`TextureHeader`."""
+    values = list(header)
+    flags = values[10]
+
+    if isinstance(flags, (bytes, bytearray)):
+        values[10:11] = list(flags[:4])
+
+    return struct.pack(TEXTURE_HEADER_STRUCT, *values)
 
 
 def level_size(fmt, w, h):
@@ -201,6 +232,44 @@ def decode(fmt, buf, w, h, palette=None):
         raise J3DError(f"Unsupported texture format {fmt}")
 
     return np.ascontiguousarray(out[:h, :w].astype(np.uint8))
+
+
+def decode_texture_payload(data, header, base=0, label="Texture"):
+    """Decode the palette and mip data referenced by a texture header.
+
+    ``header.data_offset`` and ``header.pal_offset`` are relative to *base*,
+    which is the start of the header in *data*.
+    """
+    fmt = header.format
+    width, height = header.width, header.height
+    mip_count = max(1, header.mip_count)
+    palette = None
+    raw_palette = None
+
+    if fmt in (C4, C8, C14X2) and header.pal_count:
+        start = base + header.pal_offset
+        raw_palette = bytes(data[start:start + header.pal_count * 2])
+
+        if len(raw_palette) < header.pal_count * 2:
+            raise J3DError(f"{label} palette is truncated")
+
+        palette = decode_palette(header.pal_format, raw_palette, header.pal_count)
+
+    start = base + header.data_offset
+    size = level_size(fmt, width, height)
+    buf = bytes(data[start:start + size])
+
+    if len(buf) < size:
+        raise J3DError(f"{label} data is truncated")
+
+    total = total_size(fmt, width, height, mip_count)
+    raw = bytes(data[start:start + total])
+
+    if len(raw) != total:
+        raw = None
+
+    rgba = decode(fmt, buf, width, height, palette)
+    return rgba, raw, raw_palette
 
 
 # --------------------------------------------------------------------------

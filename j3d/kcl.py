@@ -25,7 +25,7 @@ import struct
 
 import numpy as np
 
-from .common import J3DError
+from .common import J3DError, align
 
 HEADER_SIZE = 0x38
 MIN_LEAF_SHIFT = 2        # smallest leaf the original files use: 4 x 4 x 4 units
@@ -285,7 +285,7 @@ def write(tris, attrs, template=None):
         for nd in nodes:
             if isinstance(nd, _Node):
                 queue.append(nd.children)
-    lists_start = (pos + 3) & ~3
+    lists_start = align(pos, 4)
     stream = bytearray(struct.pack(">HH", 0, 0))      # empty list at offset 0 (p[0]=0, p[1]=0)
     list_ptr = {(): 0}
 

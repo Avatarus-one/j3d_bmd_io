@@ -376,41 +376,29 @@ def _parse_tex1(d, off):
     for i in range(n):
         e = off + o_hdr + 0x20 * i
         t = Texture(names[i] if i < len(names) else f"texture{i}")
-        t.format = u8(d, e)
-        t.transparency = u8(d, e + 1)
-        w, h = u16(d, e + 2), u16(d, e + 4)
-        t.wrap_s, t.wrap_t = u8(d, e + 6), u8(d, e + 7)
-        pal_fmt = u8(d, e + 9)
-        pal_cnt = u16(d, e + 0x0A)
-        pal_off = u32(d, e + 0x0C)
-        t.flags10 = bytes(d[e + 0x10:e + 0x14])
-        t.min_filter, t.mag_filter = u8(d, e + 0x14), u8(d, e + 0x15)
-        t.min_lod = struct.unpack_from(">b", d, e + 0x16)[0]
-        t.max_lod = struct.unpack_from(">b", d, e + 0x17)[0]
-        t.mip_count = max(1, u8(d, e + 0x18))
-        t.lod_bias = s16(d, e + 0x1A)
-        data_off = u32(d, e + 0x1C)
-        palette = None
-        t.pal_enabled, t.pal_format, t.pal_count = u8(d, e + 8), pal_fmt, pal_cnt
-        if data_off == 0:
+        header = gx.unpack_texture_header(d, e)
+        t.format = header.format
+        t.transparency = header.transparency
+        w, h = header.width, header.height
+        t.wrap_s, t.wrap_t = header.wrap_s, header.wrap_t
+        t.flags10 = header.flags10
+        t.min_filter, t.mag_filter = header.min_filter, header.mag_filter
+        t.min_lod = header.min_lod
+        t.max_lod = header.max_lod
+        t.mip_count = max(1, header.mip_count)
+        t.lod_bias = header.lod_bias
+        t.pal_enabled = header.pal_enabled
+        t.pal_format = header.pal_format
+        t.pal_count = header.pal_count
+        if header.data_offset == 0:
             # No image data in the file: reading from the header itself would yield garbage.
             t.external = True
             t.external_size = (w, h)
             t.rgba = np.full((h, w, 4), 128, np.uint8)
             textures.append(t)
             continue
-        if t.format in (gx.C4, gx.C8, gx.C14X2) and pal_cnt:
-            t.raw_palette = bytes(d[e + pal_off:e + pal_off + pal_cnt * 2])
-            palette = gx.decode_palette(pal_fmt, t.raw_palette, pal_cnt)
-        start = e + data_off
-        size = gx.level_size(t.format, w, h)
-        buf = bytes(d[start:start + size])
-        if len(buf) < size:
-            raise J3DError(f"Texture '{t.name}' data is truncated")
-        total = gx.total_size(t.format, w, h, t.mip_count)
-        raw = bytes(d[start:start + total])
-        t.raw_data = raw if len(raw) == total else None
-        t.rgba = gx.decode(t.format, buf, w, h, palette)
+        t.rgba, t.raw_data, t.raw_palette = gx.decode_texture_payload(
+            d, header, base=e, label=f"Texture '{t.name}'")
         textures.append(t)
     seen = {}
     for t in textures:  # names can repeat in game files: make unique keys

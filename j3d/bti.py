@@ -1,17 +1,60 @@
-"""Write standalone GX texture files (``.bti``)."""
+"""Read and write standalone GX texture files (``.bti``)."""
 
 from __future__ import annotations
 
-import struct
-
 from . import gx_texture as gx
-from .common import J3DError
+from .common import J3DError, align
 
 _PALETTE_FORMATS = (gx.C4, gx.C8, gx.C14X2)
 
 
-def _align(value, alignment=32):
-    return (value + alignment - 1) // alignment * alignment
+def parse_bti(data, name="texture"):
+    """Parse a standalone ``.bti`` file into a :class:`j3d.model.Texture`."""
+    from .model import Texture
+
+    data = bytes(data)
+
+    if len(data) < gx.TEXTURE_HEADER_SIZE:
+        raise J3DError("Texture file is too small")
+
+    header = gx.unpack_texture_header(data)
+    fmt = header.format
+    width, height = header.width, header.height
+    mip_count = max(1, header.mip_count)
+
+    if width == 0 or height == 0:
+        raise J3DError("Texture has zero dimensions")
+
+    if header.data_offset == 0:
+        raise J3DError("Texture file has no image data")
+
+    if fmt not in gx.BLOCK:
+        raise J3DError(f"Unsupported texture format: {fmt}")
+
+    rgba, raw, raw_palette = gx.decode_texture_payload(
+        data, header, base=0, label="Texture file")
+
+    texture = Texture(name)
+    texture.format = fmt
+    texture.transparency = header.transparency
+    texture.wrap_s = header.wrap_s
+    texture.wrap_t = header.wrap_t
+    texture.min_filter = header.min_filter
+    texture.mag_filter = header.mag_filter
+    texture.min_lod = header.min_lod
+    texture.max_lod = header.max_lod
+    texture.mip_count = mip_count
+    texture.lod_bias = header.lod_bias
+    texture.flags10 = header.flags10
+    texture.rgba = rgba
+    texture.raw_data = raw
+    texture.raw_palette = raw_palette
+    texture.raw_bti = data
+    texture.pal_enabled = header.pal_enabled
+    texture.pal_format = header.pal_format
+    texture.pal_count = header.pal_count
+    texture.external = False
+    return texture
 
 
 def _flags10(texture):
@@ -54,7 +97,7 @@ def build_bti(texture):
         pal_format = int(texture.pal_format)
         pal_count = int(texture.pal_count)
         pal_offset = 0x20
-        data_offset = _align(0x20 + len(palette), 32)
+        data_offset = align(0x20 + len(palette), 32)
     else:
         pal_enabled, pal_format, pal_count = 0, 0, 0
         pal_offset = 0
@@ -62,8 +105,7 @@ def build_bti(texture):
 
     width = int(texture.rgba.shape[1])
     height = int(texture.rgba.shape[0])
-    header = struct.pack(
-        ">BBHHBBBBHI4BBBbbBBhI",
+    header = gx.TextureHeader(
         fmt,
         int(getattr(texture, "transparency", 0)),
         width,
@@ -74,7 +116,7 @@ def build_bti(texture):
         pal_format,
         pal_count,
         pal_offset,
-        *_flags10(texture),
+        _flags10(texture),
         int(getattr(texture, "min_filter", 1)),
         int(getattr(texture, "mag_filter", 1)),
         max(-128, min(127, int(getattr(texture, "min_lod", 0)))),
@@ -84,7 +126,7 @@ def build_bti(texture):
         max(-32768, min(32767, int(getattr(texture, "lod_bias", 0)))),
         data_offset,
     )
-    out = bytearray(header)
+    out = bytearray(gx.pack_texture_header(header))
     if palette:
         out += palette
         out += b"\0" * (data_offset - len(out))

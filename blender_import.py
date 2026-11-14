@@ -12,8 +12,8 @@ import numpy as np
 from mathutils import Matrix
 
 from . import blender_common as bc
-from . import external_textures
-from . import normal_metadata
+from . import blender_bti
+from . import bmd_metadata
 from .j3d import gx_texture as gx
 from .j3d import material as mat3
 from .j3d import model as j3d
@@ -27,7 +27,7 @@ def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=Tru
     base = os.path.splitext(os.path.basename(filepath))[0]
 
     if import_textures and any(t.external for t in bmd.textures):
-        missing_external = external_textures.load_for_bmd(bmd, filepath, texc_dir)
+        missing_external = blender_bti.load_for_bmd(bmd, filepath, texc_dir)
     else:
         missing_external = []
 
@@ -132,6 +132,76 @@ def _image_texture_signature(image):
     return digest.hexdigest()
 
 
+def apply_texture_metadata(image, texture, path=None):
+    """Copy parsed J3D texture metadata to a Blender image."""
+    h, w = texture.rgba.shape[:2]
+    image["bmd_name"] = texture.name
+    image["bmd_key"] = texture.key
+    if path is not None:
+        image["bmd_source_path"] = os.path.abspath(path)
+    image["bmd_transparency"] = int(texture.transparency)
+    image["bmd_wrap_s"] = int(texture.wrap_s)
+    image["bmd_wrap_t"] = int(texture.wrap_t)
+    image["bmd_min_filter"] = int(texture.min_filter)
+    image["bmd_mag_filter"] = int(texture.mag_filter)
+    image["bmd_min_lod"] = int(texture.min_lod)
+    image["bmd_max_lod"] = int(texture.max_lod)
+    image["bmd_lod_bias"] = int(texture.lod_bias)
+    image["bmd_flags10"] = texture.flags10.hex()
+    image["bmd_orig_format"] = gx.FORMAT_NAMES.get(texture.format, str(texture.format))
+    if texture.external:
+        external_size = texture.external_size or (w, h)
+        image["bmd_external_size"] = [int(external_size[0]), int(external_size[1])]
+    if texture.external_path:
+        image["bmd_external_path"] = texture.external_path
+    if texture.raw_data is not None:
+        image["bmd_raw"] = base64.b64encode(
+            zlib.compress(texture.raw_data, 6)).decode("ascii")
+        image["bmd_raw_fmt"] = int(texture.format)
+        image["bmd_raw_size"] = [int(w), int(h)]
+        image["bmd_raw_mips"] = int(texture.mip_count)
+        if texture.raw_palette:
+            image["bmd_raw_pal"] = base64.b64encode(
+                zlib.compress(texture.raw_palette, 6)).decode("ascii")
+            image["bmd_pal_fmt"] = int(texture.pal_format)
+            image["bmd_pal_count"] = int(texture.pal_count)
+        image["bmd_pal_en"] = int(texture.pal_enabled)
+    if texture.raw_bti is not None:
+        image["bmd_raw_bti"] = base64.b64encode(
+            zlib.compress(texture.raw_bti, 6)).decode("ascii")
+    fmt_name = gx.FORMAT_NAMES.get(texture.format, "AUTO")
+    try:
+        image.bmd.format = (
+            fmt_name if fmt_name in {i[0] for i in bc.FORMAT_ITEMS} else "AUTO")
+        image.bmd.mip_count = int(texture.mip_count)
+        image.bmd.external = bool(texture.external)
+    except Exception:
+        pass
+
+
+def create_texture_image(texture, name=None, path=None):
+    """Create a packed Blender image from a parsed J3D texture."""
+    height, width = texture.rgba.shape[:2]
+    image = bpy.data.images.new(name or texture.key, width, height, alpha=True)
+    pixels = (texture.rgba[::-1].astype(np.float32) / 255.0).reshape(-1)
+    image.pixels.foreach_set(pixels)
+
+    try:
+        image.alpha_mode = "STRAIGHT"
+    except Exception:
+        pass
+
+    apply_texture_metadata(image, texture, path=path)
+
+    try:
+        image.pack()
+    except Exception:
+        pass
+
+    image.use_fake_user = True
+    return image
+
+
 def _create_images(bmd, base, import_id):
     images = {}
     candidates = {}
@@ -165,58 +235,8 @@ def _create_images(bmd, base, import_id):
         if existing is not None:
             images[t.key] = existing
             continue
-        h, w = t.rgba.shape[:2]
-        img = bpy.data.images.new(t.key, w, h, alpha=True)
+        img = create_texture_image(t, name=t.key)
         img["bmd_import_id"] = import_id
-        px = (t.rgba[::-1].astype(np.float32) / 255.0).reshape(-1)
-        img.pixels.foreach_set(px)
-        try:
-            img.alpha_mode = "STRAIGHT"
-        except Exception:
-            pass
-        img["bmd_name"] = t.name
-        img["bmd_key"] = t.key
-        img["bmd_transparency"] = int(t.transparency)
-        img["bmd_wrap_s"] = int(t.wrap_s)
-        img["bmd_wrap_t"] = int(t.wrap_t)
-        img["bmd_min_filter"] = int(t.min_filter)
-        img["bmd_mag_filter"] = int(t.mag_filter)
-        img["bmd_min_lod"] = int(t.min_lod)
-        img["bmd_max_lod"] = int(t.max_lod)
-        img["bmd_lod_bias"] = int(t.lod_bias)
-        img["bmd_flags10"] = t.flags10.hex()
-        img["bmd_orig_format"] = gx.FORMAT_NAMES.get(t.format, str(t.format))
-        if t.external:
-            external_size = t.external_size or (w, h)
-            img["bmd_external_size"] = [int(external_size[0]), int(external_size[1])]
-        if t.external_path:
-            img["bmd_external_path"] = t.external_path
-        if t.raw_data is not None:  # original bytes: re-used verbatim by the exporter if untouched
-            img["bmd_raw"] = base64.b64encode(zlib.compress(t.raw_data, 6)).decode("ascii")
-            img["bmd_raw_fmt"] = int(t.format)
-            img["bmd_raw_size"] = [int(w), int(h)]
-            img["bmd_raw_mips"] = int(t.mip_count)
-            if t.raw_palette:
-                img["bmd_raw_pal"] = base64.b64encode(zlib.compress(t.raw_palette, 6)).decode("ascii")
-                img["bmd_pal_fmt"] = int(t.pal_format)
-                img["bmd_pal_count"] = int(t.pal_count)
-            img["bmd_pal_en"] = int(t.pal_enabled)
-        if t.raw_bti is not None:
-            img["bmd_raw_bti"] = base64.b64encode(zlib.compress(t.raw_bti, 6)).decode("ascii")
-        fmt_name = gx.FORMAT_NAMES.get(t.format, "AUTO")
-        try:
-            img.bmd.format = fmt_name if fmt_name in {i[0] for i in bc.FORMAT_ITEMS} else "AUTO"
-            img.bmd.mip_count = int(t.mip_count)
-            img.bmd.external = bool(t.external)
-        except Exception:
-            pass
-        try:
-            img.pack()
-        except Exception:
-            pass
-        # Textures such as the eye frames are not used by any material.  Without a fake user
-        # Blender deletes them on save, which would shift every texture index in the export.
-        img.use_fake_user = True
         images[t.key] = img
     return images
 
@@ -545,7 +565,7 @@ def _create_mesh_object(coll, arm_obj, bone_names, bmd, md, materials, base, sca
     if md.loop_normal_indices is not None and len(md.loop_normal_indices) == n_loops:
         normal_count = len(bmd.arrays.get(j3d.VA_NRM, ()))
         try:
-            normal_metadata.write_metadata(
+            bmd_metadata.write_metadata(
                 me, md.loop_normal_indices, normal_count, source="import",
                 position_offset=0, vertex_order=single)
         except ValueError as exc:

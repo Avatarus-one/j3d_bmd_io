@@ -1,11 +1,7 @@
-# J3D BMD / BCK Import & Export for Blender (Zelda: Twilight Princess / Dusklight)
+# J3D BMD / BCK / BLS Import & Export for Blender (Zelda: Twilight Princess / Dusklight)
 
-Imports and exports Nintendo J3D models (`.bmd`, `.bdl` read-only) and joint animations (`.bck`).
-
-Verified against `model.bmd` (static map, 22 shapes, 25 textures), `uri.bmd` (29 joints, envelope
-skinning, Maya matrix mode) and `uri_wait_a.bck`. Both models survive parse -> write -> parse with
-identical geometry, skin weights, normals, UVs and materials; unchanged textures are written back
-byte-for-byte.
+Imports and exports Nintendo J3D models (`.bmd`, `.bdl` read-only), joint animations (`.bck`),
+collision (`.kcl`) and shape keys (`.bls`).
 
 ## AI disclosure and disclaimer
 The source code of this add-on was written with the help of an AI model (Claude by Anthropic), working
@@ -27,7 +23,11 @@ In Blender:
 
 Edit -> Preferences -> Get Extensions -> drop-down (top right) -> *Install from Disk...* and pick
 the ZIP. The operators appear under File -> Import / Export:
-*J3D Model (.bmd)* and *J3D Animation (.bck)*. Files can also be dragged into the viewport.
+*J3D Model (.bmd)*, *J3D Animation (.bck)*, *TP Collision (.kcl)* and
+*J3D Shape Keys (.bls)*. Files can also be dragged into the viewport.
+
+All import/export commands are also available in `3D View > Sidebar > J3D >
+Import / Export`.
 
 ## Models
 1. **Import** with **Convert Units** enabled (default): the model is scaled to
@@ -81,15 +81,6 @@ envelopes once more as filler. Every export is checked against these rules befor
 ### Vertex formats
 Positions, normals and UVs have separate dropdowns with two choices each: **Float32** and **s16**.
 When **s16** is selected, a **Fraction** field appears next to it.
-
-When the export dialog opens, the lists are preselected from:
-
-1. the formats of the last successful export of the selected mesh;
-2. otherwise, the formats of the imported BMD;
-3. otherwise, Float32 for a new mesh.
-
-The fraction is restored together with the format. This means an imported BMD exports with its
-original arrays by default, while a new mesh defaults to float32.
 
 **Positions**
 
@@ -196,6 +187,66 @@ pixels).
 * New materials (without `bmd_material`) become simple unlit "texture x vertex colour" materials.
 * UV layers are named `UV0`..`UV7`, vertex colours `Col0` / `Col1`.
 
+## Shape keys (.bls)
+
+**Import**
+1. Import the BMD first. **Import as Single Mesh** is recommended, because BLS
+   vertex indices address one mesh.
+2. Select the target mesh, then `File > Import > J3D Shape Keys (.bls)` or
+   `J3D Shape Keys from Folder (.bls)`. The same commands are in the `J3D`
+   sidebar, **Import / Export** panel, under **Shape Keys (.bls)**.
+3. In the dialog choose the target mesh, open each file, uncheck or rename keys
+   as needed, and press OK.
+
+Keys are imported as BLS position deltas relative to the BLS base key, rotated
+from J3D Y-up to Blender Z-up and added to the target mesh's Basis coordinates.
+**Convert Units** must stay enabled for meshes imported with the same setting
+turned on.
+
+The dialog marks keys as `OK`, `Duplicate`, `Conflict`, `Base`, `No change` or
+`Incompatible`. Duplicate/conflict detection compares the actual vertex
+displacement, not file names or slot counts. A key that references a vertex
+outside the target mesh is `Incompatible` and cannot be imported.
+
+**Export**
+1. Select the mesh that contains the shape keys.
+2. `File > Export > J3D Shape Keys (.bls)`.
+3. Select the keys, change the trailing **Base Key Name**, if needed, and press
+**Export**.
+
+The exporter writes one BLS cluster containing the selected keys and a trailing
+base key, including generated base/key normals and the normal blend table.
+Normal destinations use the `bmd_normal_index` / `bmd_normal_meta` metadata
+written by the BMD importer/exporter. If the mesh topology or vertex positions
+changed, re-export the BMD first; the dialog warns when the metadata is stale.
+
+Requirements and limits:
+
+* BLS vertex indices must match the target mesh topology.
+* The matching BMD must be exported with **Float32** positions if edited; the
+  `s16` position option is not compatible with BLS. Normal deformation
+  additionally requires **Float32** normals.
+* Export the matching BMD from the same mesh alone (the usual **Import as Single
+  Mesh** workflow). A BMD containing several mesh objects gives each object its
+  own normal-index range.
+* **Apply Modifiers** preserves the normal metadata only when the evaluated
+  mesh has identical topology and vertex positions. Apply topology- or
+  position-changing modifiers before creating or exporting shape keys.
+* The BLS normal pool is limited to 8192 distinct vectors by the 13-bit index
+  field. Very large multi-key clusters may be exported with slightly reduced
+  normal precision; positions and normal destinations are not affected.
+* The export dialog validates the file before writing. Position-pool overflow,
+  vertex-index or cluster-size overflow, normal-blend overflow, an oversized
+  name table, non-Shift-JIS names, a missing key and base-name conflicts are
+  listed below the key tree, and **Export** stays disabled until they are
+  resolved.
+* BLS normals do not participate in Blender shape-key creation: Blender stores
+  vertex coordinates and recalculates normals from the geometry.
+* An original BLS is only guaranteed to work with the original BMD it was made
+  for. If the BMD is modified or re-exported, re-export the BLS as well.
+* A modified BLS can still target the original BMD when the mesh was imported
+  with this add-on.
+
 ## Animations (.bck)
 **Import**: select the imported armature, then File -> Import -> *J3D Animation (.bck)*. A new action
 is created (named after the file, with a fake user) and keyed on every frame with linear
@@ -235,8 +286,6 @@ matching collision mesh.
   winding defines the face normal, so make sure floors face upwards.
 
 ## Known limitations
-* **BLS compatibility:** If a BMD is modified and re-exported, its BLS file must be exported again.
-  A modified BLS can still target the original BMD when the mesh was imported with `j3d_bmd_io`.
 * No TEV shading in Blender; the Blender materials are only a preview.
 * Joint scales other than 1 are exact only for unchanged bones.
 * By default all bone influences are preserved (the BMD `EVP1` limit is 255 per vertex). Enable
@@ -244,5 +293,3 @@ matching collision mesh.
   engines that assume standard 4-bone skinning. Shapes are written as triangle lists (no strips), so
   files are larger than the originals. MDL3 (BDL display lists) is not written.
 * Only `bck` (joint animations) is supported, not `btk` / `btp` / `bpk` / `brk` / `bca`.
-* Not tested in a real Blender session: the `bpy` layer was exercised with a mock, the J3D code against
-  the real files. Please report API errors with the console output.

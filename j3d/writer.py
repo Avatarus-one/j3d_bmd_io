@@ -691,12 +691,14 @@ def _build_tex1(textures):
         max_lod = (mips - 1) * 8
         if t.raw_data is not None and t.raw_palette:
             pal_pos = align(pos + len(data), 32)
-        headers += struct.pack(">BBHHBBBBHI4BBBbbBBhI", fmt, t.transparency, w, h, t.wrap_s,
-                               t.wrap_t, pal_enabled, pal_fmt, pal_cnt,
-                               (pal_pos - hpos) if pal_pos else 0, *t.flags10, t.min_filter,
-                               t.mag_filter, min(max(t.min_lod, -128), 127),
-                               min(max(t.max_lod if (t.raw_data is not None or external) else max_lod, -128), 127),
-                               mips, 0, t.lod_bias, 0 if external else pos - hpos)
+        headers += gx.pack_texture_header(gx.TextureHeader(
+            fmt, t.transparency, w, h, t.wrap_s, t.wrap_t,
+            pal_enabled, pal_fmt, pal_cnt,
+            (pal_pos - hpos) if pal_pos else 0, t.flags10, t.min_filter,
+            t.mag_filter, min(max(t.min_lod, -128), 127),
+            min(max(t.max_lod if (t.raw_data is not None or external) else max_lod,
+                    -128), 127),
+            mips, 0, t.lod_bias, 0 if external else pos - hpos))
         if external:
             continue
         blobs.append((pos, data))

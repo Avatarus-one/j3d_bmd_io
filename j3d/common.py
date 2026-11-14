@@ -46,6 +46,11 @@ def pad_to(buf, a=32):
     return buf
 
 
+def j3d_file_header(magic, body_size, chunk_count=1):
+    """Build the 32-byte J3D1 file header (magic + size/count + padding)."""
+    return magic + struct.pack(">II", 32 + body_size, chunk_count) + b"\xff" * 16
+
+
 def j3d_hash(raw):
     h = 0
     for c in raw:

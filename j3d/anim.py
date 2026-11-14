@@ -9,7 +9,7 @@ import struct
 
 import numpy as np
 
-from .common import J3DError, align, pad_to, u32
+from .common import J3DError, align, j3d_file_header, pad_to, u32
 
 LOOP_ONCE, LOOP_ONCE_RESET, LOOP_LOOP, LOOP_MIRROR_ONCE, LOOP_MIRROR_LOOP = range(5)
 LOOP_NAMES = ["ONCE", "ONCE_RESET", "LOOP", "MIRROR_ONCE", "MIRROR_LOOP"]
@@ -241,4 +241,4 @@ def write_bck(bck):
         chunk += raw
     pad_to(chunk, 32)
     struct.pack_into(">I", chunk, 4, len(chunk))
-    return b"J3D1bck1" + struct.pack(">II", 32 + len(chunk), 1) + b"\xff" * 16 + bytes(chunk)
+    return j3d_file_header(b"J3D1bck1", len(chunk)) + bytes(chunk)
