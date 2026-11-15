@@ -10,7 +10,7 @@ from bpy.props import (
     PointerProperty,
     StringProperty,
 )
-from bpy.types import Operator, Panel, PropertyGroup, UIList
+from bpy.types import Operator, PropertyGroup, UIList
 from bpy_extras.io_utils import ExportHelper
 
 from . import blender_common as bc
@@ -66,17 +66,20 @@ def _cached_validation(settings, key_names, metadata_key):
 
 
 def _rebuild_export_tree(settings):
-    """Rebuild the scrollable tree: mesh root, base key, then shape keys."""
+    """Rebuild the scrollable tree: mesh root, optional base key, shape keys."""
     settings.tree_rows.clear()
     mesh_row = settings.tree_rows.add()
     mesh_row.kind = 'mesh'
-    if settings.keys:
+
+    if settings.show_base and settings.keys:
         base_row = settings.tree_rows.add()
         base_row.kind = 'base'
+
     for index, _item in enumerate(settings.keys):
         row = settings.tree_rows.add()
         row.kind = 'key'
         row.key_index = index
+
     settings.active_tree_row = 0
 
 
@@ -85,6 +88,7 @@ def _populate_export_keys(settings, target=None):
     if settings is None:
         return
 
+    previous = {item.name: item.include for item in settings.keys}
     settings.keys.clear()
     settings.base_include = True
     target = target if target is not None else settings.target
@@ -95,7 +99,7 @@ def _populate_export_keys(settings, target=None):
             for block in shape_keys.key_blocks[1:]:
                 item = settings.keys.add()
                 item.name = block.name
-                item.include = True
+                item.include = previous.get(block.name, True)
 
     _rebuild_export_tree(settings)
 
@@ -121,6 +125,11 @@ def _export_target_changed(self, context):
     if settings is not None:
         settings.base_name = _default_base_name(self.target)
 
+
+def _export_convert_units_changed(self, context):
+    """Keep the shared scene setting in sync with the BLS dialog."""
+    bc.store_convert_units(context, self.convert_units)
+
 class BMD_SK_ExportKeyItem(PropertyGroup):
     name: StringProperty()
     include: BoolProperty(
@@ -144,11 +153,14 @@ class BMD_SK_ExportSettings(PropertyGroup):
         update=_export_target_changed,
     )
     filepath: StringProperty(subtype='FILE_PATH')
+    blk_filepath: StringProperty(subtype='FILE_PATH')
+    show_base: BoolProperty(default=True)
     convert_units: BoolProperty(
         name='Convert Units',
         description='Convert shape key positions to J3D units '
                     '(100 scale). Disable for model-unit meshes',
         default=True,
+        update=_export_convert_units_changed,
     )
     base_name: StringProperty(
         name='Base Key Name',
@@ -162,8 +174,8 @@ class BMD_SK_ExportSettings(PropertyGroup):
         default=True,
     )
     base_include: BoolProperty(
-        name='Include Base Key',
-        description='The base key is always included in the exported BLS',
+        name='',
+        description='The base key is always included in the exported BLS.',
         default=True,
     )
     keys: CollectionProperty(type=BMD_SK_ExportKeyItem)
@@ -208,8 +220,7 @@ class BMD_SK_UL_export_tree(UIList):
             check = row.row()
             check.enabled = False
             check.prop(settings, 'base_include', text='')
-            row.label(text='', icon='SHAPEKEY_DATA')
-            row.prop(settings, 'base_name', text='')
+            row.label(text=settings.base_name, icon='SHAPEKEY_DATA')
             return
 
         key = (settings.keys[item.key_index]
@@ -225,43 +236,10 @@ class BMD_SK_UL_export_tree(UIList):
 # Export
 # ---------------------------------------------------------------------------
 
-def _find_view3d_context():
-    """Return a window/area/region suitable for a 3D View popover."""
-    window = getattr(bpy.context, 'window', None)
-    area = getattr(bpy.context, 'area', None)
-
-    if window is not None and area is not None and area.type == 'VIEW_3D':
-        region = next(
-            (region for region in area.regions
-             if region.type == 'WINDOW'), None)
-        if region is not None:
-            return window, area, region
-
-    for window in bpy.context.window_manager.windows:
-        for area in window.screen.areas:
-            if area.type != 'VIEW_3D':
-                continue
-            region = next(
-                (region for region in area.regions
-                 if region.type == 'WINDOW'), None)
-            if region is not None:
-                return window, area, region
-
-    return None, None, None
-
-
-def _open_export_settings():
-    """Timer callback: open the export settings popover after the file browser."""
+def open_export_dialog():
+    """Timer callback: open the BLS export dialog after the file browser."""
     try:
-        window, area, region = _find_view3d_context()
-
-        if window is None:
-            raise RuntimeError('No 3D View is available')
-
-        with bpy.context.temp_override(
-                window=window, area=area, region=region):
-            bpy.ops.wm.call_panel(
-                name='BMD_PT_bls_export_popover', keep_open=True)
+        bpy.ops.bmd_shape_keys.export_settings('INVOKE_DEFAULT')
     except Exception as exc:  # pragma: no cover - only in unusual UI states
         print(f'BLS exporter: could not open settings dialog: {exc}')
 
@@ -303,10 +281,6 @@ class BMD_SK_OT_export_files(Operator, ExportHelper):
     def execute(self, context):
         target = _export_mesh_target(context)
 
-        if target is None:
-            self.report({'ERROR'}, 'Select a mesh with shape keys')
-            return {'CANCELLED'}
-
         settings = _get_export_settings(context)
 
         if settings is None:
@@ -314,17 +288,18 @@ class BMD_SK_OT_export_files(Operator, ExportHelper):
             return {'CANCELLED'}
 
         settings.filepath = self.filepath
-        settings.target = target
-        _populate_export_keys(settings, target)
+
+        if target is not None:
+            settings.target = target
+
+        settings.convert_units = bc.saved_convert_units(context)
+        settings.show_base = True
+        _populate_export_keys(settings, settings.target)
 
         if not settings.base_name.strip():
-            settings.base_name = _default_base_name(target)
+            settings.base_name = _default_base_name(settings.target)
 
-        if not settings.keys:
-            self.report({'ERROR'}, 'The selected mesh has no shape keys to export')
-            return {'CANCELLED'}
-
-        bpy.app.timers.register(_open_export_settings, first_interval=0.05)
+        bpy.app.timers.register(open_export_dialog, first_interval=0.05)
         return {'FINISHED'}
 
 
@@ -373,6 +348,7 @@ def _perform_export(settings, operator, context):
         f'file: {stats["bytes"]} bytes'
     )
     context.scene.bmd_shape_keys_last_info = info
+    bc.store_convert_units(context, settings.convert_units)
     operator.report({'INFO'}, info)
     return {'FINISHED'}
 
@@ -422,21 +398,39 @@ def _draw_export_dialog(layout, settings):
     for error in errors:
         layout.label(text=error, icon='ERROR')
 
-    row = layout.row()
-    row.enabled = not errors
-    row.operator('bmd_shape_keys.export_confirm', text='Export', icon='EXPORT')
 
+class BMD_SK_OT_export_settings(Operator):
+    bl_idname = 'bmd_shape_keys.export_settings'
+    bl_label = 'Export BLS'
+    bl_description = 'Choose which shape keys to write'
+    bl_options = {'REGISTER'}
 
-class BMD_PT_bls_export_popover(Panel):
-    bl_idname = 'BMD_PT_bls_export_popover'
-    bl_label = 'Export J3D Shape Keys'
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'WINDOW'
-    bl_options = {'INSTANCED'}
-    bl_ui_units_x = 26
+    def invoke(self, context, _event):
+        settings = _get_export_settings(context)
+
+        if settings is None:
+            self.report({'ERROR'}, 'Export settings are unavailable')
+            return {'CANCELLED'}
+
+        if not settings.filepath:
+            self.report({'ERROR'}, 'Select an export file')
+            return {'CANCELLED'}
+
+        settings.convert_units = bc.saved_convert_units(context)
+        settings.show_base = True
+        _populate_export_keys(settings, settings.target)
+
+        if settings.target is not None and not settings.base_name.strip():
+            settings.base_name = _default_base_name(settings.target)
+
+        return context.window_manager.invoke_props_dialog(
+            self, width=650, confirm_text='Export')
 
     def draw(self, context):
         _draw_export_dialog(self.layout, _get_export_settings(context))
+
+    def execute(self, context):
+        return _perform_export(_get_export_settings(context), self, context)
 
 
 class BMD_SK_OT_export_confirm(Operator):
@@ -455,6 +449,6 @@ CLASSES = (
     BMD_SK_ExportSettings,
     BMD_SK_UL_export_tree,
     BMD_SK_OT_export_files,
+    BMD_SK_OT_export_settings,
     BMD_SK_OT_export_confirm,
-    BMD_PT_bls_export_popover,
 )

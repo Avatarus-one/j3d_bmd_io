@@ -103,6 +103,18 @@ def position_pool_count(obj, key_names, convert_units=True):
     return len(_position_pool(basis_coords, key_coords, sorted(moved), scale))
 
 
+def _unique_orig_name(used):
+    """Return a zero-key name that does not collide with *used* names."""
+    name = "orig"
+    counter = 1
+
+    while name.casefold() in used:
+        name = f"orig.{counter:03d}"
+        counter += 1
+
+    return name
+
+
 def validate_export(obj, key_names, base_name, convert_units=True):
     """Return short error strings that would stop the BLS writer.
 
@@ -143,10 +155,15 @@ def validate_export(obj, key_names, base_name, convert_units=True):
         errors.append("Base name conflicts with a key")
 
     cluster_name = mesh.name or obj.name
-    names = [cluster_name] + key_names
+    final_base = base_name or f"{cluster_name}__base"
+    used = {name.casefold() for name in key_names}
 
-    if base_name:
-        names.append(base_name)
+    if final_base.casefold() in used:
+        final_base = f"{final_base}_base"
+
+    used.add(final_base.casefold())
+    orig_name = _unique_orig_name(used)
+    names = [cluster_name, orig_name] + key_names + [final_base]
 
     for name in names:
         try:
@@ -192,8 +209,7 @@ def validate_export(obj, key_names, base_name, convert_units=True):
     if blend_count > 0xFFFF:
         errors.append(f"Normal blend: {blend_count}/65535")
 
-    final_base = base_name or f"{cluster_name}__base"
-    table_names = key_names + [final_base]
+    table_names = [orig_name] + key_names + [final_base]
     offset = 4 + 4 * len(table_names)
 
     for name in table_names:
@@ -526,6 +542,13 @@ def collect_export_data(obj, key_names, convert_units=True, base_name=None):
 
         if base_name.casefold() in existing:
             base_name = f"{base_name}_base"
+
+    existing.add(base_name.casefold())
+    orig_name = _unique_orig_name(existing)
+    keys.insert(0, (orig_name, list(base_positions)))
+
+    if key_normals:
+        key_normals.insert(0, list(base_normals))
 
     base_normals, key_normals = _fit_normal_pool(base_normals, key_normals)
 

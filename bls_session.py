@@ -354,7 +354,6 @@ def _analyse(session, existing_keys=None, vertex_count=None, delta_scale=0.01):
     # name keeps the NO_CHANGE status; later keys with the same name are
     # duplicates of it.
     no_change_entries = []
-    no_change_by_name = {}
 
     for file_entry in session.files:
         for entry in file_entry.keys:
@@ -390,52 +389,13 @@ def _analyse(session, existing_keys=None, vertex_count=None, delta_scale=0.01):
             external_key = external.get(name_key)
 
             if entry.record.is_zero:
-                if external_key is not None:
-                    if external_key.matches(
-                        entry.record, delta_scale=delta_scale
-                    ):
-                        entry.status = DUPLICATE
-                        entry.include = False
-                        entry.new_name = external_key.name
-                        entry.status_text = (
-                            f'Duplicate: same deformation as existing key '
-                            f'"{external_key.name}" on the target mesh'
-                        )
-                        file_entry.duplicate_count += 1
-                    else:
-                        entry.status = CONFLICT
-                        entry.include = True
-                        entry.renamed = True
-                        base_name = _rename_base(entry)
-                        entry.new_name = _unique_name(base_name, used_names)
-                        entry.status_text = (
-                            f'Conflict: target mesh already has key '
-                            f'"{external_key.name}" with different '
-                            f'deformation; renamed to "{entry.new_name}"'
-                        )
-                        file_entry.conflict_count += 1
-                else:
-                    first = no_change_by_name.get(name_key)
-
-                    if first is not None:
-                        entry.status = DUPLICATE
-                        entry.include = False
-                        entry.duplicate_of = first
-                        entry.new_name = first.name
-                        entry.status_text = (
-                            f'Duplicate: same deformation as '
-                            f'{first.file.display_name}'
-                        )
-                        file_entry.duplicate_count += 1
-                    else:
-                        entry.status = NO_CHANGE
-                        entry.include = False
-                        entry.new_name = entry.name
-                        entry.status_text = (
-                            'Does not change the geometry (matches the base key)'
-                        )
-                        no_change_entries.append(entry)
-                        no_change_by_name[name_key] = entry
+                # Zero-delta ("original") keys are never imported.  They are
+                # recreated automatically by the BLS/BLK exporters.
+                entry.status = NO_CHANGE
+                entry.include = False
+                entry.new_name = entry.name
+                entry.status_text = 'Does not change the geometry (not imported)'
+                no_change_entries.append(entry)
                 continue
 
             match = None
@@ -539,9 +499,12 @@ def _summarise_file(file_entry):
         file_entry.summary = 'Read error'
         return
 
-    # Count every key, including the base key, so this summary always
-    # matches the total shown in the dialog header.
-    total = len(file_entry.keys)
+    # Count visible keys (base included, zero/no-change keys are hidden), so
+    # this summary matches the total shown in the dialog header.
+    total = sum(
+        1 for key_entry in file_entry.keys
+        if not (key_entry.record.is_zero and not key_entry.is_base)
+    )
 
     parts = [f'{total} {_plural(total, "key", "keys")}']
 

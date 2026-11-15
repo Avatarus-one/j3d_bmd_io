@@ -7,7 +7,7 @@ import json
 import os
 
 import bpy
-from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty,
+from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, IntProperty,
                        PointerProperty, StringProperty)
 from bpy.types import Operator, OperatorFileListElement, Panel, PropertyGroup, UIList
 from bpy_extras.io_utils import ExportHelper, ImportHelper
@@ -15,6 +15,12 @@ from bpy_extras.io_utils import ExportHelper, ImportHelper
 from . import blender_common as bc
 
 _PENDING_BMD_IMPORT = None
+
+
+def _export_convert_units_changed(self, context):
+    """Keep the shared scene setting in sync with any export dialog."""
+    bc.store_convert_units(context, self.convert_units)
+
 
 _BTI_STATUS = {
     "new": ("New", "EXPORT"),
@@ -127,9 +133,6 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
         description="Convert J3D model units to Blender units (scale 0.01). ")
     bone_axis: EnumProperty(name="Bone Orientation", items=bc.BONE_AXIS_ITEMS, default="X")
     import_textures: BoolProperty(name="Import Textures", default=True)
-    single_mesh: BoolProperty(
-        name="Import as Single Mesh", default=True,
-        description="Import all shapes into one mesh; vertices keep the original BMD VTX1 order")
 
     def draw(self, context):
         layout = self.layout
@@ -137,7 +140,6 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
         layout.prop(self, "convert_units")
         layout.prop(self, "bone_axis")
         layout.prop(self, "import_textures")
-        layout.prop(self, "single_mesh")
 
     def execute(self, context):
         from . import blender_import
@@ -185,7 +187,7 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
                     "scale": scale,
                     "bone_axis": self.bone_axis,
                     "import_textures": self.import_textures,
-                    "single_mesh": self.single_mesh,
+                    "convert_units": self.convert_units,
                     "files": files,
                     "missing": missing,
                     "suggested": suggested,
@@ -207,11 +209,11 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
         for p in paths:
             try:
                 blender_import.import_bmd(context, p, scale, self.bone_axis,
-                                          self.import_textures, report=self.report,
-                                          single_mesh=self.single_mesh)
+                                          self.import_textures, report=self.report)
             except J3DError as exc:
                 self.report({"ERROR"}, f"{os.path.basename(p)}: {exc}")
                 return {"CANCELLED"}
+        bc.store_convert_units(context, self.convert_units)
         return {"FINISHED"}
 
 
@@ -356,13 +358,14 @@ class IMPORT_OT_bmd_texc(Operator):
                 blender_import.import_bmd(
                     context, path, pending["scale"], pending["bone_axis"],
                     pending["import_textures"], report=self.report,
-                    single_mesh=pending["single_mesh"], texc_dir=texc_dir)
+                    texc_dir=texc_dir)
             except J3DError as exc:
                 _PENDING_BMD_IMPORT = None
                 self.report({"ERROR"}, f"{os.path.basename(path)}: {exc}")
                 return {"CANCELLED"}
 
         _PENDING_BMD_IMPORT = None
+        bc.store_convert_units(context, pending["convert_units"])
         return {"FINISHED"}
 
     def cancel(self, context):
@@ -381,6 +384,7 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
 
     convert_units: BoolProperty(
         name="Convert Units", default=True,
+        update=_export_convert_units_changed,
         description="Convert Blender units to J3D model units (scale 100). ")
     use_selection: BoolProperty(name="Selected Only", default=True,
                                 description="Export only selected objects (select the armature and meshes)")
@@ -445,10 +449,13 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
 
     def invoke(self, context, _event):
         self._apply_detected_formats(context)
+        self.convert_units = bc.saved_convert_units(context)
+
         result = ExportHelper.invoke(self, context, _event)
         # File-select operators can restore their last-used properties while
         # opening; apply the detected formats once more before the panel draws.
         self._apply_detected_formats(context)
+        self.convert_units = bc.saved_convert_units(context)
         return result
 
     def draw(self, context):
@@ -491,6 +498,7 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
         except (blender_export.ExportError, J3DError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        bc.store_convert_units(context, self.convert_units)
         return {"FINISHED"}
 
 
@@ -929,8 +937,9 @@ class IMPORT_OT_kcl(Operator, ImportHelper):
     filename_ext = ".kcl"
     filter_glob: StringProperty(default="*.kcl", options={"HIDDEN"})
 
-    scale: FloatProperty(name="Scale", default=0.01, min=1e-6, soft_max=10.0, precision=4,
-                         description="Blender units per game unit (same as the BMD import)")
+    convert_units: BoolProperty(
+        name="Convert Units", default=True,
+        description="Convert J3D units to Blender units (scale 0.01)")
     plc_file: StringProperty(name="PLC File", default="",
                              description="Attribute table (room.plc). Empty = the .plc next to the "
                                          "file. Only used to describe the attributes")
@@ -938,11 +947,13 @@ class IMPORT_OT_kcl(Operator, ImportHelper):
     def execute(self, context):
         from . import blender_kcl
         from .j3d.common import J3DError
+        scale = 0.01 if self.convert_units else 1.0
         try:
-            blender_kcl.import_kcl(context, self.filepath, self.scale, self.plc_file, self.report)
+            blender_kcl.import_kcl(context, self.filepath, scale, self.plc_file, self.report)
         except J3DError as exc:
             self.report({"ERROR"}, f"{os.path.basename(self.filepath)}: {exc}")
             return {"CANCELLED"}
+        bc.store_convert_units(context, self.convert_units)
         return {"FINISHED"}
 
 
@@ -955,8 +966,10 @@ class EXPORT_OT_kcl(Operator, ExportHelper):
     filename_ext = ".kcl"
     filter_glob: StringProperty(default="*.kcl", options={"HIDDEN"})
 
-    scale: FloatProperty(name="Scale", default=100.0, min=1e-6, soft_max=1000.0, precision=3,
-                         description="Game units per Blender unit (inverse of the import scale)")
+    convert_units: BoolProperty(
+        name="Convert Units", default=True,
+        update=_export_convert_units_changed,
+        description="Convert Blender units to J3D units (scale 100)")
     use_selection: BoolProperty(name="Selected Only", default=True)
     apply_modifiers: BoolProperty(name="Apply Modifiers", default=True)
     default_attr: IntProperty(name="Default Attribute", default=0, min=0, max=65535,
@@ -966,15 +979,24 @@ class EXPORT_OT_kcl(Operator, ExportHelper):
                             description="Reuse the area and block size of the imported file when the "
                                         "new geometry still fits into it")
 
+    def invoke(self, context, event):
+        self.convert_units = bc.saved_convert_units(context)
+
+        result = ExportHelper.invoke(self, context, event)
+        self.convert_units = bc.saved_convert_units(context)
+        return result
+
     def execute(self, context):
         from . import blender_kcl
         from .j3d.common import J3DError
+        scale = 100.0 if self.convert_units else 1.0
         try:
-            blender_kcl.export_kcl(context, self.filepath, self.scale, self.use_selection,
+            blender_kcl.export_kcl(context, self.filepath, scale, self.use_selection,
                                    self.apply_modifiers, self.default_attr, self.keep_area, self.report)
         except (blender_kcl.KclExportError, J3DError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        bc.store_convert_units(context, self.convert_units)
         return {"FINISHED"}
 
 
@@ -989,23 +1011,22 @@ class IMPORT_OT_bck(Operator, ImportHelper):
     files: CollectionProperty(type=OperatorFileListElement, options={"HIDDEN", "SKIP_SAVE"})
     directory: StringProperty(subtype="DIR_PATH", options={"HIDDEN"})
 
-    use_model_scale: BoolProperty(name="Use Model Scale", default=True,
-                                  description="Use the scale the armature was imported with")
-    scale: FloatProperty(name="Scale", default=0.01, min=1e-6, soft_max=10.0, precision=4,
-                         description="Blender units per J3D unit (only if Use Model Scale is off)")
+    convert_units: BoolProperty(
+        name="Convert Units", default=True,
+        description="Convert J3D units to Blender units (scale 0.01)")
     set_scene_range: BoolProperty(name="Set Scene Range", default=True,
                                   description="Set the scene frame range to the animation length")
 
     def execute(self, context):
         from . import blender_anim
         from .j3d.common import J3DError
+        scale = 0.01 if self.convert_units else 1.0
         paths = [os.path.join(self.directory, f.name) for f in self.files] if self.files else []
         if not paths:
             paths = [self.filepath]
         for p in paths:
             try:
-                blender_anim.import_bck(context, p, self.scale, self.use_model_scale,
-                                        self.set_scene_range, self.report)
+                blender_anim.import_bck(context, p, scale, self.set_scene_range, self.report)
             except (blender_anim.AnimError, J3DError) as exc:
                 self.report({"ERROR"}, f"{os.path.basename(p)}: {exc}")
                 return {"CANCELLED"}
@@ -1021,10 +1042,10 @@ class EXPORT_OT_bck(Operator, ExportHelper):
     filename_ext = ".bck"
     filter_glob: StringProperty(default="*.bck", options={"HIDDEN"})
 
-    use_model_scale: BoolProperty(name="Use Model Scale", default=True,
-                                  description="Use the scale the armature was imported with")
-    scale: FloatProperty(name="Scale", default=100.0, min=1e-6, soft_max=1000.0, precision=3,
-                         description="J3D units per Blender unit (only if Use Model Scale is off)")
+    convert_units: BoolProperty(
+        name="Convert Units", default=True,
+        update=_export_convert_units_changed,
+        description="Convert Blender units to J3D units (scale 100)")
     loop_mode: EnumProperty(name="Loop Mode", items=blender_anim_items(), default="AUTO")
     frame_source: EnumProperty(
         name="Frame Range",
@@ -1032,15 +1053,97 @@ class EXPORT_OT_bck(Operator, ExportHelper):
                ("SCENE", "Scene Range", "Scene start / end frame")],
         default="ACTION")
 
+    def invoke(self, context, event):
+        self.convert_units = bc.saved_convert_units(context)
+
+        result = ExportHelper.invoke(self, context, event)
+        self.convert_units = bc.saved_convert_units(context)
+        return result
+
     def execute(self, context):
         from . import blender_anim
         from .j3d.common import J3DError
+        scale = 100.0 if self.convert_units else 1.0
         try:
-            blender_anim.export_bck(context, self.filepath, self.scale, self.use_model_scale,
+            blender_anim.export_bck(context, self.filepath, scale,
                                     self.loop_mode, self.frame_source, self.report)
         except (blender_anim.AnimError, J3DError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        bc.store_convert_units(context, self.convert_units)
+        return {"FINISHED"}
+
+
+class IMPORT_OT_blk(Operator, ImportHelper):
+    """Import a J3D shape-key animation (.blk) onto the active mesh"""
+    bl_idname = "import_anim.blk"
+    bl_label = "Import BLK"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filename_ext = ".blk"
+    filter_glob: StringProperty(default="*.blk", options={"HIDDEN"})
+    filepath: StringProperty(
+        name="File Path",
+        description="Filepath used for importing the file",
+        maxlen=1024,
+        subtype="FILE_PATH",
+        options={"SKIP_SAVE", "HIDDEN"},
+    )
+
+    def invoke(self, context, event):
+        if self.filepath:
+            return self.execute(context)
+
+        return ImportHelper.invoke(self, context, event)
+
+    def execute(self, context):
+        from . import blk_import
+
+        if not self.filepath:
+            self.report({"ERROR"}, "No BLK file selected")
+            return {"CANCELLED"}
+
+        return blk_import.begin_import(context, self.filepath, self)
+
+
+class EXPORT_OT_blk(Operator, ExportHelper):
+    """Export the active shape-key action as a J3D .blk animation"""
+    bl_idname = "export_anim.blk"
+    bl_label = "Export BLK"
+    bl_options = {"REGISTER", "PRESET"}
+
+    filename_ext = ".blk"
+    filter_glob: StringProperty(default="*.blk", options={"HIDDEN"})
+
+    def execute(self, context):
+        from . import blk_export, bls_export_ui
+
+        if not self.filepath:
+            self.report({"ERROR"}, "No BLK file selected")
+            return {"CANCELLED"}
+
+        settings = bls_export_ui._get_export_settings(context)
+
+        if settings is None:
+            self.report({"ERROR"}, "Export settings are unavailable")
+            return {"CANCELLED"}
+
+        target = context.active_object
+
+        if target is None or target.type != "MESH":
+            target = next(
+                (obj for obj in context.selected_objects if obj.type == "MESH"),
+                None)
+
+        if target is not None:
+            settings.target = target
+
+        settings.blk_filepath = self.filepath
+        settings.show_base = False
+        bls_export_ui._populate_export_keys(settings, settings.target)
+
+        bpy.app.timers.register(blk_export.open_export_dialog,
+                                first_interval=0.05)
         return {"FINISHED"}
 
 
@@ -1141,6 +1244,11 @@ class BMD_PT_j3d(Panel):
                 ("bmd_shape_keys.settings", "Import Settings", "PREFERENCES"))
         _draw_format_box(layout, "Shape Keys (.bls)", bls_items)
 
+        _draw_format_box(layout, "Shape Key Animation (.blk)", (
+            (IMPORT_OT_blk.bl_idname, "Import Animation", "IMPORT"),
+            (EXPORT_OT_blk.bl_idname, "Export Animation", "EXPORT"),
+        ))
+
         _draw_format_box(layout, "Textures (.bti)", (
             (IMPORT_OT_bti.bl_idname, "Import Texture", "IMPORT"),
             (EXPORT_OT_bti.bl_idname, "Export Textures", "EXPORT"),
@@ -1160,6 +1268,8 @@ def menu_import(self, context):
     self.layout.operator("bmd_shape_keys.import_files", text="J3D Shape Keys (.bls)")
     self.layout.operator("bmd_shape_keys.import_folder",
                          text="J3D Shape Keys from Folder (.bls)")
+    self.layout.operator(IMPORT_OT_blk.bl_idname,
+                         text="J3D Shape Key Animation (.blk)")
 
 
 def menu_image_import_bti(self, context):
@@ -1172,13 +1282,16 @@ def menu_export(self, context):
     self.layout.operator(EXPORT_OT_bck.bl_idname, text="J3D Animation (.bck)")
     self.layout.operator(EXPORT_OT_kcl.bl_idname, text="TP Collision (.kcl)")
     self.layout.operator("bmd_shape_keys.export_files", text="J3D Shape Keys (.bls)")
+    self.layout.operator(EXPORT_OT_blk.bl_idname,
+                         text="J3D Shape Key Animation (.blk)")
 
 
 _classes = (IMPORT_OT_bmd, BMDImportFileState, IMPORT_OT_bmd_texc,
             BMDExportGroupState, BMDExportTextureState, BMDExportTreeRow,
             BMD_UL_bti_tree, EXPORT_OT_bmd, IMPORT_OT_bti,
             IMPORT_OT_bti_node, EXPORT_OT_bti,
-            IMPORT_OT_bck, EXPORT_OT_bck, IMPORT_OT_kcl, EXPORT_OT_kcl, MATERIAL_PT_bmd,
+            IMPORT_OT_bck, EXPORT_OT_bck, IMPORT_OT_blk, EXPORT_OT_blk,
+            IMPORT_OT_kcl, EXPORT_OT_kcl, MATERIAL_PT_bmd,
             IMAGE_PT_bmd, BMD_PT_j3d)
 _file_handlers = []
 
@@ -1203,6 +1316,16 @@ def _make_file_handlers():
             bl_label = "J3D BCK"
             bl_import_operator = "import_anim.bck"
             bl_file_extensions = ".bck"
+
+            @classmethod
+            def poll_drop(cls, context):
+                return poll_file_object_drop(context)
+
+        class BLK_FH_import(bpy.types.FileHandler):
+            bl_idname = "BLK_FH_import"
+            bl_label = "J3D BLK Shape Key Animation"
+            bl_import_operator = "import_anim.blk"
+            bl_file_extensions = ".blk"
 
             @classmethod
             def poll_drop(cls, context):
@@ -1249,8 +1372,8 @@ def _make_file_handlers():
 
                 return poll_file_object_drop(context)
 
-        return [BMD_FH_import, BCK_FH_import, KCL_FH_import, BLS_FH_import,
-                BTI_FH_import]
+        return [BMD_FH_import, BCK_FH_import, BLK_FH_import, KCL_FH_import,
+                BLS_FH_import, BTI_FH_import]
     except Exception:
         return []
 
@@ -1261,15 +1384,25 @@ def register():
     for c in _classes:
         bpy.utils.register_class(c)
 
-    from . import bls_import_ui, bls_export_ui
+    from . import blk_export, blk_import, bls_import_ui, bls_export_ui
     for c in bls_import_ui.CLASSES:
         bpy.utils.register_class(c)
     for c in bls_export_ui.CLASSES:
+        bpy.utils.register_class(c)
+    for c in blk_import.CLASSES:
+        bpy.utils.register_class(c)
+    for c in blk_export.CLASSES:
         bpy.utils.register_class(c)
     bpy.types.Scene.bmd_shape_keys_settings = PointerProperty(
         type=bls_import_ui.BMD_SK_Settings)
     bpy.types.Scene.bmd_shape_keys_export_settings = PointerProperty(
         type=bls_export_ui.BMD_SK_ExportSettings)
+    bpy.types.Scene.bmd_blk_import_settings = PointerProperty(
+        type=blk_import.BMD_SK_BlkImportSettings)
+    bpy.types.Scene.bmd_convert_units = BoolProperty(
+        name="Convert Units",
+        default=True,
+        description="Last used Convert Units setting for imports and exports")
     bpy.types.Scene.bmd_shape_keys_last_info = StringProperty(
         name="Last BLS import", default="")
 
@@ -1292,13 +1425,21 @@ def unregister():
         bpy.utils.unregister_class(fh)
     _file_handlers = []
 
-    from . import bls_import_ui, bls_export_ui
+    from . import blk_export, blk_import, bls_import_ui, bls_export_ui
     if hasattr(bpy.types.Scene, "bmd_shape_keys_last_info"):
         del bpy.types.Scene.bmd_shape_keys_last_info
+    if hasattr(bpy.types.Scene, "bmd_convert_units"):
+        del bpy.types.Scene.bmd_convert_units
+    if hasattr(bpy.types.Scene, "bmd_blk_import_settings"):
+        del bpy.types.Scene.bmd_blk_import_settings
     if hasattr(bpy.types.Scene, "bmd_shape_keys_export_settings"):
         del bpy.types.Scene.bmd_shape_keys_export_settings
     if hasattr(bpy.types.Scene, "bmd_shape_keys_settings"):
         del bpy.types.Scene.bmd_shape_keys_settings
+    for c in reversed(blk_export.CLASSES):
+        bpy.utils.unregister_class(c)
+    for c in reversed(blk_import.CLASSES):
+        bpy.utils.unregister_class(c)
     for c in reversed(bls_export_ui.CLASSES):
         bpy.utils.unregister_class(c)
     for c in reversed(bls_import_ui.CLASSES):

@@ -3,7 +3,7 @@ schema_version = "1.0.0"
 id = "j3d_bmd_io"
 version = "0.4.0"
 name = "J3D BMD Import/Export (Twilight Princess)"
-tagline = "Import/export J3D .bmd, .bck, .bti, .bls and .kcl files"
+tagline = "Import/export J3D .bmd, .bck, .blk, .bti, .bls and .kcl files"
 maintainer = "Avatarus"
 type = "add-on"
 
@@ -18,4 +18,4 @@ license = [
 ]
 
 [permissions]
-files = "Import and export .bmd, .bck, .bti, .bls and .kcl files"
+files = "Import and export .bmd, .bck, .blk, .bti, .bls and .kcl files"

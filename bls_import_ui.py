@@ -36,7 +36,6 @@ _SESSION = None
 _SELECTABLE = (
     bls_session.UNIQUE,
     bls_session.CONFLICT,
-    bls_session.NO_CHANGE,
 )
 
 # Guards the file <-> key checkbox update callbacks against recursion.
@@ -209,14 +208,11 @@ def _apply_session_to_settings(settings, session):
                 key_index += 1
                 key_item.status = key_entry.status
                 key_item.status_text = key_entry.status_text
-                key_item.new_name = key_entry.new_name or key_entry.name
-                key_item.include = (
-                    key_entry.status in _SELECTABLE and
-                    (
-                        key_entry.status != bls_session.NO_CHANGE or
-                        settings.include_no_change
-                    )
+                key_item.is_zero = (
+                    key_entry.record.is_zero and not key_entry.is_base
                 )
+                key_item.new_name = key_entry.new_name or key_entry.name
+                key_item.include = key_entry.status in _SELECTABLE
     finally:
         _SYNCING = False
 
@@ -328,14 +324,6 @@ def _file_include_changed(self, context):
             if key_item.status not in _SELECTABLE:
                 continue
 
-            # "Include keys without changes" controls whether the file
-            # checkbox may select no-change keys.  Unchecking the file still
-            # deselects them.
-            if (self.include and
-                    key_item.status == bls_session.NO_CHANGE and
-                    not settings.include_no_change):
-                continue
-
             key_item.include = self.include
     finally:
         _SYNCING = False
@@ -390,30 +378,6 @@ def _key_name_changed(self, context):
     _redraw(context)
 
 
-def _include_no_change_changed(self, context):
-    """The import option toggled: apply it to every no-change key."""
-    global _SYNCING
-
-    if _SYNCING:
-        return
-
-    settings = _get_settings(context)
-
-    if settings is None:
-        return
-
-    _SYNCING = True
-
-    try:
-        for key_item in settings.keys:
-            if key_item.status == bls_session.NO_CHANGE:
-                key_item.include = self.include_no_change
-    finally:
-        _SYNCING = False
-
-    _refresh_file_includes(settings)
-    _redraw(context)
-
 # ---------------------------------------------------------------------------
 # Property groups
 # ---------------------------------------------------------------------------
@@ -446,6 +410,7 @@ class BMD_SK_KeyItem(PropertyGroup):
     status: StringProperty()
     status_text: StringProperty()
     is_base: BoolProperty()
+    is_zero: BoolProperty()
     clusters: StringProperty()
     vertex_count: IntProperty()
     normal_count: IntProperty()
@@ -476,14 +441,6 @@ class BMD_SK_Settings(PropertyGroup):
                     '(0.01 scale). Disable for model-unit meshes',
         default=True,
         update=_convert_units_changed,
-    )
-
-    include_no_change: BoolProperty(
-        name='Include keys without changes',
-        description='Automatically select keys that do not change the '
-                    'geometry',
-        default=True,
-        update=_include_no_change_changed,
     )
 
 
@@ -522,16 +479,13 @@ def _populate_settings(_context, settings, session):
                 key_item.status = key_entry.status
                 key_item.status_text = key_entry.status_text
                 key_item.is_base = key_entry.is_base
+                key_item.is_zero = (
+                    key_entry.record.is_zero and not key_entry.is_base
+                )
                 key_item.clusters = ', '.join(key_entry.record.clusters)
                 key_item.vertex_count = key_entry.record.position_count
                 key_item.normal_count = key_entry.record.normal_count
-                key_item.include = (
-                    key_entry.status in _SELECTABLE and
-                    (
-                        key_entry.status != bls_session.NO_CHANGE or
-                        settings.include_no_change
-                    )
-                )
+                key_item.include = key_entry.status in _SELECTABLE
     finally:
         _SYNCING = False
 
@@ -551,6 +505,8 @@ def _counts(settings):
             errors += 1
 
     for key_item in settings.keys:
+        if key_item.is_zero:
+            continue
         if key_item.status in _SELECTABLE:
             selectable += 1
             if key_item.status == bls_session.CONFLICT:
@@ -563,6 +519,13 @@ def _counts(settings):
             incompatible += 1
 
     return selected, selectable, duplicates, conflicts, incompatible, errors
+
+
+def _visible_key_count(settings):
+    return sum(
+        1 for key_item in settings.keys
+        if not key_item.is_zero
+    )
 
 
 def _file_has_selectable(settings, file_index):
@@ -798,7 +761,6 @@ def _draw_target_and_options(layout, settings):
     target_row.prop(settings, 'target')
 
     box.prop(settings, 'convert_units')
-    box.prop(settings, 'include_no_change')
 
     note = box.column(align=True)
     note.active = False
@@ -812,7 +774,7 @@ def _draw_summary(layout, settings):
     summary = layout.column(align=True)
     summary.label(
         text=f'Files: {len(settings.files)} · '
-             f'keys: {len(settings.keys)} · '
+             f'keys: {_visible_key_count(settings)} · '
              f'selected: {selected} of {selectable}',
         icon='INFO',
     )
@@ -920,7 +882,9 @@ class BMD_SK_UL_keys(UIList):
         view_file = data.view_file
 
         flags = [
-            self.bitflag_filter_item if item.file_index == view_file else 0
+            self.bitflag_filter_item
+            if item.file_index == view_file and not item.is_zero
+            else 0
             for item in items
         ]
         return flags, []
@@ -964,7 +928,7 @@ class BMD_SK_UL_keys(UIList):
 
         # New name input; the status keeps a fixed-ish trailing area.
         rest = split.column(align=True)
-        rest_split = rest.split(factor=0.70, align=True)
+        rest_split = rest.split(factor=0.75, align=True)
 
         input_col = rest_split.column(align=True)
         input_row = input_col.row(align=True)
@@ -1054,6 +1018,7 @@ def _draw_file_keys_uilist(layout, settings):
     total_keys = sum(
         1 for key_item in settings.keys
         if key_item.file_index == file_index
+        and not key_item.is_zero
     )
 
     if total_keys == 0:
@@ -1107,7 +1072,7 @@ class BMD_SK_OT_settings(Operator):
         )
         _apply_session_to_settings(settings, _SESSION)
 
-        return context.window_manager.invoke_props_dialog(self, width=650)
+        return context.window_manager.invoke_props_dialog(self, width=700)
 
     def draw(self, context):
         layout = self.layout

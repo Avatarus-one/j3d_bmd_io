@@ -11,6 +11,19 @@ from bpy.types import PropertyGroup
 from .j3d import gx_texture as gx
 from .j3d import material as mat3
 
+
+def saved_convert_units(context):
+    """Last Convert Units value stored on the scene (True when unset)."""
+    scene = getattr(context, "scene", None)
+    return bool(getattr(scene, "bmd_convert_units", True))
+
+
+def store_convert_units(context, value):
+    """Remember *value* as the shared Convert Units setting for this scene."""
+    scene = getattr(context, "scene", None)
+    if scene is not None and hasattr(scene, "bmd_convert_units"):
+        scene.bmd_convert_units = bool(value)
+
 # --- coordinate systems -------------------------------------------------------
 # J3D: +Y up, +Z forward.  Blender: +Z up, -Y forward.   p_blender = C @ p_j3d
 C = np.array([[1, 0, 0, 0],

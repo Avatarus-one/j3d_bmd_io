@@ -50,13 +50,6 @@ def find_armature(context):
     raise AnimError("Select the imported armature first")
 
 
-def resolve_scale(arm_obj, use_model_scale, manual_scale):
-    """Return Blender units per J3D unit."""
-    if use_model_scale and "bmd_scale" in arm_obj:
-        return float(arm_obj["bmd_scale"])
-    return float(manual_scale)
-
-
 def rest_local(bone, fix):
     """Rest transform of a bone relative to its parent (armature space for roots).
 
@@ -79,12 +72,11 @@ def rest_local(bone, fix):
 # import
 # --------------------------------------------------------------------------
 
-def import_bck(context, filepath, scale=0.01, use_model_scale=True, set_scene_range=True,
-               report=None):
+def import_bck(context, filepath, scale=0.01, set_scene_range=True, report=None):
     with open(filepath, "rb") as f:
         bck = anim.parse_bck(f.read())
     arm_obj = find_armature(context)
-    s = resolve_scale(arm_obj, use_model_scale, scale)
+    s = float(scale)
     fix = bc.axis_fix(arm_obj)
 
     bones = {b["bmd_index"]: b for b in arm_obj.data.bones if "bmd_index" in b}
@@ -102,7 +94,6 @@ def import_bck(context, filepath, scale=0.01, use_model_scale=True, set_scene_ra
     action = bpy.data.actions.new(name)
     action.use_fake_user = True
     action["bmd_loop_mode"] = int(bck.loop_mode)
-    action["bmd_duration"] = int(bck.duration)
     ad = arm_obj.animation_data or arm_obj.animation_data_create()
     ad.action = action
 
@@ -184,7 +175,7 @@ def _continuous_euler(eul):
         out[j] = np.unwrap(out[j], axis=1)
     return out
 
-def export_bck(context, filepath, scale=100.0, use_model_scale=True, loop_mode="AUTO",
+def export_bck(context, filepath, scale=100.0, loop_mode="AUTO",
                frame_source="ACTION", report=None):
     arm_obj = find_armature(context)
     ad = arm_obj.animation_data
@@ -192,8 +183,6 @@ def export_bck(context, filepath, scale=100.0, use_model_scale=True, loop_mode="
     if action is None:
         raise AnimError("The armature has no active action to export")
     s = 1.0 / float(scale)
-    if use_model_scale and "bmd_scale" in arm_obj:
-        s = float(arm_obj["bmd_scale"])
     fix = bc.axis_fix(arm_obj)
 
     ordered = ordered_bones(arm_obj.data)
