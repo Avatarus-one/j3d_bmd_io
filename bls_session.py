@@ -41,6 +41,7 @@ class KeyEntry:
     include: bool = True
     new_name: str = ''
     renamed: bool = False
+    is_original: bool = False
     duplicate_of: Optional['KeyEntry'] = None
     conflict_with: Optional['KeyEntry'] = None
 
@@ -347,6 +348,7 @@ def _analyse(session, existing_keys=None, vertex_count=None, delta_scale=0.01):
             entry.include = True
             entry.new_name = ''
             entry.renamed = False
+            entry.is_original = False
             entry.duplicate_of = None
             entry.conflict_with = None
 
@@ -356,7 +358,16 @@ def _analyse(session, existing_keys=None, vertex_count=None, delta_scale=0.01):
     no_change_entries = []
 
     for file_entry in session.files:
+        # The original/zero key is the first zero-displacement key of the
+        # file.  It is identified by its data, not by its name.
+        original_pending = True
+
         for entry in file_entry.keys:
+            if (not entry.is_base and original_pending
+                    and entry.record.is_zero):
+                original_pending = False
+                entry.is_original = True
+
             # Incompatibility wins over every other status, including base
             # and no-change: such a key cannot be imported at all.
             offending_vertex = _out_of_bounds_vertex(
@@ -388,13 +399,13 @@ def _analyse(session, existing_keys=None, vertex_count=None, delta_scale=0.01):
             existing = variants.setdefault(name_key, [])
             external_key = external.get(name_key)
 
-            if entry.record.is_zero:
-                # Zero-delta ("original") keys are never imported.  They are
-                # recreated automatically by the BLS/BLK exporters.
+            if entry.is_original:
+                # Only the original/zero key is skipped; it is recreated
+                # automatically by the BLS/BLK exporters.
                 entry.status = NO_CHANGE
                 entry.include = False
                 entry.new_name = entry.name
-                entry.status_text = 'Does not change the geometry (not imported)'
+                entry.status_text = 'Original/zero key (not imported)'
                 no_change_entries.append(entry)
                 continue
 
@@ -459,12 +470,10 @@ def _analyse(session, existing_keys=None, vertex_count=None, delta_scale=0.01):
 
             existing.append(entry)
 
-    # Second pass: allocate final names for the first no-change key of each
-    # name only after all importable keys have their names.  This renames
-    # them on collision even when they are not selected for import.  Renamed
-    # keys use the same "<name> [<folder>]" form as conflicts.  Later
-    # no-change keys with the same name are duplicates and keep the original
-    # name, exactly like other duplicate keys.
+    # Second pass: allocate a final name for the original/zero key after all
+    # importable keys have their names.  It is not imported, but this keeps
+    # its stored name collision-free and consistent with the other entries.
+    # Renamed keys use the same "<name> [<folder>]" form as conflicts.
     for entry in no_change_entries:
         base_name = entry.name
 
@@ -477,7 +486,7 @@ def _analyse(session, existing_keys=None, vertex_count=None, delta_scale=0.01):
 
         if entry.renamed:
             entry.status_text = (
-                'Does not change the geometry (matches the base key); '
+                'Original/zero key (not imported); '
                 f'renamed to "{new_name}" because the name is already in use'
             )
 
@@ -499,11 +508,11 @@ def _summarise_file(file_entry):
         file_entry.summary = 'Read error'
         return
 
-    # Count visible keys (base included, zero/no-change keys are hidden), so
-    # this summary matches the total shown in the dialog header.
+    # Count visible keys (base included, only the original/zero key is
+    # hidden), so this summary matches the total shown in the dialog header.
     total = sum(
         1 for key_entry in file_entry.keys
-        if not (key_entry.record.is_zero and not key_entry.is_base)
+        if not key_entry.is_original
     )
 
     parts = [f'{total} {_plural(total, "key", "keys")}']

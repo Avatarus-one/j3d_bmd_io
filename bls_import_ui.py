@@ -208,8 +208,8 @@ def _apply_session_to_settings(settings, session):
                 key_index += 1
                 key_item.status = key_entry.status
                 key_item.status_text = key_entry.status_text
-                key_item.is_zero = (
-                    key_entry.record.is_zero and not key_entry.is_base
+                key_item.is_original = (
+                    key_entry.is_original and not key_entry.is_base
                 )
                 key_item.new_name = key_entry.new_name or key_entry.name
                 key_item.include = key_entry.status in _SELECTABLE
@@ -410,7 +410,7 @@ class BMD_SK_KeyItem(PropertyGroup):
     status: StringProperty()
     status_text: StringProperty()
     is_base: BoolProperty()
-    is_zero: BoolProperty()
+    is_original: BoolProperty()
     clusters: StringProperty()
     vertex_count: IntProperty()
     normal_count: IntProperty()
@@ -479,8 +479,8 @@ def _populate_settings(_context, settings, session):
                 key_item.status = key_entry.status
                 key_item.status_text = key_entry.status_text
                 key_item.is_base = key_entry.is_base
-                key_item.is_zero = (
-                    key_entry.record.is_zero and not key_entry.is_base
+                key_item.is_original = (
+                    key_entry.is_original and not key_entry.is_base
                 )
                 key_item.clusters = ', '.join(key_entry.record.clusters)
                 key_item.vertex_count = key_entry.record.position_count
@@ -505,7 +505,7 @@ def _counts(settings):
             errors += 1
 
     for key_item in settings.keys:
-        if key_item.is_zero:
+        if key_item.is_original:
             continue
         if key_item.status in _SELECTABLE:
             selectable += 1
@@ -524,7 +524,7 @@ def _counts(settings):
 def _visible_key_count(settings):
     return sum(
         1 for key_item in settings.keys
-        if not key_item.is_zero
+        if not key_item.is_original
     )
 
 
@@ -883,7 +883,7 @@ class BMD_SK_UL_keys(UIList):
 
         flags = [
             self.bitflag_filter_item
-            if item.file_index == view_file and not item.is_zero
+            if item.file_index == view_file and not item.is_original
             else 0
             for item in items
         ]
@@ -1018,7 +1018,7 @@ def _draw_file_keys_uilist(layout, settings):
     total_keys = sum(
         1 for key_item in settings.keys
         if key_item.file_index == file_index
-        and not key_item.is_zero
+        and not key_item.is_original
     )
 
     if total_keys == 0:

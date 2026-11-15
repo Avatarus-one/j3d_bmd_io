@@ -4,17 +4,19 @@ Imports and exports Nintendo J3D models (`.bmd`, `.bdl` read-only), joint animat
 collision (`.kcl`), shape keys (`.bls`) and shape-key animations (`.blk`).
 
 ## AI disclosure and disclaimer
-The source code of this add-on was written with the help of an AI model (Claude by Anthropic), working
-from the requirements, test files and feedback of me. The maintainer directed the
-project and tested the results in-game, but the code has not been independently audited.
+The original source code of this add-on was written with the help of an AI model (Claude by Anthropic),
+working from the requirements, test files and feedback of the maintainer. Later updates — BLS/BLK
+shape-key support, BTI textures, refactoring and test automation — were developed with
+DeepSeek V4.1 Flash (OpenCode). The maintainer directed the project and tested the results in-game,
+but the code has not been independently audited.
 
 The add-on is provided "as is", without warranty of any kind (see the GPL-3.0-or-later license).
 It reads and writes file formats that were analysed from publicly available information and the
 open-source Dusklight code. Always keep backups of your original game files; exported files can
 still crash the game or behave unexpectedly, especially collision (`.kcl`) edits.
 
-This is an unofficial fan tool. It is not affiliated with or endorsed by Nintendo, Anthropic, or the
-Dusklight / Twilit Realm project. No game assets are included.
+This is an unofficial fan tool. It is not affiliated with or endorsed by Nintendo, Anthropic,
+DeepSeek, OpenCode, or the Dusklight / Twilit Realm project. No game assets are included.
 
 ## Installation (Blender 4.2 - 5.x)
 Download this code as ZIP.
@@ -203,11 +205,11 @@ from J3D Y-up to Blender Z-up and added to the target mesh's Basis coordinates.
 **Convert Units** must stay enabled for meshes imported with the same setting
 turned on.
 
-Most game BLS files contain a `<cluster>__orig` key with zero displacement. It
-is the Maya "original" blend-shape target; its BLK track holds the remainder of
-the normalized weights (so it can be negative) and does not move any vertex.
-Zero-displacement keys are skipped during import. The BLS exporter recreates an
-`orig` shape key automatically.
+BLS files contain a key named `<cluster>__orig` with zero displacement. Its BLK
+track holds the remainder of the normalized weights (so it can be negative) and
+does not move any vertex. The importer skips the first zero-displacement key of
+each file and imports every other key. The BLS exporter recreates an `orig`
+shape key automatically.
 
 The dialog marks keys as `OK`, `Duplicate`, `Conflict`, `Base` or
 `Incompatible`. Duplicate/conflict detection compares the actual vertex
