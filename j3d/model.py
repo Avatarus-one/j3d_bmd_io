@@ -405,7 +405,7 @@ def _parse_tex1(d, off):
         n = seen.get(t.name, 0)
         seen[t.name] = n + 1
         if n:
-            t.key = f"{t.name}#{n}"
+            t.key = f"{t.name}.{n:03d}"
     return textures
 
 

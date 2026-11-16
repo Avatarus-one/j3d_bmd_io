@@ -186,17 +186,22 @@ pixels).
 
 ### Materials
 * Material tab -> *J3D (BMD) Material*: **Render Mode** (Auto keeps imported values; Opaque / Cutout /
-  Translucent), Alpha Reference, Backface Culling. The panel also lists the current **Image nodes**
-  keys and their formats.
+  Translucent), Alpha Reference, Backface Culling. The **Textures** box lists the material's texture
+  slots and lets you change, add or remove textures from the model's BMD texture list.
 * Alpha test and blending are detected from the material's `alphaComp` / `blend` data and wired into
   the shader (alpha test via "Greater Than", blending as *Blended*).
 * GX wraps per axis (Clamp / Repeat / Mirror). If the two axes differ, the importer builds a
   Separate XYZ -> Math -> Combine XYZ chain in front of the image node.
-* To swap a texture, set the image of node `bmd_tex0` (`bmd_tex1` ...). Per-image format, **BMD Key**,
-  mip count and sampling: Image Editor -> sidebar -> *Image* -> *J3D (BMD) Texture*. The BMD Key is
-  the internal key materials use; clearing it releases the key and falls back to a unique image name.
-  Moving a key to another image makes that image the owner, but a material still uses the image
-  assigned to its `bmd_tex<N>` node, so assign the new image there as well.
+* **BMD Textures** (3D View sidebar -> *J3D*) is the shared texture list of the model. It shows every
+  texture in export order with its index and BMD name.
+  Materials keep their textures when the list is re-ordered. To assign a texture to a material, use the
+  **Textures** box in *J3D (BMD) Material*.
+  Clearing the image with the **X** button removes it from the material nodes but keeps the slot
+  link, so assigning a new image to the same slot restores the material texture. The selected
+  texture's GX format, mip levels, external flag and sampling (wrap, filters, LOD) are shown below
+  the preview.
+  Deleting a slot shifts every later TEX1 index, so if the game addresses textures by index
+  (texture animations), keep the original slots and replace their images instead.
 * New materials (without `bmd_material`) become simple unlit "texture x vertex colour" materials.
 * UV layers are named `UV0`..`UV7`, vertex colours `Col0` / `Col1`.
 

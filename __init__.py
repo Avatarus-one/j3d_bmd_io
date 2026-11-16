@@ -1268,14 +1268,70 @@ class MATERIAL_PT_bmd(Panel):
         layout.prop(mat, "use_backface_culling")
         if "bmd_material" in mat:
             layout.label(text="Imported TEV data kept in 'bmd_material'", icon="INFO")
-        if mat.node_tree:
-            box = layout.box()
-            box.label(text="Image nodes", icon="IMAGE_DATA")
-            for node in mat.node_tree.nodes:
-                if node.type == "TEX_IMAGE" and node.name.startswith("bmd_tex") and node.image:
-                    row = box.row()
-                    row.label(text=f"{node.name[4:]}: {bc.texture_key(node.image)}")
-                    row.prop(node.image.bmd, "format", text="")
+        owner = _texture_owner(context)
+        box = layout.box()
+        box.label(text="Textures", icon="IMAGE_DATA")
+        slots = _material_texture_slots(mat, owner)
+        items = _texture_items(owner)
+        if slots:
+            for slot in sorted(slots):
+                owner_index = slots[slot]
+                owner_slot = owner.bmd_texture_list[owner_index]
+                key = bc.texture_slot_key(owner_slot)
+                label = f"{owner_index}: {owner_slot.name or key}"
+                row = box.row(align=True)
+                row.label(text=f"{slot}: {label}")
+                op = row.operator(BMD_OT_material_texture_menu.bl_idname,
+                                  text="", icon="IMAGE_DATA")
+                op.slot = slot
+                op.add = False
+                op.owner_name = owner.name if owner is not None else ""
+                op = row.operator(BMD_OT_texture_focus.bl_idname, text="",
+                                  icon="PREFERENCES")
+                op.owner_name = owner.name if owner is not None else ""
+                op.texture_index = owner_index
+                op = row.operator(BMD_OT_material_remove_texture.bl_idname,
+                                  text="", icon="X")
+                op.slot = slot
+        else:
+            box.label(text="No textures", icon="INFO")
+        if owner is None:
+            box.label(text="No BMD texture list for this material", icon="INFO")
+        elif not items:
+            box.label(text="Assign textures in BMD Textures first", icon="INFO")
+        elif len(slots) >= 8:
+            box.label(text="All 8 texture slots are used", icon="INFO")
+        else:
+            add = box.operator(BMD_OT_material_texture_menu.bl_idname,
+                               text="Add Texture", icon="ADD")
+            add.owner_name = owner.name
+            add.add = True
+
+
+def _draw_bmd_prop(layout, data, prop, label, factor=0.42, alert=False):
+    """Label + property field with a fixed-width label column."""
+    row = layout.split(factor=factor)
+    row.alert = alert
+    row.label(text=label)
+    row.prop(data, prop, text="")
+
+
+def _draw_bmd_image_settings(layout, img, hint=False):
+    _draw_bmd_prop(layout, img.bmd, "format", "GX Format", 0.3)
+    layout.prop(img.bmd, "mip_count")
+    layout.prop(img.bmd, "external")
+    if hint:
+        layout.label(text="Order and assignment: J3D sidebar > BMD Textures",
+                     icon="INFO")
+    box = layout.box()
+    box.label(text="Sampling", icon="TEXTURE")
+    _draw_bmd_prop(box, img.bmd, "wrap_s", "Wrap S", 0.3)
+    _draw_bmd_prop(box, img.bmd, "wrap_t", "Wrap T", 0.3)
+    _draw_bmd_prop(box, img.bmd, "min_filter", "Min Filter", 0.3)
+    _draw_bmd_prop(box, img.bmd, "mag_filter", "Mag Filter", 0.3)
+    _draw_bmd_prop(box, img.bmd, "min_lod", "Min LOD", 0.3)
+    _draw_bmd_prop(box, img.bmd, "max_lod", "Max LOD", 0.3)
+    _draw_bmd_prop(box, img.bmd, "lod_bias", "LOD Bias", 0.3)
 
 
 class IMAGE_PT_bmd(Panel):
@@ -1290,19 +1346,7 @@ class IMAGE_PT_bmd(Panel):
 
     def draw(self, context):
         img = context.space_data.image
-        self.layout.prop(img.bmd, "format")
-        self.layout.prop(img.bmd, "key")
-        self.layout.prop(img.bmd, "mip_count")
-        self.layout.prop(img.bmd, "external")
-        box = self.layout.box()
-        box.label(text="Sampling", icon="TEXTURE")
-        box.prop(img.bmd, "wrap_s")
-        box.prop(img.bmd, "wrap_t")
-        box.prop(img.bmd, "min_filter")
-        box.prop(img.bmd, "mag_filter")
-        box.prop(img.bmd, "min_lod")
-        box.prop(img.bmd, "max_lod")
-        box.prop(img.bmd, "lod_bias")
+        _draw_bmd_image_settings(self.layout, img, hint=True)
         external_path = img.get("bmd_external_path")
         if external_path:
             self.layout.label(text=f"External: {os.path.basename(external_path)}")
@@ -1374,6 +1418,555 @@ class BMD_PT_j3d(Panel):
         ))
 
 
+def _texture_mesh(context, owner=None):
+    """Selected mesh, or the first mesh deformed by *owner*."""
+    obj = context.active_object
+    if obj is not None and obj.type == "MESH":
+        return obj
+    for selected in context.selected_objects:
+        if selected.type == "MESH":
+            return selected
+    if owner is not None:
+        for candidate in bpy.data.objects:
+            if candidate.type == "MESH" and bc.target_armature(candidate) == owner:
+                return candidate
+    return None
+
+
+def _texture_owner(context):
+    """Object that owns the BMD texture list (armature, or a mesh without one)."""
+    obj = context.active_object
+    if obj is not None:
+        if obj.type == "ARMATURE":
+            return obj
+        if obj.type == "MESH":
+            arm = bc.target_armature(obj)
+            if (arm is not None
+                    and (len(arm.bmd_texture_list) or "bmd_textures" in arm)):
+                return arm
+            return obj
+    for selected in context.selected_objects:
+        if selected.type == "ARMATURE":
+            return selected
+        if selected.type == "MESH":
+            arm = bc.target_armature(selected)
+            if (arm is not None
+                    and (len(arm.bmd_texture_list) or "bmd_textures" in arm)):
+                return arm
+            return selected
+    scene = getattr(context, "scene", None)
+    if scene is not None:
+        for candidate in scene.objects:
+            if (candidate.type == "ARMATURE"
+                    and ("bmd_textures" in candidate
+                         or len(candidate.bmd_texture_list))):
+                return candidate
+            if (candidate.type == "MESH"
+                    and ("bmd_textures" in candidate
+                         or len(candidate.bmd_texture_list))):
+                return candidate
+    return None
+
+
+def _active_material(context):
+    mat = getattr(context, "material", None)
+    if mat is not None:
+        return mat
+    obj = getattr(context, "active_object", None)
+    if obj is not None:
+        return obj.active_material
+    return None
+
+
+def _populate_slot_maps():
+    """Fill missing material->BMD texture slot maps outside UI draw callbacks."""
+    try:
+        owner = _texture_owner(bpy.context)
+        if owner is not None:
+            for material in bpy.data.materials:
+                if not material.get("bmd_texture_slots"):
+                    bc.material_texture_slots(material, owner)
+    except Exception:
+        pass
+    return 1.0
+
+
+def _texture_items(owner):
+    """[(BMD texture index, slot, image)] for slots that have an image."""
+    if owner is None:
+        return []
+    coll = bc.ensure_texture_list(owner)
+    return [(i, slot, slot.image) for i, slot in enumerate(coll)
+            if slot.image is not None]
+
+
+def _material_texture_slots(mat, owner=None):
+    """{material texture slot: BMD texture index}."""
+    indices = bc.material_texture_slots(mat, owner, store=False)
+    out = {}
+    for n, s in enumerate(indices):
+        if (s is not None and owner is not None
+                and 0 <= s < len(owner.bmd_texture_list)):
+            out[n] = s
+    return out
+
+
+def _texture_label_for_key(owner, key):
+    if owner is not None:
+        for i, slot in enumerate(owner.bmd_texture_list):
+            if bc.texture_slot_key(slot) == key:
+                return f"{i}: {slot.name or key}"
+    return key
+
+
+def _set_material_texname(mat, slot, key):
+    stored = mat.get("bmd_material")
+    if not stored:
+        return
+    try:
+        data = json.loads(stored)
+    except Exception:
+        return
+    names = list(data.get("texNames") or [])
+    while len(names) < 8:
+        names.append(None)
+    names[slot] = key
+    data["texNames"] = names
+    mat["bmd_material"] = json.dumps(data, separators=(",", ":"))
+
+
+def _ensure_texture_node(mat, slot):
+    if mat.node_tree is None:
+        mat.use_nodes = True
+    tree = mat.node_tree
+    node = tree.nodes.get(f"bmd_tex{slot}")
+    if node is not None and node.type != "TEX_IMAGE":
+        tree.nodes.remove(node)
+        node = None
+    if node is None:
+        node = tree.nodes.new("ShaderNodeTexImage")
+        node.name = f"bmd_tex{slot}"
+        node.label = f"bmd_tex{slot}"
+        node.location = (-300, 300 - 280 * slot)
+        bsdf = next((n for n in tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        if bsdf is not None and not bsdf.inputs["Base Color"].is_linked:
+            tree.links.new(node.outputs["Color"], bsdf.inputs["Base Color"])
+    return node
+
+
+def _set_material_texture(mat, slot, image, texture_index, owner=None):
+    node = _ensure_texture_node(mat, slot)
+    node.image = image
+    _set_material_texname(mat, slot, bc.texture_key(image))
+    slots = bc.material_texture_slots(mat, owner)
+    slots[slot] = texture_index
+    bc.set_material_texture_slots(mat, slots)
+
+
+def _first_free_slot(mat, owner=None):
+    used = set(_material_texture_slots(mat, owner))
+    for i in range(8):
+        if i not in used:
+            return i
+    return None
+
+
+def _preview_icon(image):
+    """Preview icon id for an image, or 0 when no preview is available."""
+    try:
+        if image.preview is None:
+            image.preview_ensure()
+        preview = image.preview
+        if preview is not None:
+            return preview.icon_id
+    except Exception:
+        pass
+    return 0
+
+
+class BMD_OT_material_set_texture(Operator):
+    bl_idname = "bmd.material_set_texture"
+    bl_label = "Set Material Texture"
+    bl_description = "Change the texture used by this material slot"
+    bl_options = {"REGISTER", "UNDO"}
+
+    slot: IntProperty(name="Slot", default=0, min=0, max=7)
+    owner_name: StringProperty(name="Owner", default="")
+    texture: StringProperty(name="Texture", default="")
+
+    def execute(self, context):
+        mat = _active_material(context)
+        owner = (bpy.data.objects.get(self.owner_name)
+                 if self.owner_name else _texture_owner(context))
+        if mat is None or owner is None:
+            return {"CANCELLED"}
+        try:
+            index = int(self.texture)
+        except (TypeError, ValueError):
+            return {"CANCELLED"}
+        coll = bc.ensure_texture_list(owner)
+        if not (0 <= index < len(coll)) or coll[index].image is None:
+            return {"CANCELLED"}
+        _set_material_texture(mat, self.slot, coll[index].image, index, owner)
+        return {"FINISHED"}
+
+
+class BMD_OT_material_add_texture(Operator):
+    bl_idname = "bmd.material_add_texture"
+    bl_label = "Add Material Texture"
+    bl_description = "Add a texture from the BMD texture list to this material"
+    bl_options = {"REGISTER", "UNDO"}
+
+    owner_name: StringProperty(name="Owner", default="")
+    texture: StringProperty(name="Texture", default="")
+
+    def execute(self, context):
+        mat = _active_material(context)
+        owner = (bpy.data.objects.get(self.owner_name)
+                 if self.owner_name else _texture_owner(context))
+        if mat is None or owner is None:
+            return {"CANCELLED"}
+        try:
+            index = int(self.texture)
+        except (TypeError, ValueError):
+            return {"CANCELLED"}
+        coll = bc.ensure_texture_list(owner)
+        if not (0 <= index < len(coll)) or coll[index].image is None:
+            return {"CANCELLED"}
+        slot = _first_free_slot(mat, owner)
+        if slot is None:
+            self.report({"ERROR"}, "All 8 material texture slots are used")
+            return {"CANCELLED"}
+        _set_material_texture(mat, slot, coll[index].image, index, owner)
+        return {"FINISHED"}
+
+
+class BMD_OT_material_remove_texture(Operator):
+    bl_idname = "bmd.material_remove_texture"
+    bl_label = "Remove Material Texture"
+    bl_description = "Remove this texture slot from the material"
+    bl_options = {"REGISTER", "UNDO"}
+
+    slot: IntProperty(name="Slot", default=0, min=0, max=7)
+
+    def execute(self, context):
+        mat = _active_material(context)
+        if mat is None:
+            return {"CANCELLED"}
+        owner = _texture_owner(context)
+        tree = mat.node_tree
+        if tree is not None:
+            node = tree.nodes.get(f"bmd_tex{self.slot}")
+            if node is not None:
+                tree.nodes.remove(node)
+        _set_material_texname(mat, self.slot, None)
+        slots = bc.material_texture_slots(mat, owner)
+        slots[self.slot] = None
+        bc.set_material_texture_slots(mat, slots)
+        return {"FINISHED"}
+
+
+def _set_j3d_category(area):
+    for region in area.regions:
+        if region.type != "UI":
+            continue
+        try:
+            region.active_panel_category = "J3D"
+            area.tag_redraw()
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _activate_j3d_sidebar(area):
+    """Open the sidebar and switch it to J3D after the UI region exists."""
+    area.spaces.active.show_region_ui = True
+    pointer = area.as_pointer()
+    attempts = [0]
+
+    def apply_category():
+        screen = getattr(bpy.context, "screen", None)
+        target = None
+        if screen is not None:
+            target = next((a for a in screen.areas
+                           if a.as_pointer() == pointer), None)
+            if target is None:
+                target = next((a for a in screen.areas if a.type == "VIEW_3D"), None)
+        if target is not None and _set_j3d_category(target):
+            return None
+        attempts[0] += 1
+        return 0.05 if attempts[0] < 10 else None
+
+    bpy.app.timers.register(apply_category, first_interval=0.05)
+
+
+class BMD_OT_texture_focus(Operator):
+    bl_idname = "bmd.texture_focus"
+    bl_label = "Show BMD Texture Settings"
+    bl_description = "Select this texture in the BMD Textures panel"
+    bl_options = {"REGISTER", "UNDO"}
+
+    owner_name: StringProperty(name="Owner", default="")
+    texture_index: IntProperty(name="Texture Index", default=-1)
+
+    def execute(self, context):
+        owner = (bpy.data.objects.get(self.owner_name)
+                 if self.owner_name else _texture_owner(context))
+        if owner is None:
+            return {"CANCELLED"}
+        coll = bc.ensure_texture_list(owner)
+        if not (0 <= self.texture_index < len(coll)):
+            return {"CANCELLED"}
+        owner.bmd_texture_index = self.texture_index
+        obj = getattr(context, "object", None)
+        if obj is None or obj.type != "MESH":
+            obj = owner if owner.type == "MESH" else _texture_mesh(context, owner)
+        if obj is not None:
+            context.view_layer.objects.active = obj
+            obj.select_set(True)
+        screen = getattr(context, "screen", None)
+        area = (next((a for a in screen.areas if a.type == "VIEW_3D"), None)
+                if screen is not None else None)
+        if area is None:
+            self.report({"INFO"}, "Open a 3D View to see the BMD Textures panel")
+            return {"FINISHED"}
+        area.spaces.active.show_region_ui = True
+        _activate_j3d_sidebar(area)
+        return {"FINISHED"}
+
+
+class BMD_OT_material_texture_menu(Operator):
+    bl_idname = "bmd.material_texture_menu"
+    bl_label = "Select Material Texture"
+    bl_description = "Choose a texture from the BMD texture list"
+    bl_options = {"INTERNAL"}
+
+    owner_name: StringProperty(name="Owner", default="")
+    slot: IntProperty(name="Slot", default=-1)
+    add: BoolProperty(name="Add", default=False)
+
+    def invoke(self, context, event):
+        mat = _active_material(context)
+        owner = (bpy.data.objects.get(self.owner_name)
+                 if self.owner_name else _texture_owner(context))
+        if mat is None or owner is None:
+            return {"CANCELLED"}
+        items = _texture_items(owner)
+        if not items:
+            self.report({"INFO"}, "No textures assigned in BMD Textures")
+            return {"CANCELLED"}
+        slot = self.slot
+        add = self.add
+
+        def draw(menu, context):
+            for index, texture_slot, image in items:
+                label = f"{index}: {texture_slot.name or image.name}"
+                op_id = (BMD_OT_material_add_texture.bl_idname if add
+                         else BMD_OT_material_set_texture.bl_idname)
+                icon_value = _preview_icon(image)
+                if icon_value:
+                    op = menu.layout.operator(op_id, text=label,
+                                              icon_value=icon_value)
+                else:
+                    op = menu.layout.operator(op_id, text=label, icon="IMAGE_DATA")
+                op.owner_name = owner.name
+                op.texture = str(index)
+                if not add:
+                    op.slot = slot
+
+        context.window_manager.popup_menu(draw, title="Texture", icon="IMAGE_DATA")
+        return {"FINISHED"}
+
+
+class BMD_UL_textures(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data,
+                  active_propname, index, *args):
+        key = bc.texture_slot_key(item)
+        duplicate = bc.texture_is_duplicate(data, key)
+        row = layout.row(align=True)
+        row.alert = duplicate
+        index_col = row.column()
+        index_col.ui_units_x = 2.0
+        index_col.label(text=f"{index:02d}")
+        if duplicate:
+            row.label(text="", icon="ERROR")
+        name = item.name or (item.image.name if item.image is not None else "(no image)")
+        row.label(text=name)
+
+
+class BMD_OT_texture_add(Operator):
+    bl_idname = "bmd.texture_add"
+    bl_label = "Add BMD Texture"
+    bl_description = "Add an empty texture slot to the exported BMD texture list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        arm = _texture_owner(context)
+        if arm is None:
+            self.report({"ERROR"}, "Select the imported armature first")
+            return {"CANCELLED"}
+        coll = bc.ensure_texture_list(arm)
+        slot = coll.add()
+        slot.name = f"texture{len(coll) - 1}"
+        arm.bmd_texture_index = len(coll) - 1
+        bc.sync_texture_legacy(arm)
+        return {"FINISHED"}
+
+
+class BMD_OT_texture_remove(Operator):
+    bl_idname = "bmd.texture_remove"
+    bl_label = "Remove BMD Texture"
+    bl_description = "Remove the selected texture from the BMD texture list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: IntProperty(name="Index", default=-1)
+
+    def execute(self, context):
+        arm = _texture_owner(context)
+        if arm is None:
+            return {"CANCELLED"}
+        coll = bc.ensure_texture_list(arm)
+        index = self.index if self.index >= 0 else int(arm.bmd_texture_index)
+        if not (0 <= index < len(coll)):
+            return {"CANCELLED"}
+        for material in bpy.data.materials:
+            bc.material_texture_slots(material, arm)
+        key = bc.texture_slot_key(coll[index])
+        users = bc.material_slot_users(arm, index) if key else 0
+        if key:
+            bc.retarget_material_textures(key, "", None, index, arm, drop_slot=True)
+        coll.remove(index)
+        bc.remove_material_texture_slot(arm, index)
+        arm.bmd_texture_index = min(index, max(0, len(coll) - 1))
+        bc.sync_texture_legacy(arm)
+        if users:
+            self.report({"WARNING"},
+                        f"Removed a texture that was used by {users} material slot(s)")
+        return {"FINISHED"}
+
+
+class BMD_OT_texture_clear_image(Operator):
+    bl_idname = "bmd.texture_clear_image"
+    bl_label = "Clear BMD Texture Image"
+    bl_description = "Remove the image from the selected BMD texture slot"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        arm = _texture_owner(context)
+        if arm is None:
+            return {"CANCELLED"}
+        coll = bc.ensure_texture_list(arm)
+        index = int(arm.bmd_texture_index)
+        if not (0 <= index < len(coll)):
+            return {"CANCELLED"}
+        coll[index].image = None
+        return {"FINISHED"}
+
+
+class BMD_OT_texture_move(Operator):
+    bl_idname = "bmd.texture_move"
+    bl_label = "Move BMD Texture"
+    bl_description = "Move the texture up or down in the exported texture order"
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: IntProperty(name="Index", default=-1)
+    direction: EnumProperty(name="Direction",
+                            items=(("UP", "Up", ""), ("DOWN", "Down", "")))
+
+    def execute(self, context):
+        arm = _texture_owner(context)
+        if arm is None:
+            return {"CANCELLED"}
+        coll = bc.ensure_texture_list(arm)
+        index = self.index if self.index >= 0 else int(arm.bmd_texture_index)
+        target = index - 1 if self.direction == "UP" else index + 1
+        if not (0 <= index < len(coll) and 0 <= target < len(coll)):
+            return {"CANCELLED"}
+        for material in bpy.data.materials:
+            bc.material_texture_slots(material, arm)
+        order = list(range(len(coll)))
+        order.pop(index)
+        order.insert(target, index)
+        mapping = {old: new for new, old in enumerate(order)}
+        coll.move(index, target)
+        bc.remap_material_texture_slots(arm, mapping)
+        arm.bmd_texture_index = target
+        bc.sync_texture_legacy(arm)
+        return {"FINISHED"}
+
+
+class BMD_PT_textures(Panel):
+    bl_label = "BMD Textures"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "J3D"
+
+    @classmethod
+    def poll(cls, context):
+        return _texture_owner(context) is not None
+
+    def draw(self, context):
+        layout = self.layout
+        owner = _texture_owner(context)
+        if owner is None:
+            return
+        mesh = _texture_mesh(context, owner)
+        if mesh is not None:
+            layout.label(text=mesh.name, icon="MESH_DATA")
+        else:
+            layout.label(text=owner.name, icon="OBJECT_DATA")
+        coll = bc.ensure_texture_list(owner)
+        row = layout.row(align=True)
+        row.operator(BMD_OT_texture_add.bl_idname, text="Add", icon="ADD")
+        row.operator(BMD_OT_texture_remove.bl_idname, text="Remove", icon="REMOVE")
+        row.operator(BMD_OT_texture_move.bl_idname, text="", icon="TRIA_UP").direction = "UP"
+        row.operator(BMD_OT_texture_move.bl_idname, text="", icon="TRIA_DOWN").direction = "DOWN"
+        if not len(coll):
+            layout.label(text="No textures in this model", icon="INFO")
+            return
+        layout.template_list("BMD_UL_textures", "", owner, "bmd_texture_list",
+                             owner, "bmd_texture_index", rows=8)
+        duplicates = bc.texture_duplicates(owner)
+        if duplicates:
+            box = layout.box()
+            box.alert = True
+            box.label(text="Duplicate textures", icon="ERROR")
+            for key, indices in list(duplicates.items())[:6]:
+                first = coll[indices[0]]
+                name = first.name or (first.image.name if first.image is not None else key)
+                box.label(text=f"{name}: slots {', '.join(str(i) for i in indices)}")
+            if len(duplicates) > 6:
+                box.label(text=f"... and {len(duplicates) - 6} more")
+        index = min(max(int(owner.bmd_texture_index), 0), len(coll) - 1)
+        slot = coll[index]
+        key = bc.texture_slot_key(slot)
+        duplicate = bc.texture_is_duplicate(owner, key)
+        box = layout.box()
+        box.label(text=f"Texture {index}", icon="TEXTURE")
+        if slot.image is None:
+            box.label(text="No image (skipped on export)", icon="ERROR")
+        if duplicate:
+            box.label(text="Also used by another slot", icon="ERROR")
+        _draw_bmd_prop(box, slot, "name", "BMD Name", 0.3, alert=duplicate)
+        image_col = box.column()
+        image_col.alert = duplicate
+        if slot.image is not None:
+            try:
+                slot.image.preview_ensure()
+            except Exception:
+                pass
+        image_col.template_ID_preview(slot, "image", new="", open="",
+                                      unlink=BMD_OT_texture_clear_image.bl_idname)
+        if slot.image is not None:
+            settings = box.box()
+            settings.label(text="Texture Settings", icon="PREFERENCES")
+            _draw_bmd_image_settings(settings, slot.image)
+        if key:
+            box.label(text=f"Used by {bc.material_slot_users(owner, index)} material slot(s)",
+                      icon="MATERIAL")
+
+
 def menu_import(self, context):
     self.layout.operator(IMPORT_OT_bmd.bl_idname, text="J3D Model (.bmd/.bdl)")
     self.layout.operator(IMPORT_OT_bck.bl_idname, text="J3D Animation (.bck)")
@@ -1406,7 +1999,12 @@ _classes = (IMPORT_OT_bmd, BMDImportFileState, IMPORT_OT_bmd_texc,
             IMPORT_OT_bti_node, EXPORT_OT_bti,
             IMPORT_OT_bck, EXPORT_OT_bck, IMPORT_OT_blk, EXPORT_OT_blk,
             IMPORT_OT_kcl, EXPORT_OT_kcl, MATERIAL_PT_bmd,
-            IMAGE_PT_bmd, BMD_PT_j3d)
+            IMAGE_PT_bmd, BMD_PT_j3d, BMD_UL_textures,
+            BMD_OT_texture_add, BMD_OT_texture_remove,
+            BMD_OT_texture_clear_image, BMD_OT_texture_move,
+            BMD_OT_material_set_texture, BMD_OT_material_add_texture,
+            BMD_OT_material_remove_texture, BMD_OT_material_texture_menu,
+            BMD_OT_texture_focus, BMD_PT_textures)
 _file_handlers = []
 
 
@@ -1497,6 +2095,12 @@ def register():
     bc.register_classes()
     for c in _classes:
         bpy.utils.register_class(c)
+    try:
+        if not bpy.app.timers.is_registered(_populate_slot_maps):
+            bpy.app.timers.register(_populate_slot_maps, first_interval=1.0,
+                                    persistent=True)
+    except Exception:
+        pass
 
     from . import blk_export, blk_import, bls_import_ui, bls_export_ui
     for c in bls_import_ui.CLASSES:
@@ -1531,6 +2135,11 @@ def register():
 
 def unregister():
     global _file_handlers
+    try:
+        if bpy.app.timers.is_registered(_populate_slot_maps):
+            bpy.app.timers.unregister(_populate_slot_maps)
+    except Exception:
+        pass
     bpy.types.NODE_MT_context_menu.remove(menu_node_import_bti)
     bpy.types.IMAGE_MT_image.remove(menu_image_import_bti)
     bpy.types.TOPBAR_MT_file_export.remove(menu_export)

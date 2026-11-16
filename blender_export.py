@@ -1,6 +1,7 @@
 """Collect Blender data into an :class:`ExportModel` and write it as BMD3."""
 
 import base64
+import copy
 import json
 import math
 import os
@@ -128,8 +129,16 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
             print(f"[BMD] {message}")
 
     mats = _MaterialCollector(model, warn)
-    if arm_obj is not None and "bmd_textures" in arm_obj:
-        mats.preload_original_textures(arm_obj, source_file, allow_missing_textures, report)
+    texture_owner = None
+    if arm_obj is not None and ("bmd_textures" in arm_obj or len(arm_obj.bmd_texture_list)):
+        texture_owner = arm_obj
+    if texture_owner is None:
+        for obj in mesh_objs:
+            if "bmd_textures" in obj or len(obj.bmd_texture_list):
+                texture_owner = obj
+                break
+    if texture_owner is not None:
+        mats.preload_original_textures(texture_owner, source_file, allow_missing_textures, report)
     # Keep every imported material slot, including slots that currently have
     # no faces.  The game addresses materials by index, so dropping an unused
     # original material would shift every later material index.  New materials
@@ -839,43 +848,91 @@ class _MaterialCollector:
         return self._source
 
     def preload_original_textures(self, arm_obj, source_file, allow_missing, report):
-        """Add every texture of the imported model in its original order.
+        """Add every texture of the BMD texture list in its current order.
 
-        Texture indices are referenced by game code and animations (e.g. eye frames), so a
-        missing or re-ordered texture shifts them and crashes the game.  Textures whose image was
-        lost (Blender purges unused images) are restored from the original BMD if available.
+        The list order is the exported TEX1 order.  Materials reference textures
+        by key, so re-ordering the list only changes their indices.  Textures
+        whose image was lost (Blender purges unused images) are restored from
+        the original BMD if available.
         """
-        names = list(arm_obj["bmd_textures"])
-        keys = list(arm_obj["bmd_texture_keys"]) if "bmd_texture_keys" in arm_obj else names
+        slots = bc.ensure_texture_list(arm_obj)
         source = source_file or arm_obj.get("bmd_source", "")
-        missing, restored = [], []
-        # A key can be moved to another image (the BMD Key field is editable),
-        # so find the current owner by key instead of by the remembered image
-        # name.
-        by_key = {}
-        for image in bpy.data.images:
-            key = bc.texture_key(image)
-            if key:
-                by_key.setdefault(key, image)
-        for name, key in zip(names, keys):
-            img = by_key.get(key)
-            if img is None:
-                legacy = bpy.data.images.get(name)
-                if legacy is not None and bc.texture_key(legacy) == key:
-                    img = legacy
-            if img is not None:
-                self._texture_for(img)
+        missing, restored, empty = [], [], 0
+        seen = {}  # texture key -> number of slots already using it
+        dup_index = 0
+        duplicate_slots = 0
+
+        def duplicate_key(key):
+            nonlocal dup_index
+            dup_index += 1
+            out = f"__dup{dup_index}__{key}"
+            while out in self.images:
+                dup_index += 1
+                out = f"__dup{dup_index}__{key}"
+            return out
+
+        for slot in slots:
+            image = slot.image
+            if image is not None:
+                key = bc.texture_key(image)
+                if key in seen:
+                    # The same texture is used by several slots.  Keep the list
+                    # length/order by writing a separate TEX1 entry; materials
+                    # reference the first occurrence.
+                    tex = texture_from_image(image, self.warn)
+                    tex.key = duplicate_key(key)
+                    if slot.name:
+                        tex.name = slot.name
+                    self.images[tex.key] = tex
+                    self.model.textures.append(tex)
+                    seen[key] += 1
+                    duplicate_slots += 1
+                    continue
+                key = self._texture_for(image)
+                if slot.name:
+                    self.images[key].name = slot.name
+                if slot.key != key:
+                    slot.key = key
+                seen[key] = 1
+                continue
+            key = str(slot.key or "")
+            if not key:
+                empty += 1
+                continue
+            if key in seen:
+                tex = self._source_textures(source).get(key)
+                if tex is not None:
+                    tex = copy.deepcopy(tex)
+                    tex.key = duplicate_key(key)
+                    if slot.name:
+                        tex.name = slot.name
+                    self.images[tex.key] = tex
+                    self.model.textures.append(tex)
+                    restored.append(key)
+                    seen[key] += 1
+                    duplicate_slots += 1
+                else:
+                    missing.append(key)
                 continue
             tex = self._source_textures(source).get(key)
             if tex is not None:
+                if slot.name:
+                    tex.name = slot.name
                 self.images[key] = tex
                 self.model.textures.append(tex)
                 restored.append(key)
+                seen[key] = 1
             else:
                 missing.append(key)
         if restored:
             _warn(self.warn, f"{len(restored)} textures were missing in Blender and were restored "
                              f"from the original model: {', '.join(restored)}")
+        if empty:
+            _warn(self.warn, f"Skipped {empty} BMD texture slot(s) without an image")
+        if duplicate_slots:
+            _warn(self.warn,
+                  f"{duplicate_slots} duplicate texture slot(s) were exported as separate TEX1 "
+                  "entries; materials use the first slot with each texture")
         if missing and not allow_missing:
             raise ExportError(
                 f"{len(missing)} textures of the imported model no longer exist in Blender "

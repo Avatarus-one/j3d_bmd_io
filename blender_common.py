@@ -1,11 +1,13 @@
 """Shared helpers for the Blender import / export operators."""
 
+import json
 import math
 import os
 
 import numpy as np
 import bpy
-from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
+from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, IntProperty,
+                       PointerProperty, StringProperty)
 from bpy.types import PropertyGroup
 
 from .j3d import gx_texture as gx
@@ -194,6 +196,382 @@ def _image_filter_changed(self, context):
                     node.interpolation = interpolation
                 except Exception:
                     pass
+
+
+def texture_slot_key(slot):
+    """Stable key of a texture slot (the image key is authoritative)."""
+    if slot.image is not None:
+        return texture_key(slot.image)
+    if slot.key:
+        return str(slot.key)
+    return ""
+
+
+def texture_duplicates(arm_obj):
+    """{key: [slot indices]} for textures used by more than one slot."""
+    by_key = {}
+    for i, slot in enumerate(arm_obj.bmd_texture_list):
+        key = texture_slot_key(slot)
+        if key:
+            by_key.setdefault(key, []).append(i)
+    return {key: indices for key, indices in by_key.items() if len(indices) > 1}
+
+
+def texture_is_duplicate(arm_obj, key):
+    if not key:
+        return False
+    count = 0
+    for slot in arm_obj.bmd_texture_list:
+        if texture_slot_key(slot) == key:
+            count += 1
+            if count > 1:
+                return True
+    return False
+
+
+def image_by_key(key):
+    if not key:
+        return None
+    for image in bpy.data.images:
+        if texture_key(image) == key:
+            return image
+    return None
+
+
+def sync_texture_legacy(arm_obj):
+    """Keep the old bmd_textures / bmd_texture_keys arrays in sync."""
+    names, keys = [], []
+    for slot in arm_obj.bmd_texture_list:
+        key = texture_slot_key(slot)
+        name = slot.name
+        if slot.image is not None:
+            # Legacy arrays stored image datablock names, not BMD names.
+            name = slot.image.name
+        names.append(name)
+        keys.append(key)
+    arm_obj["bmd_textures"] = names
+    arm_obj["bmd_texture_keys"] = keys
+
+
+def ensure_texture_list(arm_obj):
+    """Return the texture list, rebuilding it from the legacy arrays if needed."""
+    coll = arm_obj.bmd_texture_list
+    if len(coll):
+        return coll
+    names = list(arm_obj.get("bmd_textures", []))
+    keys = list(arm_obj.get("bmd_texture_keys", []))
+    if not keys and names:
+        keys = [""] * len(names)
+    if not keys:
+        return coll
+    was_loading = bool(arm_obj.get("bmd_texture_loading", False))
+    arm_obj["bmd_texture_loading"] = True
+    try:
+        for i, key in enumerate(keys):
+            slot = coll.add()
+            slot.key = str(key)
+            image = image_by_key(key)
+            slot.image = image
+            if image is not None:
+                slot.name = str(image.get("bmd_name") or
+                                 (names[i] if i < len(names) else clean_texture_name(image)))
+            else:
+                slot.name = str(names[i]) if i < len(names) else ""
+    finally:
+        if not was_loading and "bmd_texture_loading" in arm_obj:
+            del arm_obj["bmd_texture_loading"]
+    sync_texture_legacy(arm_obj)
+    return coll
+
+
+def texture_slot(arm_obj, image):
+    """(index, slot) of *image* in the BMD texture list, or (-1, None)."""
+    if arm_obj is None or image is None:
+        return -1, None
+    ensure_texture_list(arm_obj)
+    key = texture_key(image)
+    for i, slot in enumerate(arm_obj.bmd_texture_list):
+        if slot.image == image or texture_slot_key(slot) == key:
+            return i, slot
+    return -1, None
+
+
+def texture_label(arm_obj, image):
+    """Human readable texture reference for the material panel."""
+    index, slot = texture_slot(arm_obj, image)
+    if slot is not None:
+        return f"{index}: {slot.name or image.name}"
+    return f"{image.name} (not in BMD list)"
+
+
+def material_texture_slots(mat, owner=None, store=True):
+    """BMD texture index per material texture slot (8 entries)."""
+    raw = mat.get("bmd_texture_slots")
+    slots = None
+    if raw:
+        try:
+            slots = json.loads(raw)
+        except Exception:
+            slots = None
+    if slots is None:
+        if owner is None:
+            return [None] * 8
+        slots = [None] * 8
+        key_to_index = {texture_slot_key(s): i
+                        for i, s in enumerate(owner.bmd_texture_list)}
+        stored = mat.get("bmd_material")
+        names = []
+        if stored:
+            try:
+                names = json.loads(stored).get("texNames") or []
+            except Exception:
+                names = []
+        for i, key in enumerate(names):
+            if key and key in key_to_index:
+                slots[i] = key_to_index[key]
+        tree = mat.node_tree
+        if tree is not None:
+            for node in tree.nodes:
+                if (node.type == "TEX_IMAGE" and node.name.startswith("bmd_tex")
+                        and node.name[7:].isdigit() and node.image is not None):
+                    key = texture_key(node.image)
+                    if key in key_to_index:
+                        slots[int(node.name[7:])] = key_to_index[key]
+        if store:
+            set_material_texture_slots(mat, slots)
+    return list(slots)[:8]
+
+
+def set_material_texture_slots(mat, slots):
+    values = list(slots)[:8]
+    while len(values) < 8:
+        values.append(None)
+    mat["bmd_texture_slots"] = json.dumps(values, separators=(",", ":"))
+
+
+def remap_material_texture_slots(owner, mapping):
+    for material in bpy.data.materials:
+        slots = material_texture_slots(material, owner)
+        new = [mapping.get(s, s) if s is not None else None for s in slots]
+        if new != slots:
+            set_material_texture_slots(material, new)
+
+
+def remove_material_texture_slot(owner, index):
+    for material in bpy.data.materials:
+        slots = material_texture_slots(material, owner)
+        changed = False
+        for n, s in enumerate(slots):
+            if s is None:
+                continue
+            if s == index:
+                slots[n] = None
+                changed = True
+            elif s > index:
+                slots[n] = s - 1
+                changed = True
+        if changed:
+            set_material_texture_slots(material, slots)
+
+
+def material_slot_users(owner, index):
+    return sum(1 for material in bpy.data.materials
+               if index in material_texture_slots(material, owner, store=False))
+
+
+def count_texture_users(key):
+    if not key:
+        return 0
+    count = 0
+    for material in bpy.data.materials:
+        tree = material.node_tree
+        stored = material.get("bmd_material")
+        names = None
+        if stored:
+            try:
+                names = json.loads(stored).get("texNames")
+            except Exception:
+                names = None
+        if names:
+            count += sum(1 for name in names if name == key)
+        if tree is None:
+            continue
+        for node in tree.nodes:
+            if node.type != "TEX_IMAGE":
+                continue
+            if names and key in names:
+                continue
+            if node.get("bmd_cleared_texture") == key:
+                count += 1
+            elif node.image is not None and texture_key(node.image) == key:
+                count += 1
+    return count
+
+
+def clear_material_textures(old_key, slot_index=None, owner=None):
+    """Clear the material image but keep the texture link for a later assignment."""
+    if not old_key:
+        return
+    for material in bpy.data.materials:
+        tree = material.node_tree
+        slots = (material_texture_slots(material, owner)
+                 if slot_index is not None and owner is not None else None)
+        if slots is not None and any(s is not None for s in slots):
+            if tree is None:
+                continue
+            for n, s in enumerate(slots):
+                if s != slot_index:
+                    continue
+                node = tree.nodes.get(f"bmd_tex{n}")
+                if node is not None and node.type == "TEX_IMAGE":
+                    node.image = None
+                    node["bmd_cleared_texture"] = old_key
+            continue
+        if tree is None:
+            continue
+        stored = material.get("bmd_material")
+        if stored:
+            try:
+                data = json.loads(stored)
+            except Exception:
+                data = None
+            if data is not None:
+                for slot, name in enumerate(data.get("texNames") or []):
+                    if name != old_key:
+                        continue
+                    node = tree.nodes.get(f"bmd_tex{slot}")
+                    if node is not None and node.type == "TEX_IMAGE":
+                        node.image = None
+                        node["bmd_cleared_texture"] = old_key
+        for node in tree.nodes:
+            if (node.type == "TEX_IMAGE" and node.image is not None
+                    and texture_key(node.image) == old_key):
+                node["bmd_cleared_texture"] = old_key
+                node.image = None
+
+
+def retarget_material_textures(old_key, new_key, new_image, slot_index=None,
+                               owner=None, drop_slot=False):
+    """Point the materials linked to the changed BMD texture at its replacement."""
+    if not old_key:
+        return
+    for material in bpy.data.materials:
+        tree = material.node_tree
+        slots = (material_texture_slots(material, owner)
+                 if slot_index is not None and owner is not None else None)
+        if slots is not None and any(s is not None for s in slots):
+            stored = material.get("bmd_material")
+            data = None
+            if stored:
+                try:
+                    data = json.loads(stored)
+                except Exception:
+                    data = None
+            names_changed = False
+            slots_changed = False
+            for n, s in enumerate(slots):
+                if s != slot_index:
+                    continue
+                if data is not None:
+                    names = list(data.get("texNames") or [])
+                    while len(names) < 8:
+                        names.append(None)
+                    names[n] = new_key or None
+                    data["texNames"] = names
+                    names_changed = True
+                if tree is not None:
+                    node = tree.nodes.get(f"bmd_tex{n}")
+                    if node is not None and node.type == "TEX_IMAGE":
+                        node.image = new_image
+                        if "bmd_cleared_texture" in node:
+                            del node["bmd_cleared_texture"]
+                if drop_slot and not new_key:
+                    slots[n] = None
+                    slots_changed = True
+            if names_changed:
+                material["bmd_material"] = json.dumps(data, separators=(",", ":"))
+            if slots_changed:
+                set_material_texture_slots(material, slots)
+            continue
+        stored = material.get("bmd_material")
+        data = None
+        if stored:
+            try:
+                data = json.loads(stored)
+            except Exception:
+                data = None
+        if data is not None:
+            names = data.get("texNames")
+            if names:
+                changed = False
+                for slot, name in enumerate(names):
+                    if name != old_key:
+                        continue
+                    names[slot] = new_key or None
+                    changed = True
+                    if tree is not None:
+                        node = tree.nodes.get(f"bmd_tex{slot}")
+                        if node is not None and node.type == "TEX_IMAGE":
+                            node.image = new_image
+                            if "bmd_cleared_texture" in node:
+                                del node["bmd_cleared_texture"]
+                if changed:
+                    material["bmd_material"] = json.dumps(data, separators=(",", ":"))
+        if tree is None:
+            continue
+        for node in tree.nodes:
+            if node.type != "TEX_IMAGE":
+                continue
+            if node.get("bmd_cleared_texture") == old_key:
+                node.image = new_image
+                del node["bmd_cleared_texture"]
+            elif (node.image is not None
+                  and texture_key(node.image) == old_key):
+                node.image = new_image
+
+
+def _texture_slot_image_changed(self, context):
+    arm_obj = self.id_data
+    if arm_obj is None or arm_obj.get("bmd_texture_loading"):
+        return
+    old_key = str(self.key or "")
+    image = self.image
+    new_key = texture_key(image) if image is not None else ""
+    slot_index = None
+    for i, slot in enumerate(arm_obj.bmd_texture_list):
+        if slot == self:
+            slot_index = i
+            break
+    if image is None:
+        if old_key:
+            clear_material_textures(old_key, slot_index, arm_obj)
+        # Keep self.key so assigning a new image can restore the material link.
+        sync_texture_legacy(arm_obj)
+        return
+    retarget_material_textures(old_key, new_key, image, slot_index, arm_obj)
+    self.key = new_key
+    stored = image.get("bmd_name")
+    self.name = str(stored) if stored else clean_texture_name(image)
+    sync_texture_legacy(arm_obj)
+
+
+def _texture_slot_name_changed(self, context):
+    arm_obj = self.id_data
+    if arm_obj is None or arm_obj.get("bmd_texture_loading"):
+        return
+    if self.image is not None:
+        if self.name:
+            self.image["bmd_name"] = self.name
+        elif "bmd_name" in self.image:
+            del self.image["bmd_name"]
+    sync_texture_legacy(arm_obj)
+
+
+class BMDTextureSlot(PropertyGroup):
+    image: PointerProperty(type=bpy.types.Image, name="Image",
+                           update=_texture_slot_image_changed)
+    name: StringProperty(name="BMD Name", update=_texture_slot_name_changed)
+    key: StringProperty(options={"HIDDEN"})
 
 
 class BMDImageProps(PropertyGroup):
@@ -425,13 +803,18 @@ def clean_texture_name(image):
 def register_classes():
     bpy.utils.register_class(BMDMaterialProps)
     bpy.utils.register_class(BMDImageProps)
-    from bpy.props import PointerProperty
+    bpy.utils.register_class(BMDTextureSlot)
     bpy.types.Material.bmd = PointerProperty(type=BMDMaterialProps)
     bpy.types.Image.bmd = PointerProperty(type=BMDImageProps)
+    bpy.types.Object.bmd_texture_list = CollectionProperty(type=BMDTextureSlot)
+    bpy.types.Object.bmd_texture_index = IntProperty(default=0, min=0)
 
 
 def unregister_classes():
+    del bpy.types.Object.bmd_texture_index
+    del bpy.types.Object.bmd_texture_list
     del bpy.types.Image.bmd
     del bpy.types.Material.bmd
+    bpy.utils.unregister_class(BMDTextureSlot)
     bpy.utils.unregister_class(BMDImageProps)
     bpy.utils.unregister_class(BMDMaterialProps)

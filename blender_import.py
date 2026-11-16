@@ -68,8 +68,20 @@ def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=Tru
 
     # keep the raw model data that is not editable in Blender
     # texture order matters in-game (texture animations switch textures by index)
-    arm_obj["bmd_textures"] = [images[t.key].name for t in bmd.textures if t.key in images]
-    arm_obj["bmd_texture_keys"] = [t.key for t in bmd.textures if t.key in images]
+    # The texture list is the exported TEX1 order and the UI for replacing /
+    # re-ordering textures; materials reference textures by key, not by index.
+    arm_obj["bmd_texture_loading"] = True
+    try:
+        slots = arm_obj.bmd_texture_list
+        for texture in bmd.textures:
+            slot = slots.add()
+            slot.key = texture.key
+            slot.name = texture.name
+            slot.image = images.get(texture.key)
+    finally:
+        if "bmd_texture_loading" in arm_obj:
+            del arm_obj["bmd_texture_loading"]
+    bc.sync_texture_legacy(arm_obj)
     arm_obj["bmd_source"] = os.path.abspath(filepath)
     arm_obj["bmd_vtx_formats"] = json.dumps({str(a): [c, t, f] for a, c, t, f in bmd.vtx_formats})
     arm_obj["bmd_inf_flags"] = int(bmd.inf_flags)
@@ -253,6 +265,7 @@ def _create_images(bmd, base, import_id):
     for t in bmd.textures:
         existing = reusable(t)
         if existing is not None:
+            apply_texture_metadata(existing, t)
             images[t.key] = existing
             continue
         img = create_texture_image(t, name=t.key)
@@ -271,6 +284,10 @@ def _create_material(bmd, index, m, images, warn=None):
     mat["bmd_name"] = name
     mat["bmd_index"] = index
     mat["bmd_material"] = _get_json_material(m)
+    key_to_index = {t.key: i for i, t in enumerate(bmd.textures)}
+    mat["bmd_texture_slots"] = json.dumps(
+        [key_to_index.get(key) if key else None
+         for key in m.get("texNames", [])], separators=(",", ":"))
     mat.use_backface_culling = (m.get("cull") == 2)
     mat.bmd.render_mode = "AUTO"
     alpha_ref = m["alphaComp"][1] if m.get("alphaComp") else 128

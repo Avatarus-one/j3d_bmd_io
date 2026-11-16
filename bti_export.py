@@ -53,7 +53,8 @@ def _disambiguate_labels(groups):
 def scene_bti_groups():
     """Group every external image in the scene by imported BMD/model."""
     models = [obj for obj in bpy.data.objects
-              if obj.type == "ARMATURE" and ("bmd_textures" in obj or "bmd_source" in obj)]
+              if obj.type == "ARMATURE" and ("bmd_textures" in obj or "bmd_source" in obj
+                                             or len(obj.bmd_texture_list))]
     models.sort(key=lambda arm: arm.name)
 
     groups = []
@@ -68,8 +69,10 @@ def scene_bti_groups():
         seen = set()
         seen_by_arm[arm] = seen
         groups.append(group)
-        for name in arm.get("bmd_textures", ()):
-            image = bpy.data.images.get(name)
+        for slot in bc.ensure_texture_list(arm):
+            image = slot.image
+            if image is None and slot.key:
+                image = bc.image_by_key(slot.key)
             if image is not None and image.bmd.external and image.name not in seen:
                 seen.add(image.name)
                 group["images"].append(image)
