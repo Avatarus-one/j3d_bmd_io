@@ -50,20 +50,54 @@ def find_armature(context):
     raise AnimError("Select the imported armature first")
 
 
-def rest_local(bone, fix):
+def _rest_chain_unchanged(bone):
+    """True when the bone and all of its ancestors still match the import."""
+    rest = bone.get("bmd_rest")
+    if rest is None or len(rest) != 16:
+        return False
+    parent_index = bone.get("bmd_parent")
+    if parent_index is not None:
+        if bone.parent is None:
+            if int(parent_index) >= 0:
+                return False
+        else:
+            parent_bmd = bone.parent.get("bmd_index")
+            if parent_bmd is None or int(parent_bmd) != int(parent_index):
+                return False
+    stored = np.array([float(x) for x in rest], dtype=np.float64)
+    current = bc.to_np(bone.matrix_local).reshape(-1)
+    if not np.allclose(current, stored, atol=1e-5, rtol=0.0):
+        return False
+    return bone.parent is None or _rest_chain_unchanged(bone.parent)
+
+
+def rest_local(bone, fix, scale=1.0):
     """Rest transform of a bone relative to its parent (armature space for roots).
 
-    Blender bones carry no scale, but J3D joints can (e.g. 1.6 on eyebrows).  The stored joint
-    scale is folded back in, so that "animation == rest pose" yields an identity basis and the
-    skinning matrix (animated * rest^-1) is not scaled twice.
+    Blender bones carry no scale, but J3D joints can (e.g. 1.6 on eyebrows).
+    For an unchanged imported bone the stored ``bmd_local`` is used directly:
+    it contains the exact joint scale, including negative (mirrored) scales
+    that Blender's edit-bone matrix cannot represent.  For an edited bone the
+    current Blender rest matrix is used and the magnitudes of the stored scale
+    are folded back in.
     """
+    local = bone.get("bmd_local")
+    if local is not None and len(local) >= 9 and _rest_chain_unchanged(bone):
+        L = bc.trs_matrix(local[6:9], local[3:6], local[0:3])
+        L[:3, 3] *= scale
+        if bone.parent is None:
+            return bc.C @ L @ bc.C_INV @ fix
+        return fix.T @ bc.C @ L @ bc.C_INV @ fix
+
     M = bc.to_np(bone.matrix_local)
     if bone.parent is not None:
         M = np.linalg.inv(bc.to_np(bone.parent.matrix_local)) @ M
-    local = bone.get("bmd_local")
     if local is not None and len(local) >= 9:
         S = np.eye(4)
-        S[:3, :3] = np.diag([float(x) for x in local[6:9]])
+        # The bone rest matrix keeps the sign of a negative scale but not its
+        # magnitude.  Fold in the magnitudes only, otherwise the sign would be
+        # applied twice.
+        S[:3, :3] = np.diag([abs(float(x)) for x in local[6:9]])
         M = M @ (fix.T @ bc.C @ S @ bc.C_INV @ fix)
     return M
 
@@ -105,14 +139,25 @@ def import_bck(context, filepath, scale=0.01, set_scene_range=True, report=None)
     except Exception:
         pass
     try:
+        sheared = []
         for j in range(min(njoints, max(bones) + 1)):
             bone = bones.get(j)
             if bone is None:
                 continue
-            _key_joint(arm_obj, bone, samples[j], frames, s, fix)
+            shear = _key_joint(arm_obj, bone, samples[j], frames, s, fix)
+            if shear > 1e-4:
+                sheared.append(bone.name)
     finally:
         if old_interp is not None:
             prefs.keyframe_new_interpolation_type = old_interp
+
+    if sheared and report:
+        names = ", ".join(sheared[:8])
+        if len(sheared) > 8:
+            names += ", ..."
+        report({"WARNING"},
+               "Animation is approximate for joints with a non-uniform rest "
+               "scale (Blender pose bones cannot store shear): " + names)
 
     if set_scene_range:
         context.scene.frame_start = 0
@@ -129,13 +174,18 @@ def import_bck(context, filepath, scale=0.01, set_scene_range=True, report=None)
 
 def _key_joint(arm_obj, bone, smp, frames, s, fix):
     pb = arm_obj.pose.bones[bone.name]
-    rest_inv = np.linalg.inv(rest_local(bone, fix))
+    rest_inv = np.linalg.inv(rest_local(bone, fix, s))
     n = len(frames)
     loc, quat, scl = np.zeros((n, 3)), np.zeros((n, 4)), np.zeros((n, 3))
+    shear = 0.0
     for i in range(n):
         L = bc.trs_matrix(smp[[0, 3, 6], i], smp[[1, 4, 7], i], smp[[2, 5, 8], i])
         basis = rest_inv @ bc.j3d_local_to_blender(L, s, fix, bone.parent is None)
-        loc[i], quat[i], scl[i] = bc.decompose(basis)
+        R, sc, sh = bc.split_trs(basis[:3, :3])
+        loc[i] = basis[:3, 3]
+        quat[i] = bc.matrix_to_quat(R)
+        scl[i] = sc
+        shear = max(shear, sh)
         if i and np.dot(quat[i], quat[i - 1]) < 0:  # keep the quaternion on the same hemisphere
             quat[i] = -quat[i]
 
@@ -148,6 +198,8 @@ def _key_joint(arm_obj, bone, smp, frames, s, fix):
         for i in key_frames:
             setattr(pb, prop, tuple(float(x) for x in data[i]))
             pb.keyframe_insert(prop, frame=float(frames[i]), group=bone.name)
+
+    return shear
 
 
 # --------------------------------------------------------------------------
@@ -175,8 +227,8 @@ def _continuous_euler(eul):
         out[j] = np.unwrap(out[j], axis=1)
     return out
 
-def export_bck(context, filepath, scale=100.0, loop_mode="AUTO",
-               frame_source="ACTION", report=None):
+def export_bck(context, filepath, scale=100.0, loop_mode="ONCE",
+               frame_source="ACTION", report=None, custom_range=None):
     arm_obj = find_armature(context)
     ad = arm_obj.animation_data
     action = ad.action if ad else None
@@ -189,15 +241,19 @@ def export_bck(context, filepath, scale=100.0, loop_mode="AUTO",
     if not ordered:
         raise AnimError("The armature has no bones")
     extra_root = sum(1 for b in ordered if b.parent is None) > 1  # model export adds a root joint
-    rests = [rest_local(b, fix) for b in ordered]
+    rests = [rest_local(b, fix, s) for b in ordered]
 
-    if frame_source == "SCENE":
+    if frame_source == "CUSTOM":
+        if custom_range is None:
+            raise AnimError("Custom frame range is not set")
+        start, end = int(custom_range[0]), int(custom_range[1])
+    elif frame_source == "SCENE":
         start, end = context.scene.frame_start, context.scene.frame_end
     else:
         f0, f1 = action.frame_range
         start, end = int(math.floor(f0)), int(math.ceil(f1))
-    if end <= start:
-        end = start + 1
+    if end < start:
+        raise AnimError("End frame must not be before start frame")
     frames = list(range(start, end + 1))
     nj = len(ordered) + (1 if extra_root else 0)
     smp = np.zeros((nj, 9, len(frames)))
@@ -205,28 +261,45 @@ def export_bck(context, filepath, scale=100.0, loop_mode="AUTO",
 
     scene = context.scene
     current = scene.frame_current
+    sheared = set()
     try:
         for fi, f in enumerate(frames):
             scene.frame_set(f)
             for j, bone in enumerate(ordered):
                 pb = arm_obj.pose.bones[bone.name]
-                Lb = rests[j] @ bc.to_np(pb.matrix_basis)
+                basis = bc.to_np(pb.matrix_basis)
+                _R_basis, _sc_basis, shear = bc.split_trs(basis[:3, :3])
+                if shear > 1e-4:
+                    sheared.add(bone.name)
+                Lb = rests[j] @ basis
                 L = bc.blender_local_to_j3d(Lb, s, fix, bone.parent is None)
-                sc = np.linalg.norm(L[:3, :3], axis=0)
-                sc[sc == 0] = 1.0
-                eul = matrix_to_euler(L[:3, :3] / sc[None, :])
+                R, sc, shear_l = bc.split_trs(L[:3, :3])
+                if shear_l > 1e-4:
+                    sheared.add(bone.name)
+                eul = matrix_to_euler(R)
                 smp[j, [0, 3, 6], fi] = sc
                 smp[j, [1, 4, 7], fi] = eul
                 smp[j, [2, 5, 8], fi] = L[:3, 3]
     finally:
         scene.frame_set(current)
 
+    if sheared and report:
+        names = ", ".join(sorted(sheared)[:8])
+        if len(sheared) > 8:
+            names += ", ..."
+        report({"WARNING"},
+               "Animation is approximate for joints with a non-uniform rest "
+               "scale (Blender pose bones cannot store shear): " + names)
+
     smp[:, [1, 4, 7], :] = _continuous_euler(smp[:, [1, 4, 7], :])
 
     if loop_mode == "AUTO":
         mode = int(action.get("bmd_loop_mode", anim.LOOP_LOOP))
     else:
-        mode = anim.LOOP_NAMES.index(loop_mode)
+        try:
+            mode = anim.LOOP_NAMES.index(loop_mode)
+        except ValueError:
+            raise AnimError(f"Unknown loop mode: {loop_mode}")
 
     tolerance = {anim.KIND_SCALE: 1e-4, anim.KIND_ROT: 2e-4, anim.KIND_TRANS: 0.01}
     bck = anim.Bck()
@@ -237,6 +310,10 @@ def export_bck(context, filepath, scale=100.0, loop_mode="AUTO",
     data = anim.write_bck(bck)
     with open(filepath, "wb") as f:
         f.write(data)
+    try:
+        action["bmd_loop_mode"] = mode
+    except Exception:
+        pass
     if report:
         keys = sum(len(t.keys) for jt in bck.tracks for t in jt)
         report({"INFO"}, f"Exported {len(frames)} frames for {nj} joints ({keys} keys, "

@@ -4,6 +4,7 @@ Includes BMD/BDL models, BCK animations, BLS shape keys and KCL collision.
 """
 
 import json
+import math
 import os
 
 import bpy
@@ -36,7 +37,51 @@ MAX_BTI_TREE_ROWS = 12
 
 def blender_anim_items():
     from .blender_anim import LOOP_ITEMS
-    return LOOP_ITEMS
+    return [item for item in LOOP_ITEMS if item[0] != "AUTO"]
+
+
+def _bck_action(context):
+    from . import blender_anim
+    try:
+        arm = blender_anim.find_armature(context)
+    except blender_anim.AnimError:
+        return None
+    ad = arm.animation_data
+    return ad.action if ad else None
+
+
+def _bck_loop_mode(context):
+    from . import blender_anim
+    from .j3d import anim
+    action = _bck_action(context)
+    if action is None:
+        return "ONCE"
+    try:
+        mode = int(action.get("bmd_loop_mode", anim.LOOP_ONCE))
+    except (TypeError, ValueError):
+        return "ONCE"
+    if 0 <= mode < len(anim.LOOP_NAMES):
+        return anim.LOOP_NAMES[mode]
+    return "ONCE"
+
+
+def _bck_sync_frame_range(operator, context):
+    if operator.frame_source == "SCENE":
+        operator.custom_start = context.scene.frame_start
+        operator.custom_end = context.scene.frame_end
+    elif operator.frame_source == "ACTION":
+        action = _bck_action(context)
+        if action is None:
+            operator.custom_start = context.scene.frame_start
+            operator.custom_end = context.scene.frame_end
+        else:
+            start, end = action.frame_range
+            operator.custom_start = int(math.floor(start))
+            operator.custom_end = int(math.ceil(end))
+
+
+def _bck_frame_source_changed(operator, context):
+    _bck_sync_frame_range(operator, context)
 
 
 def _decode_vtx_formats(raw):
@@ -390,8 +435,6 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
                                 description="Export only selected objects (select the armature and meshes)")
     apply_modifiers: BoolProperty(name="Apply Modifiers", default=False,
                                   description="Apply modifiers (except armature) before exporting")
-    default_format: EnumProperty(name="Texture Format", items=bc.FORMAT_ITEMS, default="AUTO",
-                                 description="Format for textures without their own GX Format setting")
     # Plain text field on purpose: a FILE_PATH property adds a browse button, and Blender cannot
     # open a file selector from inside the (already open) export file selector.
     source_file: StringProperty(name="Original BMD", default="",
@@ -464,7 +507,6 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
         layout.prop(self, "convert_units")
         layout.prop(self, "use_selection")
         layout.prop(self, "apply_modifiers")
-        layout.prop(self, "default_format")
         layout.prop(self, "source_file")
         layout.prop(self, "limit_weights")
         layout.prop(self, "allow_missing_textures")
@@ -490,7 +532,7 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
         try:
             blender_export.export_bmd(
                 context, self.filepath, scale, self.use_selection,
-                self.apply_modifiers, self.default_format, self.source_file,
+                self.apply_modifiers, self.source_file,
                 self.allow_missing_textures, True,
                 self.report, self.limit_weights, False, False,
                 self.position_format, self.normal_format, self.uv_format,
@@ -944,6 +986,18 @@ class IMPORT_OT_kcl(Operator, ImportHelper):
                              description="Attribute table (room.plc). Empty = the .plc next to the "
                                          "file. Only used to describe the attributes")
 
+    def invoke(self, context, event):
+        self.convert_units = bc.saved_convert_units(context)
+        result = ImportHelper.invoke(self, context, event)
+        self.convert_units = bc.saved_convert_units(context)
+        return result
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop(self, "convert_units")
+        layout.prop(self, "plc_file")
+
     def execute(self, context):
         from . import blender_kcl
         from .j3d.common import J3DError
@@ -960,7 +1014,7 @@ class IMPORT_OT_kcl(Operator, ImportHelper):
 class EXPORT_OT_kcl(Operator, ExportHelper):
     """Export meshes as a Twilight Princess collision file (room.kcl). Keep the original room.plc"""
     bl_idname = "export_scene.kcl"
-    bl_label = "Export TP Collision (.kcl)"
+    bl_label = "Export KCL"
     bl_options = {"REGISTER", "PRESET"}
 
     filename_ext = ".kcl"
@@ -985,6 +1039,15 @@ class EXPORT_OT_kcl(Operator, ExportHelper):
         result = ExportHelper.invoke(self, context, event)
         self.convert_units = bc.saved_convert_units(context)
         return result
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop(self, "convert_units")
+        layout.prop(self, "use_selection")
+        layout.prop(self, "apply_modifiers")
+        layout.prop(self, "default_attr")
+        layout.prop(self, "keep_area")
 
     def execute(self, context):
         from . import blender_kcl
@@ -1017,6 +1080,18 @@ class IMPORT_OT_bck(Operator, ImportHelper):
     set_scene_range: BoolProperty(name="Set Scene Range", default=True,
                                   description="Set the scene frame range to the animation length")
 
+    def invoke(self, context, event):
+        self.convert_units = bc.saved_convert_units(context)
+        result = ImportHelper.invoke(self, context, event)
+        self.convert_units = bc.saved_convert_units(context)
+        return result
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop(self, "convert_units")
+        layout.prop(self, "set_scene_range")
+
     def execute(self, context):
         from . import blender_anim
         from .j3d.common import J3DError
@@ -1046,27 +1121,54 @@ class EXPORT_OT_bck(Operator, ExportHelper):
         name="Convert Units", default=True,
         update=_export_convert_units_changed,
         description="Convert Blender units to J3D units (scale 100)")
-    loop_mode: EnumProperty(name="Loop Mode", items=blender_anim_items(), default="AUTO")
+    loop_mode: EnumProperty(name="Loop Mode", items=blender_anim_items(), default="ONCE")
     frame_source: EnumProperty(
         name="Frame Range",
         items=[("ACTION", "Action Range", "Frame range of the keyframes in the action"),
-               ("SCENE", "Scene Range", "Scene start / end frame")],
-        default="ACTION")
+               ("SCENE", "Scene Range", "Scene start / end frame"),
+               ("CUSTOM", "Custom Range", "Use the Start Frame and End Frame fields")],
+        default="ACTION",
+        update=_bck_frame_source_changed)
+    custom_start: IntProperty(name="Start Frame", default=0)
+    custom_end: IntProperty(name="End Frame", default=0)
 
     def invoke(self, context, event):
         self.convert_units = bc.saved_convert_units(context)
 
         result = ExportHelper.invoke(self, context, event)
         self.convert_units = bc.saved_convert_units(context)
+        self.loop_mode = _bck_loop_mode(context)
+        if self.frame_source != "CUSTOM":
+            _bck_sync_frame_range(self, context)
         return result
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.prop(self, "convert_units")
+        layout.prop(self, "loop_mode")
+        layout.prop(self, "frame_source")
+        start_row = layout.row()
+        start_row.enabled = self.frame_source == "CUSTOM"
+        start_row.prop(self, "custom_start")
+        end_row = layout.row()
+        end_row.enabled = self.frame_source == "CUSTOM"
+        end_row.prop(self, "custom_end")
+        if (self.frame_source == "CUSTOM"
+                and self.custom_end < self.custom_start):
+            layout.label(text="End Frame must not be before Start Frame",
+                         icon="ERROR")
 
     def execute(self, context):
         from . import blender_anim
         from .j3d.common import J3DError
         scale = 100.0 if self.convert_units else 1.0
+        custom_range = ((self.custom_start, self.custom_end)
+                        if self.frame_source == "CUSTOM" else None)
         try:
             blender_anim.export_bck(context, self.filepath, scale,
-                                    self.loop_mode, self.frame_source, self.report)
+                                    self.loop_mode, self.frame_source, self.report,
+                                    custom_range=custom_range)
         except (blender_anim.AnimError, J3DError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -1167,10 +1269,12 @@ class MATERIAL_PT_bmd(Panel):
         if "bmd_material" in mat:
             layout.label(text="Imported TEV data kept in 'bmd_material'", icon="INFO")
         if mat.node_tree:
+            box = layout.box()
+            box.label(text="Image nodes", icon="IMAGE_DATA")
             for node in mat.node_tree.nodes:
                 if node.type == "TEX_IMAGE" and node.name.startswith("bmd_tex") and node.image:
-                    row = layout.row()
-                    row.label(text=node.name[4:])
+                    row = box.row()
+                    row.label(text=f"{node.name[4:]}: {bc.texture_key(node.image)}")
                     row.prop(node.image.bmd, "format", text="")
 
 
@@ -1187,6 +1291,7 @@ class IMAGE_PT_bmd(Panel):
     def draw(self, context):
         img = context.space_data.image
         self.layout.prop(img.bmd, "format")
+        self.layout.prop(img.bmd, "key")
         self.layout.prop(img.bmd, "mip_count")
         self.layout.prop(img.bmd, "external")
         external_path = img.get("bmd_external_path")
@@ -1250,7 +1355,7 @@ class BMD_PT_j3d(Panel):
         ))
 
         _draw_format_box(layout, "Textures (.bti)", (
-            (IMPORT_OT_bti.bl_idname, "Import Texture", "IMPORT"),
+            (IMPORT_OT_bti.bl_idname, "Import Textures", "IMPORT"),
             (EXPORT_OT_bti.bl_idname, "Export Textures", "EXPORT"),
         ))
 

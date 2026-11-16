@@ -5,7 +5,7 @@ import os
 
 import numpy as np
 import bpy
-from bpy.props import BoolProperty, EnumProperty, IntProperty
+from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
 from bpy.types import PropertyGroup
 
 from .j3d import gx_texture as gx
@@ -45,9 +45,11 @@ BONE_AXIS_ITEMS = [
     ("NONE", "Joint axes (exact)", "Bone axes are identical to the J3D joint axes"),
 ]
 
-FORMAT_ITEMS = [("AUTO", "Auto", "Keep the imported format, or choose CMPR / RGB5A3 automatically")] + [
+IMAGE_FORMAT_ITEMS = [
     (n, n, "") for n in ("CMPR", "RGB5A3", "RGBA32", "RGB565", "IA8", "IA4", "I8", "I4")
 ]
+
+FORMAT_ITEMS = list(IMAGE_FORMAT_ITEMS)
 
 RENDER_ITEMS = [
     ("AUTO", "Auto (keep imported)", "Keep imported material settings; derive them for new materials"),
@@ -64,9 +66,20 @@ class BMDMaterialProps(PropertyGroup):
                            description="Alpha test threshold for the Cutout mode")
 
 
+def _image_key_changed(self, context):
+    self.key_custom = True
+
+
 class BMDImageProps(PropertyGroup):
-    format: EnumProperty(name="GX Format", items=FORMAT_ITEMS, default="AUTO",
+    format: EnumProperty(name="GX Format", items=IMAGE_FORMAT_ITEMS, default="CMPR",
                          description="Texture format used when exporting this image")
+    key: StringProperty(
+        name="BMD Key",
+        description="Unique key used by materials to reference this texture. "
+                    "Empty = use the image datablock name",
+        update=_image_key_changed,
+    )
+    key_custom: BoolProperty(default=False, options={"HIDDEN"})
     mip_count: IntProperty(name="Mip Levels", default=0, min=0, max=12,
                            description="Number of mip levels (0 = automatic / keep imported)")
     external: BoolProperty(name="External Texture", default=False,
@@ -165,12 +178,40 @@ def matrix_to_quat(R):
     return q / np.linalg.norm(q)
 
 
-def decompose(M):
-    """4x4 matrix -> (location, quaternion wxyz, scale)."""
-    loc = M[:3, 3].copy()
-    scale = np.linalg.norm(M[:3, :3], axis=0)
+def split_trs(A):
+    """Split a 3x3 matrix into the closest proper rotation and signed scales.
+
+    ``A = R @ diag(scale)`` for a normal T*R*S matrix.  A non-uniformly
+    scaled joint that rotates produces a shear; Blender pose bones cannot
+    store shear, so the closest rotation is returned and ``shear`` reports
+    the maximum deviation from it (0 for an exact T*R*S matrix).
+    """
+    A = np.asarray(A, dtype=np.float64)
+    scale = np.linalg.norm(A, axis=0)
     scale[scale == 0] = 1.0
-    R = M[:3, :3] / scale[None, :]
+    R = A / scale[None, :]
+
+    # Move a reflection onto one scale axis instead of the rotation.  Prefer
+    # the smallest axis so the sign flip is as harmless as possible.
+    if np.linalg.det(R) < 0.0:
+        axis = int(np.argmin(np.abs(scale)))
+        scale[axis] = -scale[axis]
+        R[:, axis] = -R[:, axis]
+
+    U, _S, Vt = np.linalg.svd(R)
+    Rp = U @ Vt
+    if np.linalg.det(Rp) < 0.0:
+        U[:, -1] *= -1.0
+        Rp = U @ Vt
+
+    shear = float(np.abs(R - Rp).max()) if R.size else 0.0
+    return Rp, scale, shear
+
+
+def decompose(M):
+    """4x4 matrix -> (location, quaternion wxyz, signed scale)."""
+    loc = M[:3, 3].copy()
+    R, scale, _shear = split_trs(M[:3, :3])
     return loc, matrix_to_quat(R), scale
 
 
@@ -205,10 +246,19 @@ def vec_from_blender(v):
 
 def texture_key(image):
     """Unique key of an image inside the exported file."""
-    key = image.get("bmd_key")
-    if key:
-        return str(key)
-    return clean_texture_name(image)
+    bmd = getattr(image, "bmd", None)
+    if bmd is not None and bool(getattr(bmd, "key_custom", False)):
+        key = str(bmd.key or "")
+        return key or f"__image__{image.name}"
+    legacy = image.get("bmd_key")
+    if legacy:
+        return str(legacy)
+    if bmd is not None and bmd.key:
+        return str(bmd.key)
+    # Never fall back to the BMD texture name here: clearing BMD Key must
+    # release the old key, and two new images with the same base name must not
+    # collapse into one texture.  The datablock name is unique in Blender.
+    return f"__image__{image.name}"
 
 
 def clean_texture_name(image):

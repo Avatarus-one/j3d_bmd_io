@@ -14,6 +14,7 @@ from .model import (HIER_CLOSE, HIER_END, HIER_JOINT, HIER_MATERIAL, HIER_OPEN, 
 _INT_TYPES = {0: "u1", 1: "i1", 2: ">u2", 3: ">i2"}
 MAX_PACKET_MATRICES = 10
 MAX_PRIM_VERTS = 65532  # multiple of 3 below the u16 limit
+MAX_PACKET_FACES = MAX_PRIM_VERTS // 3  # keeps every strip below the u16 limit
 MAX_ENVELOPE_WEIGHTS = 255  # EVP1 stores the influence count per envelope as u8
 
 
@@ -33,6 +34,7 @@ class ExportMesh:
         self.sort_key = 0            # export order of shapes (original shape index)
         self.order = 0               # position in the scene graph (INF1) among shapes of a joint
         self.joint = None            # joint the shape hangs under (None = derive from skinning)
+        self.matrix_type = None      # original SHP1 matrix type (1/2 = billboard)
 
 
 class ExportModel:
@@ -160,6 +162,8 @@ def write(model):
     joints = model.joints
     if not joints:
         raise J3DError("Model has no joints")
+    if not model.meshes:
+        raise J3DError("Model has no meshes to export")
     maya = (model.inf_flags & 0x0F) == 2
     world = compute_world_matrices(joints, maya)
     inv_world = np.array([np.linalg.inv(w) for w in world])
@@ -315,6 +319,10 @@ def write(model):
             info["pos_idx"] = pos_inv[offs:offs + nv]
             offs += nv
 
+    if len(pos_u) > 0xFFFF:
+        raise J3DError(
+            f"Too many unique positions ({len(pos_u)}); a BMD supports at most 65535")
+
     def collect(attr, key_fn):
         sel = [(i, key_fn(m, i)) for i, m in enumerate(model.meshes)]
         sel = [(i, a) for i, a in sel if a is not None]
@@ -369,6 +377,9 @@ def write(model):
     nrm = preserved_normals()
     if nrm is None:
         nrm = collect(VA_NRM, lambda m, i: per_mesh[i].get("normals"))
+    if nrm is not None and len(nrm[0]) > 0xFFFF:
+        raise J3DError(
+            f"Too many unique normals ({len(nrm[0])}); a BMD supports at most 65535")
     cols = []
     for c in range(2):
         sel = [(i, m.loop_colors[c]) for i, m in enumerate(model.meshes) if m.loop_colors[c] is not None]
@@ -378,12 +389,20 @@ def write(model):
         allc = np.concatenate([np.round(np.clip(a, 0, 1) * 255).astype(np.uint8) for _, a in sel])
         u, inv = np.unique(allc, axis=0, return_inverse=True)
         inv = inv.reshape(-1)
+        if len(u) > 0xFFFF:
+            raise J3DError(
+                f"Too many unique vertex colours ({len(u)}); a BMD supports at most 65535")
         res, o = {}, 0
         for i, a in sel:
             res[i] = inv[o:o + len(a)]
             o += len(a)
         cols.append((u, res))
     uvs = [collect(VA_TEX0 + t, lambda m, i, t=t: m.loop_uvs[t]) for t in range(8)]
+    for t, entry in enumerate(uvs):
+        if entry is not None and len(entry[0]) > 0xFFFF:
+            raise J3DError(
+                f"Too many unique UV{t} coordinates ({len(entry[0])}); "
+                "a BMD supports at most 65535")
 
     # ------------------------- SHP1 ----------------------------
     attr_lists, attr_lookup = bytearray(), {}
@@ -441,7 +460,8 @@ def write(model):
         packets, cur, cur_set = [], [], set()
         for f in face_order.tolist():
             fs = set(face_draw[f].tolist())
-            if len(cur_set | fs) > MAX_PACKET_MATRICES:
+            if (len(cur_set | fs) > MAX_PACKET_MATRICES
+                    or len(cur) >= MAX_PACKET_FACES):
                 packets.append((cur, cur_set))
                 cur, cur_set = [], set()
             cur.append(f)
@@ -478,6 +498,10 @@ def write(model):
             urec = rec[first]
             dl = bytearray()
             for strip in _build_strips(rid.reshape(-1, 3)):
+                if len(strip) > MAX_PRIM_VERTS:
+                    raise J3DError(
+                        f"Triangle strip is too long ({len(strip)} vertices); "
+                        f"the BMD limit is {MAX_PRIM_VERTS}")
                 dl += bytes([0x98]) + struct.pack(">H", len(strip)) + urec[strip].tobytes()
             dl += b"\0" * (align(len(dl), 32) - len(dl))
             packet_entries += struct.pack(">II", len(dl), len(prim_data))
@@ -489,10 +513,19 @@ def write(model):
 
         # game files store shape bounds in model space; the radius is measured from the origin
         st = mesh.verts.astype(np.float64)
-        bmin, bmax = st.min(0), st.max(0)
-        radius = float(np.linalg.norm(st, axis=1).max())
+        if len(st):
+            bmin, bmax = st.min(0), st.max(0)
+            radius = float(np.linalg.norm(st, axis=1).max())
+        else:
+            bmin = bmax = np.zeros(3, np.float64)
+            radius = 0.0
+        matrix_type = 3 if multi else 0
+        if mesh.matrix_type is not None:
+            matrix_type = int(mesh.matrix_type)
+        if not 0 <= matrix_type <= 3:
+            raise J3DError(f"Invalid shape matrix type {matrix_type}")
         shape_entries += struct.pack(
-            ">BBHHHHH f3f3f", 3 if multi else 0, 0xFF, len(packets), attr_off, first_group,
+            ">BBHHHHH f3f3f", matrix_type, 0xFF, len(packets), attr_off, first_group,
             first_packet, 0xFFFF, radius, *bmin, *bmax)
         # NOTE: struct above: B pad(0xFF) -> keep 0xFF like original files
         shape_bounds.append((bmin, bmax))

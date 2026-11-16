@@ -165,10 +165,11 @@ def apply_texture_metadata(image, texture, path=None):
     if texture.raw_bti is not None:
         image["bmd_raw_bti"] = base64.b64encode(
             zlib.compress(texture.raw_bti, 6)).decode("ascii")
-    fmt_name = gx.FORMAT_NAMES.get(texture.format, "AUTO")
+    fmt_name = gx.FORMAT_NAMES.get(texture.format, "CMPR")
     try:
         image.bmd.format = (
-            fmt_name if fmt_name in {i[0] for i in bc.FORMAT_ITEMS} else "AUTO")
+            fmt_name if fmt_name in {i[0] for i in bc.IMAGE_FORMAT_ITEMS} else "CMPR")
+        image.bmd.key = texture.key
         image.bmd.mip_count = int(texture.mip_count)
         image.bmd.external = bool(texture.external)
     except Exception:
@@ -491,6 +492,7 @@ def _create_armature(context, coll, bmd, base, scale, bone_axis):
     for i, j in enumerate(joints):
         b = arm.bones[names[i]]
         b["bmd_index"] = i
+        b["bmd_parent"] = int(j.parent)
         b["bmd_kind"] = int(j.kind)
         b["bmd_scale_comp"] = int(j.scale_compensate)
         if bmd.maya and j.scale_compensate and j.parent >= 0:
@@ -580,7 +582,9 @@ def _create_mesh_object(coll, arm_obj, bone_names, bmd, md, materials, base, sca
     attr = me.attributes.new("bmd_node", "INT", "FACE")
     attr.data.foreach_set("value", md.face_node.astype(np.int32))
     obj["bmd_shape_nodes"] = json.dumps(
-        [[int(j), int(m), int(s), i] for i, (j, m, s) in enumerate(bmd.shape_nodes)])
+        [[int(j), int(m), int(s), i,
+          int(bmd.shapes[s].matrix_type) if 0 <= s < len(bmd.shapes) else 0]
+         for i, (j, m, s) in enumerate(bmd.shape_nodes)])
     obj.parent = arm_obj
     mod = obj.modifiers.new("Armature", "ARMATURE")
     mod.object = arm_obj

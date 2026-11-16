@@ -49,7 +49,8 @@ Import / Export`.
 * The original vertex order is kept through a BMD -> Blender -> BMD round trip:
   exported positions are written in the imported order and distinct vertices that
   share the same coordinates are no longer merged. Export also restores the source
-  shape nodes (one shape per original INF1 node) using a small per-face node index.
+  shape nodes (one shape per original INF1 node) using a small per-face node index,
+  including the original SHP1 matrix type (billboard).
 * Normals use a canonical layout instead of being globally sorted. Every corner
   is addressed by its `(vertex, normal)` pair, so the normal array keeps a
   stable order and index.
@@ -68,7 +69,10 @@ Import / Export`.
 The game and its animations address textures, shapes and materials **by index**, so the exporter keeps
 them stable: shapes are written in their original shape-index order, materials in their original
 order, every texture of the imported model is written in its original position (even those no
-material uses, such as the eye frames), and shapes stay attached to their original joint.
+material uses, such as the eye frames), and shapes stay attached to their original joint. Imported
+materials without faces and shapes without geometry are written as placeholders instead of being
+dropped, so their indices do not shift. After a BMD export the armature's joint indices and rest
+data are refreshed automatically, so a later BCK export matches the file that was just written.
 Blender deletes images that have no user when a file is saved, so imported images get a *Fake User*.
 If a texture is still missing at export time, it is restored from the original BMD (the path is
 remembered at import, or set *Original BMD* in the export options); otherwise the export stops with
@@ -122,7 +126,9 @@ The importer stores the original encoded texture bytes (all mips, palettes) on e
 images that still match the imported pixels are written back **byte-identically**, so texture packs
 that match textures by content keep working. Only edited images, or images whose format / mip setting
 you changed, are re-encoded (CMPR, RGB5A3, RGBA32, RGB565, IA8, IA4, I8, I4). Palette formats are
-decoded on import and re-encoded as CMPR / RGB5A3 only if you change the image.
+decoded on import and re-encoded as CMPR / RGB5A3 only if you change the image. Edited images update
+the GX transparency flag and the mipmap flag; an automatically kept format is switched to CMPR /
+RGB5A3 when the edited pixels now contain alpha.
 
 ### External stage textures (`STG_00/texc`)
 Some stage models keep their texture pixels outside the BMD. In `TEX1`, such an entry has
@@ -180,13 +186,17 @@ pixels).
 
 ### Materials
 * Material tab -> *J3D (BMD) Material*: **Render Mode** (Auto keeps imported values; Opaque / Cutout /
-  Translucent), Alpha Reference, Backface Culling.
+  Translucent), Alpha Reference, Backface Culling. The panel also lists the current **Image nodes**
+  keys and their formats.
 * Alpha test and blending are detected from the material's `alphaComp` / `blend` data and wired into
   the shader (alpha test via "Greater Than", blending as *Blended*).
 * GX wraps per axis (Clamp / Repeat / Mirror). If the two axes differ, the importer builds a
   Separate XYZ -> Math -> Combine XYZ chain in front of the image node.
-* To swap a texture, set the image of node `bmd_tex0` (`bmd_tex1` ...). Per-image format and mip count:
-  Image Editor -> sidebar -> *Image* -> *J3D (BMD) Texture*.
+* To swap a texture, set the image of node `bmd_tex0` (`bmd_tex1` ...). Per-image format, **BMD Key**
+  and mip count: Image Editor -> sidebar -> *Image* -> *J3D (BMD) Texture*. The BMD Key is the
+  internal key materials use; clearing it releases the key and falls back to a unique image name.
+  Moving a key to another image makes that image the owner, but a material still uses the image
+  assigned to its `bmd_tex<N>` node, so assign the new image there as well.
 * New materials (without `bmd_material`) become simple unlit "texture x vertex colour" materials.
 * UV layers are named `UV0`..`UV7`, vertex colours `Col0` / `Col1`.
 
@@ -276,15 +286,18 @@ interpolation; channels that never change get a single key. Frame `n` of the fil
 **Export**: make the armature active, assign the action, then File -> Export -> *J3D Animation (.bck)*.
 Every frame is sampled, converted back to joint-local scale / rotation / translation, and fitted
 with cubic Hermite curves using as few keys as the tolerances allow (rotation 2e-4 rad, translation
-0.01 units, scale 1e-4). Options: loop mode (Auto uses the stored one), action or scene frame range,
-and the **Convert Units** setting.
+0.01 units, scale 1e-4). Options: Loop Mode, Action / Scene / Custom frame range, and the **Convert
+Units** setting.
 
 Notes
 * The joint count of the animation equals the number of bones; bones keep their `bmd_index`.
 * Joints with a non-uniform rest scale (e.g. the eyebrows of Uri, 1.6 on X) are handled: the stored
-  scale is folded into the rest transform so the animation is not scaled twice. In Maya mode a joint
-  that does not inherit its parent's scale gets `Inherit Scale: None` on its bone.
-* The Blender pose reproduces the game's skinning (checked: skinned vertices match to 1e-4 units).
+  joint-local transform is used for unchanged bones, so the animation is not scaled twice. In Maya
+  mode a joint that does not inherit its parent's scale gets `Inherit Scale: None` on its bone.
+  Negative joint scales are preserved.
+* A Blender pose bone cannot store the shear produced by rotating a non-uniformly scaled joint.
+  Such channels are approximated (the importer/exporter reports a warning); unchanged bones and
+  uniform scales are exact.
 
 ## Collision (.kcl)
 
@@ -306,7 +319,11 @@ matching collision mesh.
 
 ## Known limitations
 * No TEV shading in Blender; the Blender materials are only a preview.
-* Joint scales other than 1 are exact only for unchanged bones.
+* Joint scales other than 1 are exact only for unchanged bones. Rotating a non-uniformly scaled
+  joint produces shear that a Blender pose bone cannot represent; BCK import/export warns and
+  approximates those channels.
+* BMD export rejects meshes with more than 65535 unique positions, normals or UV coordinates
+  (split the mesh first) and empty mesh selections.
 * By default all bone influences are preserved (the BMD `EVP1` limit is 255 per vertex). Enable
   **Limit 4 Weights per Vertex** on export to cap skinning at 4 influences, which may be required by
   engines that assume standard 4-bone skinning. Shapes are written as triangle lists (no strips), so

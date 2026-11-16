@@ -56,7 +56,7 @@ def _format_override(choice, components, fraction):
 
 
 def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifiers=False,
-               default_format="AUTO", source_file="", allow_missing_textures=False,
+               source_file="", allow_missing_textures=False,
                keep_vertex_formats=True, report=None, limit_weights=False,
                optimize_bmd=False, bls_compatible=False,
                position_format="AUTO", normal_format="AUTO", uv_format="AUTO",
@@ -105,14 +105,34 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
         any(o.data is not None and o.data.attributes.get("bmd_node") is not None
             for o in mesh_objs))
     bone_index = _build_joints(model, arm_obj, scale)
+    joint_map = {}
+    if arm_obj is not None:
+        for bone in arm_obj.data.bones:
+            old = bone.get("bmd_index")
+            new = bone_index.get(bone.name)
+            if old is not None and new is not None:
+                joint_map[int(old)] = int(new)
 
-    mats = _MaterialCollector(model, default_format)
+    mats = _MaterialCollector(model)
     if arm_obj is not None and "bmd_textures" in arm_obj:
         mats.preload_original_textures(arm_obj, source_file, allow_missing_textures, report)
+    # Keep every imported material slot, including slots that currently have
+    # no faces.  The game addresses materials by index, so dropping an unused
+    # original material would shift every later material index.  New materials
+    # are built lazily with the mesh that uses them (they have no original
+    # index to preserve).
+    for obj in mesh_objs:
+        for slot in obj.material_slots:
+            mat = slot.material
+            if mat is not None and mat.get("bmd_material"):
+                mats.register_material(mat)
     normal_updates = []
     for obj in mesh_objs:
         _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modifiers,
-                            context, limit_weights, normal_updates)
+                            context, limit_weights, normal_updates, joint_map)
+    if not model.meshes:
+        raise ExportError("The selected meshes have no faces to export")
+    _add_empty_shapes(model, mesh_objs, mats, joint_map)
     mats.finish()
     # keep the original shape order: the game addresses shapes and materials by index
     model.meshes.sort(key=lambda m: (m.sort_key, m.order))
@@ -148,6 +168,8 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
             obj["bmd_export_formats"] = serialized
     with open(filepath, "wb") as f:
         f.write(data)
+    if arm_obj is not None:
+        _update_bone_metadata(arm_obj, model, bone_index, mesh_objs)
     if report:
         report({"INFO"}, f"Exported {len(model.meshes)} meshes, {len(model.joints)} joints, "
                          f"{len(model.materials)} materials, {len(model.textures)} textures "
@@ -174,6 +196,124 @@ def ordered_bones(arm):
     for r in [b for b in bones if b.parent is None]:
         dfs(r)
     return known + [b for b in new if b not in known]
+
+
+def _add_empty_shapes(model, mesh_objs, mats, joint_map=None):
+    """Append placeholder shapes for original shapes that have no faces.
+
+    Shape indices are part of the game-facing interface (BSK animations and
+    game code address shapes by index).  Dropping an empty shape would shift
+    every later shape index.
+    """
+    table = None
+    for obj in mesh_objs:
+        raw = obj.get("bmd_shape_nodes")
+        if not raw:
+            continue
+        try:
+            table = json.loads(raw)
+        except (TypeError, ValueError):
+            table = None
+        if table:
+            break
+    if not table:
+        return
+
+    present = {int(mesh.sort_key) for mesh in model.meshes}
+    added = set()
+    by_bmd_index = {}
+    for material in bpy.data.materials:
+        index = material.get("bmd_index")
+        if index is not None:
+            by_bmd_index.setdefault(int(index), material)
+
+    for info in table:
+        if len(info) < 4:
+            continue
+        shape_index = int(info[2])
+        if shape_index in present or shape_index in added:
+            continue
+        joint = int(info[0])
+        if joint_map is not None:
+            joint = joint_map.get(joint, joint)
+        material_index = int(info[1])
+        order = int(info[3])
+        matrix_type = int(info[4]) if len(info) > 4 else None
+        material = by_bmd_index.get(material_index)
+        material_slot = mats.register_material(material) if material is not None else 0
+
+        em = writer.ExportMesh()
+        em.name = f"empty_shape_{shape_index}"
+        em.verts = np.zeros((0, 3), np.float32)
+        em.faces = np.zeros((0, 3), np.int32)
+        em.vertex_ids = np.zeros(0, np.int64)
+        em.vert_influence = np.zeros(0, np.int32)
+        em.influence_sets = []
+        em.material = material_slot
+        em.sort_key = shape_index
+        em.order = order
+        em.joint = joint
+        em.matrix_type = matrix_type
+        model.meshes.append(em)
+        added.add(shape_index)
+
+
+def _update_bone_metadata(arm_obj, model, bone_index, mesh_objs):
+    """Store the exported joint layout on the armature and shape-node tables.
+
+    A later BCK import/export maps tracks by ``bmd_index`` and reuses
+    ``bmd_local``/``bmd_rest`` for unchanged bones.  After a BMD export those
+    values must describe the file that was just written, not the previous one.
+    """
+    old_indices = {}
+    for bone in arm_obj.data.bones:
+        old = bone.get("bmd_index")
+        if old is not None:
+            old_indices[bone.name] = int(old)
+    new_by_old = {}
+    for name, old in old_indices.items():
+        new = bone_index.get(name)
+        if new is not None:
+            new_by_old[old] = new
+
+    for name, joint_index in bone_index.items():
+        bone = arm_obj.data.bones.get(name)
+        if bone is None or not 0 <= joint_index < len(model.joints):
+            continue
+        joint = model.joints[joint_index]
+        bone["bmd_index"] = int(joint_index)
+        parent = bone.parent
+        bone["bmd_parent"] = (
+            int(bone_index[parent.name])
+            if parent is not None and parent.name in bone_index else -1)
+        bone["bmd_kind"] = int(joint.kind)
+        bone["bmd_scale_comp"] = int(joint.scale_compensate)
+        bone["bmd_local"] = [
+            float(x) for x in (*joint.trans, *joint.rot, *joint.scale)]
+        bone["bmd_rest"] = [
+            float(x) for x in bc.to_np(bone.matrix_local).reshape(-1)]
+
+    arm_obj["bmd_bone_names"] = [b.name for b in ordered_bones(arm_obj.data)]
+
+    for obj in mesh_objs:
+        raw = obj.get("bmd_shape_nodes")
+        if not raw:
+            continue
+        try:
+            table = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        changed = False
+        for info in table:
+            if len(info) < 4:
+                continue
+            old_joint = int(info[0])
+            new_joint = new_by_old.get(old_joint)
+            if new_joint is not None and new_joint != old_joint:
+                info[0] = int(new_joint)
+                changed = True
+        if changed:
+            obj["bmd_shape_nodes"] = json.dumps(table)
 
 
 def _build_joints(model, arm_obj, scale):
@@ -283,11 +423,11 @@ def _eval_mesh(obj, apply_modifiers, context):
 
 
 def _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modifiers, context,
-                        limit_weights=False, normal_updates=None):
+                        limit_weights=False, normal_updates=None, joint_map=None):
     me, cleanup = _eval_mesh(obj, apply_modifiers, context)
     try:
         _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_weights,
-                          normal_updates)
+                          normal_updates, joint_map)
     finally:
         if cleanup:
             ev, disabled = cleanup
@@ -297,7 +437,7 @@ def _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modi
 
 
 def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_weights=False,
-                      normal_updates=None):
+                      normal_updates=None, joint_map=None):
     me.calc_loop_triangles()
     nt = len(me.loop_triangles)
     if nt == 0:
@@ -468,9 +608,13 @@ def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_we
             em.loop_uvs[t] = a[lp]
         if merged and 0 <= node_id < len(node_table):
             info = node_table[node_id]
-            em.joint = int(info[0])
+            old_joint = int(info[0])
+            em.joint = (joint_map.get(old_joint, old_joint)
+                        if joint_map is not None else old_joint)
             em.sort_key = int(info[2])
             em.order = int(info[3])
+            if len(info) > 4:
+                em.matrix_type = int(info[4])
         else:
             em.order = int(obj.get("bmd_order", 1e6 + len(model.meshes)))
             em.sort_key = int(obj.get("bmd_shape_index", 1e6 + len(model.meshes)))
@@ -544,7 +688,7 @@ def _reuse_raw(image, t, w, h):
     return True
 
 
-def texture_from_image(image, wrap_ext="REPEAT", default_format="AUTO"):
+def texture_from_image(image, wrap_ext="REPEAT"):
     """Build an export :class:`j3d.Texture` from a Blender image."""
     name = bc.clean_texture_name(image)
     t = j3d.Texture(name)
@@ -559,15 +703,30 @@ def texture_from_image(image, wrap_ext="REPEAT", default_format="AUTO"):
     orig = image.get("bmd_orig_format")
     external = bool(props.external)
     reused = _reuse_raw(image, t, w, h)
+    has_a = gx.has_alpha(t.rgba)
+    partial = gx.has_partial_alpha(t.rgba)
+
+    def choose_format(want, auto):
+        fmt = gx.NAME_TO_FORMAT.get(want) if want else None
+        if fmt is None or fmt in (gx.C4, gx.C8, gx.C14X2):
+            return gx.RGB5A3 if partial else gx.CMPR
+        # An automatically kept format must not silently discard alpha that
+        # the edited image now has.  An explicit user choice is respected.
+        if auto and has_a and fmt in (gx.I4, gx.I8, gx.RGB565):
+            return gx.RGB5A3 if partial else gx.CMPR
+        return fmt
+
+    # An imported image keeps its original format in the UI.  Treat that value
+    # (and "AUTO") as automatic so an edited image can switch to an
+    # alpha-capable format; a different explicit choice is respected.
+    auto_format = (props.format == "AUTO"
+                   or (bool(orig) and props.format == orig))
     if external:
         # Header-only TEX1 entry; the pixels live in a .bti file.
         t.external = True
         if not reused:
-            want = props.format if props.format != "AUTO" else orig
-            fmt = gx.NAME_TO_FORMAT.get(want)
-            if fmt is None or fmt in (gx.C4, gx.C8, gx.C14X2):
-                fmt = gx.RGB5A3 if gx.has_partial_alpha(t.rgba) else gx.CMPR
-            t.format = fmt
+            want = orig if auto_format else props.format
+            t.format = choose_format(want, auto_format)
             t.max_lod = int(image.get("bmd_max_lod", 0))
         external_size = image.get("bmd_external_size")
         if external_size and len(external_size) == 2:
@@ -577,50 +736,66 @@ def texture_from_image(image, wrap_ext="REPEAT", default_format="AUTO"):
                 # the original texture size because no pixels are written.
                 t.rgba = np.full((ext_h, ext_w, 4), 255, np.uint8)
     elif not reused:
-        want = props.format if props.format != "AUTO" else (
-            default_format if default_format != "AUTO" else None)
-        if want is None:
-            if orig in gx.NAME_TO_FORMAT and gx.NAME_TO_FORMAT[orig] not in (gx.C4, gx.C8, gx.C14X2):
-                fmt = gx.NAME_TO_FORMAT[orig]
-            else:
-                fmt = gx.RGB5A3 if gx.has_partial_alpha(t.rgba) else gx.CMPR
+        if auto_format:
+            want = orig
         else:
-            fmt = gx.NAME_TO_FORMAT[want]
-        t.format = fmt
-    has_a = gx.has_alpha(t.rgba)
-    t.transparency = int(image.get("bmd_transparency", 2 if has_a else 0))
+            want = props.format
+        t.format = choose_format(want, auto_format)
+
     if reused:
+        # Unchanged pixels: keep the original header values verbatim.
+        t.transparency = int(image.get("bmd_transparency", 2 if has_a else 0))
         mips = t.mip_count
     else:
+        # Edited pixels: derive the alpha flag from the actual image.
+        t.transparency = 2 if has_a else 0
         mips = props.mip_count
         if mips <= 0:
             mips = 1
             if "bmd_min_filter" not in image and min(w, h) >= 16:
                 mips = min(gx.max_mip_count(w, h), 4)
         t.mip_count = mips
+
     ext_wrap = {"EXTEND": 0, "CLIP": 0, "REPEAT": 1, "MIRROR": 2}.get(wrap_ext, 1)
     t.wrap_s = int(image.get("bmd_wrap_s", ext_wrap))
     t.wrap_t = int(image.get("bmd_wrap_t", ext_wrap))
-    t.min_filter = int(image.get("bmd_min_filter", 5 if mips > 1 else 1))
+    min_filter = int(image.get("bmd_min_filter", 5 if mips > 1 else 1))
+    if mips <= 1 and min_filter >= 2:
+        # Mipmap filtering without mip levels would sample past the image.
+        min_filter = 1
+    t.min_filter = min_filter
     t.mag_filter = int(image.get("bmd_mag_filter", 1))
     t.min_lod = int(image.get("bmd_min_lod", 0))
     t.lod_bias = int(image.get("bmd_lod_bias", 0))
     fl = image.get("bmd_flags10")
-    t.flags10 = bytes.fromhex(fl) if fl else bytes([1 if mips > 1 else 0, 0, 0, 0])
-    if mips > 1:
-        t.flags10 = bytes([1]) + t.flags10[1:]
+    flags = bytes.fromhex(fl) if fl else b"\0\0\0\0"
+    if len(flags) < 4:
+        flags = flags + b"\0" * (4 - len(flags))
+    # flags10 bit 0 is the mipmap flag; keep it in sync with mip_count.
+    t.flags10 = bytes([(flags[0] & 0xFE) | (1 if mips > 1 else 0)]) + flags[1:4]
     return t
 
 
 class _MaterialCollector:
-    def __init__(self, model, default_format):
+    def __init__(self, model):
         self.model = model
-        self.default_format = default_format
         self.mat_index = {}
         self.images = {}   # tex name -> (Texture)
         self.pending = []  # (ExportMesh)
         self.sort_keys = {}  # material index -> original index
         self._source = None
+
+    def register_material(self, bl_mat):
+        """Add a material to the export without attaching it to a mesh."""
+        key = bl_mat.name if bl_mat else None
+        if key not in self.mat_index:
+            self.mat_index[key] = len(self.model.materials)
+            d, name = self._build(bl_mat, None)
+            self.model.materials.append(d)
+            self.model.material_names.append(name)
+            n = self.mat_index[key]
+            self.sort_keys[n] = int(bl_mat.get("bmd_index", 1e6 + n)) if bl_mat else 1e6 + n
+        return self.mat_index[key]
 
     def index_for(self, bl_mat, mesh):
         key = bl_mat.name if bl_mat else None
@@ -657,8 +832,20 @@ class _MaterialCollector:
         keys = list(arm_obj["bmd_texture_keys"]) if "bmd_texture_keys" in arm_obj else names
         source = source_file or arm_obj.get("bmd_source", "")
         missing, restored = [], []
+        # A key can be moved to another image (the BMD Key field is editable),
+        # so find the current owner by key instead of by the remembered image
+        # name.
+        by_key = {}
+        for image in bpy.data.images:
+            key = bc.texture_key(image)
+            if key:
+                by_key.setdefault(key, image)
         for name, key in zip(names, keys):
-            img = bpy.data.images.get(name)
+            img = by_key.get(key)
+            if img is None:
+                legacy = bpy.data.images.get(name)
+                if legacy is not None and bc.texture_key(legacy) == key:
+                    img = legacy
             if img is not None:
                 self._texture_for(img, "REPEAT")
                 continue
@@ -680,11 +867,18 @@ class _MaterialCollector:
                 "imported into the 'Original BMD' export option so they can be restored (or enable "
                 "'Allow Missing Textures' if you removed them on purpose).")
 
+    def _image_for_key(self, key):
+        """Find the image that currently owns *key* (the BMD Key is editable)."""
+        for image in bpy.data.images:
+            if bc.texture_key(image) == key:
+                return image
+        return None
+
     def _texture_for(self, image, wrap_ext):
         key = bc.texture_key(image)
         if key in self.images:
             return key
-        t = texture_from_image(image, wrap_ext, self.default_format)
+        t = texture_from_image(image, wrap_ext)
         self.images[key] = t
         self.model.textures.append(t)
         return key
@@ -724,7 +918,7 @@ class _MaterialCollector:
             for slot in range(8):
                 if tex_names[slot] and tex_names[slot] not in self.images:
                     base = tex_names[slot]
-                    img = bpy.data.images.get(base)
+                    img = self._image_for_key(base)
                     if img is not None:
                         tex_names[slot] = self._texture_for(img, "REPEAT")
                     else:
@@ -767,8 +961,10 @@ class _MaterialCollector:
                 mode = mat3.RENDER_CUTOUT
             else:
                 mode = mat3.RENDER_OPAQUE
-        d = mat3.default_material(tex_name, use_vertex_colors=mesh.loop_colors[0] is not None,
-                                  mode=mode, cull_back=cull_back, alpha_ref=alpha_ref)
+        d = mat3.default_material(
+            tex_name,
+            use_vertex_colors=bool(mesh is not None and mesh.loop_colors[0] is not None),
+            mode=mode, cull_back=cull_back, alpha_ref=alpha_ref)
         return d, name
 
     def finish(self):
@@ -785,8 +981,11 @@ class _MaterialCollector:
         remap = {old: new for new, old in enumerate(order)}
         self.model.materials[:] = [self.model.materials[i] for i in order]
         self.model.material_names[:] = [self.model.material_names[i] for i in order]
-        for mesh, _idx in self.pending:
-            mesh.material = remap[mesh.material]
+        # Placeholder/empty shapes are not in ``pending`` but their material
+        # indices also have to follow the reordered material table.
+        for mesh in self.model.meshes:
+            if 0 <= mesh.material < len(remap):
+                mesh.material = remap[mesh.material]
         self.pending = [(m, remap[i]) for m, i in self.pending]
         # unique material names (J3D tables are by index but names should be distinct)
         seen = {}
