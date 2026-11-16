@@ -192,9 +192,9 @@ pixels).
   the shader (alpha test via "Greater Than", blending as *Blended*).
 * GX wraps per axis (Clamp / Repeat / Mirror). If the two axes differ, the importer builds a
   Separate XYZ -> Math -> Combine XYZ chain in front of the image node.
-* To swap a texture, set the image of node `bmd_tex0` (`bmd_tex1` ...). Per-image format, **BMD Key**
-  and mip count: Image Editor -> sidebar -> *Image* -> *J3D (BMD) Texture*. The BMD Key is the
-  internal key materials use; clearing it releases the key and falls back to a unique image name.
+* To swap a texture, set the image of node `bmd_tex0` (`bmd_tex1` ...). Per-image format, **BMD Key**,
+  mip count and sampling: Image Editor -> sidebar -> *Image* -> *J3D (BMD) Texture*. The BMD Key is
+  the internal key materials use; clearing it releases the key and falls back to a unique image name.
   Moving a key to another image makes that image the owner, but a material still uses the image
   assigned to its `bmd_tex<N>` node, so assign the new image there as well.
 * New materials (without `bmd_material`) become simple unlit "texture x vertex colour" materials.
@@ -288,6 +288,9 @@ Every frame is sampled, converted back to joint-local scale / rotation / transla
 with cubic Hermite curves using as few keys as the tolerances allow (rotation 2e-4 rad, translation
 0.01 units, scale 1e-4). Options: Loop Mode, Action / Scene / Custom frame range, and the **Convert
 Units** setting.
+
+**Frame range**: *Action Range* uses the action's keyframe range. *Scene Range* samples the scene
+start/end frames. *Custom Range* uses the Start Frame / End Frame fields.
 
 Notes
 * The joint count of the animation equals the number of bones; bones keep their `bmd_index`.

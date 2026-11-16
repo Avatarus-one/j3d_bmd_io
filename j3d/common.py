@@ -70,8 +70,9 @@ def _decode_name(raw):
 def _encode_name(name):
     try:
         return name.encode("shift_jis")
-    except UnicodeEncodeError:
-        return name.encode("ascii", "replace")
+    except UnicodeEncodeError as exc:
+        raise J3DError(
+            f"Name {name!r} cannot be encoded as Shift-JIS; rename it") from exc
 
 
 def read_string_table(d, off):

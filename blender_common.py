@@ -51,6 +51,25 @@ IMAGE_FORMAT_ITEMS = [
 
 FORMAT_ITEMS = list(IMAGE_FORMAT_ITEMS)
 
+WRAP_EXT = {0: "EXTEND", 1: "REPEAT", 2: "MIRROR"}
+WRAP_ITEMS = [
+    ("0", "Clamp", "Clamp to edge"),
+    ("1", "Repeat", "Repeat the texture"),
+    ("2", "Mirror", "Mirror the texture"),
+]
+MIN_FILTER_ITEMS = [
+    ("0", "Nearest", "Nearest neighbour"),
+    ("1", "Linear", "Linear"),
+    ("2", "Nearest Mipmap Nearest", "Nearest mipmap, nearest texel"),
+    ("3", "Linear Mipmap Nearest", "Nearest mipmap, linear texel"),
+    ("4", "Nearest Mipmap Linear", "Linear mipmap, nearest texel"),
+    ("5", "Linear Mipmap Linear", "Trilinear"),
+]
+MAG_FILTER_ITEMS = [
+    ("0", "Nearest", "Nearest neighbour"),
+    ("1", "Linear", "Linear"),
+]
+
 RENDER_ITEMS = [
     ("AUTO", "Auto (keep imported)", "Keep imported material settings; derive them for new materials"),
     (mat3.RENDER_OPAQUE, "Opaque", "No transparency"),
@@ -70,6 +89,113 @@ def _image_key_changed(self, context):
     self.key_custom = True
 
 
+def _set_wrap_math(node, mode):
+    if mode == 1:
+        node.operation = "FRACT"
+        node.use_clamp = False
+    elif mode == 2:
+        node.operation = "PINGPONG"
+        node.inputs[1].default_value = 1.0
+        node.use_clamp = False
+    else:
+        node.operation = "ADD"
+        node.inputs[1].default_value = 0.0
+        node.use_clamp = True
+
+
+def _layout_wrap_chain(node, sep, comb, s, t, uv=None):
+    """Lay the per-axis wrap chain out as a compact tree left of *node*."""
+    x, y = node.location
+    if uv is not None:
+        uv.location = (x - 800, y)
+    sep.location = (x - 600, y)
+    s.location = (x - 400, y)
+    t.location = (x - 400, y - 160)
+    comb.location = (x - 200, y)
+
+
+def _apply_wrap_to_node(node, wrap_s, wrap_t):
+    tree = node.id_data
+    chain = {n.get("bmd_wrap_axis"): n for n in tree.nodes
+             if n.get("bmd_wrap_for") == node.name}
+    if not chain and wrap_s == wrap_t:
+        node.extension = WRAP_EXT.get(wrap_s, "REPEAT")
+        return
+    if not chain:
+        uv = None
+        if node.inputs["Vector"].is_linked:
+            source = node.inputs["Vector"].links[0].from_socket
+        else:
+            uv = tree.nodes.new("ShaderNodeUVMap")
+            uv.uv_map = "UV0"
+            source = uv.outputs["UV"]
+        sep = tree.nodes.new("ShaderNodeSeparateXYZ")
+        comb = tree.nodes.new("ShaderNodeCombineXYZ")
+        s = tree.nodes.new("ShaderNodeMath")
+        s["bmd_wrap_for"] = node.name
+        s["bmd_wrap_axis"] = "S"
+        t = tree.nodes.new("ShaderNodeMath")
+        t["bmd_wrap_for"] = node.name
+        t["bmd_wrap_axis"] = "T"
+        _layout_wrap_chain(node, sep, comb, s, t, uv)
+        tree.links.new(source, sep.inputs["Vector"])
+        tree.links.new(sep.outputs["X"], s.inputs[0])
+        tree.links.new(sep.outputs["Y"], t.inputs[0])
+        tree.links.new(s.outputs[0], comb.inputs["X"])
+        tree.links.new(t.outputs[0], comb.inputs["Y"])
+        tree.links.new(comb.outputs["Vector"], node.inputs["Vector"])
+        chain = {"S": s, "T": t}
+    _set_wrap_math(chain["S"], wrap_s)
+    _set_wrap_math(chain["T"], wrap_t)
+    node.extension = "EXTEND"
+
+
+def _image_wrap_changed(self, context):
+    image = self.id_data
+    for material in bpy.data.materials:
+        tree = material.node_tree
+        if tree is None:
+            continue
+        for node in tree.nodes:
+            if node.type == "TEX_IMAGE" and node.image is image:
+                try:
+                    _apply_wrap_to_node(node, int(self.wrap_s), int(self.wrap_t))
+                except Exception:
+                    pass
+
+
+def _image_max_lod_changed(self, context):
+    self.max_lod_custom = True
+
+
+def _image_mip_count_changed(self, context):
+    if self.max_lod_custom:
+        return
+    mips = max(1, int(self.mip_count))
+    self.max_lod = (mips - 1) * 8
+    self.max_lod_custom = False
+
+
+def image_interpolation(mag_filter):
+    """Blender has one interpolation mode; the GX magnification filter selects it."""
+    return "Closest" if int(mag_filter) == 0 else "Linear"
+
+
+def _image_filter_changed(self, context):
+    image = self.id_data
+    interpolation = image_interpolation(self.mag_filter)
+    for material in bpy.data.materials:
+        tree = material.node_tree
+        if tree is None:
+            continue
+        for node in tree.nodes:
+            if node.type == "TEX_IMAGE" and node.image is image:
+                try:
+                    node.interpolation = interpolation
+                except Exception:
+                    pass
+
+
 class BMDImageProps(PropertyGroup):
     format: EnumProperty(name="GX Format", items=IMAGE_FORMAT_ITEMS, default="CMPR",
                          description="Texture format used when exporting this image")
@@ -80,8 +206,24 @@ class BMDImageProps(PropertyGroup):
         update=_image_key_changed,
     )
     key_custom: BoolProperty(default=False, options={"HIDDEN"})
+    wrap_s: EnumProperty(name="Wrap S", items=WRAP_ITEMS, default="1",
+                         update=_image_wrap_changed)
+    wrap_t: EnumProperty(name="Wrap T", items=WRAP_ITEMS, default="1",
+                         update=_image_wrap_changed)
+    min_filter: EnumProperty(name="Min Filter", items=MIN_FILTER_ITEMS, default="1")
+    mag_filter: EnumProperty(name="Mag Filter", items=MAG_FILTER_ITEMS, default="1",
+                             update=_image_filter_changed)
+    min_lod: IntProperty(name="Min LOD", default=0, min=-128, max=127,
+                         description="Raw GX LOD value (1/8 units)")
+    max_lod: IntProperty(name="Max LOD", default=0, min=-128, max=127,
+                         description="Raw GX LOD value (1/8 units)",
+                         update=_image_max_lod_changed)
+    max_lod_custom: BoolProperty(default=False, options={"HIDDEN"})
+    lod_bias: IntProperty(name="LOD Bias", default=0, min=-32768, max=32767,
+                          description="Raw GX LOD bias (1/100 units)")
     mip_count: IntProperty(name="Mip Levels", default=0, min=0, max=12,
-                           description="Number of mip levels (0 = automatic / keep imported)")
+                           description="Number of mip levels (0 = automatic / keep imported)",
+                           update=_image_mip_count_changed)
     external: BoolProperty(name="External Texture", default=False,
                            description="Store this texture outside the BMD (header-only TEX1 "
                                        "entry). Use File > Export > J3D Textures (.bti) to write "

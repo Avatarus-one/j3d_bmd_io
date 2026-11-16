@@ -19,12 +19,25 @@ from .j3d import material as mat3
 from .j3d import model as j3d
 
 
+def _warn(warn, message):
+    if warn is not None:
+        warn(message)
+    else:
+        print(f"[BMD] {message}")
+
+
 def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=True,
                report=None, texc_dir=None):
     with open(filepath, "rb") as f:
         raw = f.read()
     bmd = j3d.parse(raw)
     base = os.path.splitext(os.path.basename(filepath))[0]
+
+    def warn(message):
+        if report:
+            report({"WARNING"}, message)
+        else:
+            print(f"[BMD] {message}")
 
     if import_textures and any(t.external for t in bmd.textures):
         missing_external = blender_bti.load_for_bmd(bmd, filepath, texc_dir)
@@ -38,7 +51,8 @@ def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=Tru
         images = _create_images(bmd, base, uuid.uuid4().hex)
     else:
         images = {}
-    materials = [_create_material(bmd, i, m, images) for i, m in enumerate(bmd.materials)]
+    materials = [_create_material(bmd, i, m, images, warn)
+                 for i, m in enumerate(bmd.materials)]
     arm_obj = _create_armature(context, coll, bmd, base, scale, bone_axis)
     bone_names = [b for b in arm_obj["bmd_bone_names"]]
 
@@ -47,7 +61,7 @@ def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=Tru
 
     if merged is not None:
         _create_mesh_object(coll, arm_obj, bone_names, bmd, merged, materials,
-                            base, scale)
+                            base, scale, warn)
         mesh_count = 1
     else:
         mesh_count = 0
@@ -170,7 +184,16 @@ def apply_texture_metadata(image, texture, path=None):
         image.bmd.format = (
             fmt_name if fmt_name in {i[0] for i in bc.IMAGE_FORMAT_ITEMS} else "CMPR")
         image.bmd.key = texture.key
+        image.bmd.wrap_s = str(int(texture.wrap_s))
+        image.bmd.wrap_t = str(int(texture.wrap_t))
+        image.bmd.min_filter = str(int(texture.min_filter))
+        image.bmd.mag_filter = str(int(texture.mag_filter))
+        image.bmd.min_lod = int(texture.min_lod)
+        image.bmd.lod_bias = int(texture.lod_bias)
         image.bmd.mip_count = int(texture.mip_count)
+        image.bmd.max_lod = int(texture.max_lod)
+        image.bmd.max_lod_custom = (
+            int(texture.max_lod) != (max(1, int(texture.mip_count)) - 1) * 8)
         image.bmd.external = bool(texture.external)
     except Exception:
         pass
@@ -242,7 +265,7 @@ def _get_json_material(bmd_mat):
     return json.dumps(bmd_mat, separators=(",", ":"))
 
 
-def _create_material(bmd, index, m, images):
+def _create_material(bmd, index, m, images, warn=None):
     name = bmd.material_names[index] if index < len(bmd.material_names) else f"material{index}"
     mat = bpy.data.materials.new(name)
     mat["bmd_name"] = name
@@ -255,17 +278,19 @@ def _create_material(bmd, index, m, images):
     try:
         _build_nodes(mat, m, images)
     except Exception as exc:  # node API differences must never break the import
-        print(f"[BMD] could not build nodes for {name}: {exc}")
+        _warn(warn, f"Material '{name}': preview nodes could not be built: {exc}")
     return mat
 
 
 _WRAP_EXT = {0: "EXTEND", 1: "REPEAT", 2: "MIRROR"}
 
 
-def _wrap_axis(nodes, links, src, mode, x, y):
+def _wrap_axis(nodes, links, src, mode, x, y, owner, axis):
     """Per-axis UV wrapping: 0 clamp, 1 repeat, 2 mirror. Returns the output socket."""
     n = nodes.new("ShaderNodeMath")
     n.location = (x, y)
+    n["bmd_wrap_for"] = owner
+    n["bmd_wrap_axis"] = axis
     if mode == 1:
         n.operation = "FRACT"
     elif mode == 2:
@@ -308,7 +333,7 @@ def _build_nodes(mat, m, images):
         node.image = images[tname]
         node.location = (-100, 300 - 280 * slot)
         img = node.image
-        node.interpolation = "Closest" if img.get("bmd_mag_filter", 1) == 0 else "Linear"
+        node.interpolation = bc.image_interpolation(int(img.bmd.mag_filter))
         slot_nodes[slot] = node
 
     # which slot does TEV stage 0 sample?
@@ -322,14 +347,13 @@ def _build_nodes(mat, m, images):
     if main_slot is not None:
         node = slot_nodes[main_slot]
         img = node.image
-        ws, wt = int(img.get("bmd_wrap_s", 1)), int(img.get("bmd_wrap_t", 1))
+        ws, wt = int(img.bmd.wrap_s), int(img.bmd.wrap_t)
         tc = m.get("texCoord", [None] * 8)
         uv_name = "UV0"
         if main_coord < 8 and tc[main_coord] and 4 <= tc[main_coord][1] <= 11:
             uv_name = f"UV{tc[main_coord][1] - 4}"
         uvn = nodes.new("ShaderNodeUVMap")
         uvn.uv_map = uv_name
-        uvn.location = (-700, 300)
         use_chain = ws != wt
         if not use_chain:
             try:
@@ -341,12 +365,19 @@ def _build_nodes(mat, m, images):
         else:
             # the image node has a single extension mode, GX has one per axis
             sep = nodes.new("ShaderNodeSeparateXYZ")
-            sep.location = (-520, 300)
             comb = nodes.new("ShaderNodeCombineXYZ")
-            comb.location = (-250, 300)
             links.new(uvn.outputs["UV"], sep.inputs["Vector"])
-            xs = _wrap_axis(nodes, links, sep.outputs["X"], ws, -400, 400)
-            ys = _wrap_axis(nodes, links, sep.outputs["Y"], wt, -400, 200)
+            xs = _wrap_axis(nodes, links, sep.outputs["X"], ws, 0, 0,
+                            node.name, "S")
+            ys = _wrap_axis(nodes, links, sep.outputs["Y"], wt, 0, 0,
+                            node.name, "T")
+            s_node = next(n for n in nodes
+                          if n.get("bmd_wrap_for") == node.name
+                          and n.get("bmd_wrap_axis") == "S")
+            t_node = next(n for n in nodes
+                          if n.get("bmd_wrap_for") == node.name
+                          and n.get("bmd_wrap_axis") == "T")
+            bc._layout_wrap_chain(node, sep, comb, s_node, t_node, uvn)
             links.new(xs, comb.inputs["X"])
             links.new(ys, comb.inputs["Y"])
             links.new(comb.outputs["Vector"], node.inputs["Vector"])
@@ -355,7 +386,7 @@ def _build_nodes(mat, m, images):
     for slot, node in slot_nodes.items():
         if slot != main_slot:
             try:
-                node.extension = _WRAP_EXT.get(int(node.image.get("bmd_wrap_s", 1)), "REPEAT")
+                node.extension = _WRAP_EXT.get(int(node.image.bmd.wrap_s), "REPEAT")
             except Exception:
                 pass
 
@@ -511,7 +542,8 @@ def _create_armature(context, coll, bmd, base, scale, bone_axis):
 # meshes
 # --------------------------------------------------------------------------
 
-def _create_mesh_object(coll, arm_obj, bone_names, bmd, md, materials, base, scale):
+def _create_mesh_object(coll, arm_obj, bone_names, bmd, md, materials, base, scale,
+                        warn=None):
     shape_name = base
     verts = bc.point_to_blender(md.verts, scale)
     # GX front faces are wound the opposite way to Blender's: flip every triangle and
@@ -557,7 +589,7 @@ def _create_mesh_object(coll, arm_obj, bone_names, bmd, md, materials, base, sca
         try:
             me.normals_split_custom_set((n / ln).tolist())
         except Exception as exc:
-            print(f"[BMD] custom normals failed for {shape_name}: {exc}")
+            _warn(warn, f"Mesh '{shape_name}': custom normals failed: {exc}")
 
     if md.loop_normal_indices is not None and len(md.loop_normal_indices) == n_loops:
         normal_count = len(bmd.arrays.get(j3d.VA_NRM, ()))
@@ -566,7 +598,7 @@ def _create_mesh_object(coll, arm_obj, bone_names, bmd, md, materials, base, sca
                 me, md.loop_normal_indices, normal_count, source="import",
                 position_offset=0, vertex_order=True)
         except ValueError as exc:
-            print(f"[BMD] could not store normal metadata for {shape_name}: {exc}")
+            _warn(warn, f"Mesh '{shape_name}': could not store normal metadata: {exc}")
 
     # Keep the original material indices.  The exporter groups faces by the
     # source shape node, so one material slot per source material is enough.

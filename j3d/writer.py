@@ -721,7 +721,11 @@ def _build_tex1(textures):
             fmt = t.format
             h, w = t.rgba.shape[:2]
             data, mips = gx.encode_with_mips(fmt, t.rgba, t.mip_count)
-        max_lod = (mips - 1) * 8
+        if (getattr(t, "max_lod_custom", False)
+                or t.raw_data is not None or external):
+            max_lod = t.max_lod
+        else:
+            max_lod = (mips - 1) * 8
         if t.raw_data is not None and t.raw_palette:
             pal_pos = align(pos + len(data), 32)
         headers += gx.pack_texture_header(gx.TextureHeader(
@@ -729,8 +733,7 @@ def _build_tex1(textures):
             pal_enabled, pal_fmt, pal_cnt,
             (pal_pos - hpos) if pal_pos else 0, t.flags10, t.min_filter,
             t.mag_filter, min(max(t.min_lod, -128), 127),
-            min(max(t.max_lod if (t.raw_data is not None or external) else max_lod,
-                    -128), 127),
+            min(max(max_lod, -128), 127),
             mips, 0, t.lod_bias, 0 if external else pos - hpos))
         if external:
             continue

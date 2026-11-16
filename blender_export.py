@@ -21,6 +21,13 @@ class ExportError(Exception):
     pass
 
 
+def _warn(warn, message):
+    if warn is not None:
+        warn(message)
+    else:
+        print(f"[BMD] {message}")
+
+
 def _same_geometry(original, evaluated):
     """True when the modifier result has identical topology and positions."""
     if original is evaluated:
@@ -64,15 +71,16 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
     scene_objs = context.selected_objects if use_selection else [
         o for o in context.scene.objects if o.visible_get()]
     mesh_objs = [o for o in scene_objs if o.type == "MESH"]
-    arm_obj = next((o for o in scene_objs if o.type == "ARMATURE"), None)
-    if arm_obj is None:
-        for o in mesh_objs:
-            for m in o.modifiers:
-                if m.type == "ARMATURE" and m.object:
-                    arm_obj = m.object
-                    break
-            if arm_obj:
-                break
+    armatures = {o for o in scene_objs if o.type == "ARMATURE"}
+    for obj in mesh_objs:
+        target = bc.target_armature(obj)
+        if target is not None:
+            armatures.add(target)
+    if len(armatures) > 1:
+        raise ExportError(
+            "The export contains meshes from multiple armatures. "
+            "Select one armature and its meshes, or hide the other models.")
+    arm_obj = next(iter(armatures), None)
     if not mesh_objs:
         raise ExportError("No mesh objects to export (select the meshes, or disable 'Selected Only')")
 
@@ -113,7 +121,13 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
             if old is not None and new is not None:
                 joint_map[int(old)] = int(new)
 
-    mats = _MaterialCollector(model)
+    def warn(message):
+        if report:
+            report({"WARNING"}, message)
+        else:
+            print(f"[BMD] {message}")
+
+    mats = _MaterialCollector(model, warn)
     if arm_obj is not None and "bmd_textures" in arm_obj:
         mats.preload_original_textures(arm_obj, source_file, allow_missing_textures, report)
     # Keep every imported material slot, including slots that currently have
@@ -129,7 +143,7 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
     normal_updates = []
     for obj in mesh_objs:
         _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modifiers,
-                            context, limit_weights, normal_updates, joint_map)
+                            context, limit_weights, normal_updates, joint_map, warn)
     if not model.meshes:
         raise ExportError("The selected meshes have no faces to export")
     _add_empty_shapes(model, mesh_objs, mats, joint_map)
@@ -156,7 +170,7 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
                 obj.data, indices, model.normal_count, source="export",
                 position_offset=position_offset, vertex_order=vertex_order)
         except ValueError as exc:
-            print(f"[BMD] could not update normal metadata for {obj.name}: {exc}")
+            warn(f"Object '{obj.name}': could not update normal metadata: {exc}")
 
     exported_formats = {
         str(attr): [components, typ, frac]
@@ -423,11 +437,11 @@ def _eval_mesh(obj, apply_modifiers, context):
 
 
 def _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modifiers, context,
-                        limit_weights=False, normal_updates=None, joint_map=None):
+                        limit_weights=False, normal_updates=None, joint_map=None, warn=None):
     me, cleanup = _eval_mesh(obj, apply_modifiers, context)
     try:
         _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_weights,
-                          normal_updates, joint_map)
+                          normal_updates, joint_map, warn)
     finally:
         if cleanup:
             ev, disabled = cleanup
@@ -437,7 +451,7 @@ def _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modi
 
 
 def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_weights=False,
-                      normal_updates=None, joint_map=None):
+                      normal_updates=None, joint_map=None, warn=None):
     me.calc_loop_triangles()
     nt = len(me.loop_triangles)
     if nt == 0:
@@ -482,7 +496,8 @@ def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_we
         ln[ln == 0] = 1
         normals = (n / ln).astype(np.float32)
     except Exception as exc:
-        print(f"[BMD] could not read normals of {obj.name}: {exc}")
+        _warn(warn, f"Mesh '{obj.name}': could not read normals; "
+                    f"exporting without custom normals: {exc}")
 
     normal_indices = None
     if normals is not None:
@@ -544,8 +559,8 @@ def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_we
         max_weights = 4 if limit_weights else writer.MAX_ENVELOPE_WEIGHTS
         if len(ws) > max_weights:
             if not limit_weights:
-                print(f"[BMD] {obj.name}: vertex {i} has more than "
-                      f"{writer.MAX_ENVELOPE_WEIGHTS} influences; clamping")
+                _warn(warn, f"Object '{obj.name}': vertex {i} has more than "
+                            f"{writer.MAX_ENVELOPE_WEIGHTS} influences; clamping")
             ws = dict(sorted(ws.items(), key=lambda kv: -kv[1])[:max_weights])
         tot = sum(ws.values())
         key = tuple(sorted((j, round(w / tot, 5)) for j, w in ws.items()))
@@ -564,7 +579,9 @@ def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_we
         node_attr = me.attributes.get("bmd_node")
         try:
             node_table = json.loads(obj.get("bmd_shape_nodes", "[]"))
-        except Exception:
+        except Exception as exc:
+            _warn(warn, f"Object '{obj.name}': invalid bmd_shape_nodes; "
+                        f"falling back to material groups: {exc}")
             node_table = []
         if node_attr is not None and node_table:
             node_values = np.empty(len(me.polygons), np.int32)
@@ -641,7 +658,7 @@ def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_we
 # materials & textures
 # --------------------------------------------------------------------------
 
-def _reuse_raw(image, t, w, h):
+def _reuse_raw(image, t, w, h, warn=None):
     """Use the original encoded bytes when the image still looks like the imported one."""
     raw = image.get("bmd_raw")
     if not raw:
@@ -670,7 +687,8 @@ def _reuse_raw(image, t, w, h):
         if worst > 1:
             return False
     except Exception as exc:
-        print(f"[BMD] cannot reuse original texture data of {image.name}: {exc}")
+        _warn(warn, f"Image '{image.name}': could not reuse the original texture data; "
+                    f"re-encoding from pixels: {exc}")
         return False
     t.raw_data, t.raw_palette = data, pal_raw
     t.format, t.mip_count = rfmt, mips0
@@ -683,12 +701,13 @@ def _reuse_raw(image, t, w, h):
         try:
             t.raw_bti = zlib.decompress(base64.b64decode(raw_bti))
         except Exception as exc:
-            print(f"[BMD] cannot read original .bti data of {image.name}: {exc}")
+            _warn(warn, f"Image '{image.name}': could not read the original .bti data; "
+                        f"it will be re-encoded: {exc}")
             t.raw_bti = None
     return True
 
 
-def texture_from_image(image, wrap_ext="REPEAT"):
+def texture_from_image(image, warn=None):
     """Build an export :class:`j3d.Texture` from a Blender image."""
     name = bc.clean_texture_name(image)
     t = j3d.Texture(name)
@@ -702,7 +721,7 @@ def texture_from_image(image, wrap_ext="REPEAT"):
     props = image.bmd
     orig = image.get("bmd_orig_format")
     external = bool(props.external)
-    reused = _reuse_raw(image, t, w, h)
+    reused = _reuse_raw(image, t, w, h, warn)
     has_a = gx.has_alpha(t.rgba)
     partial = gx.has_partial_alpha(t.rgba)
 
@@ -727,7 +746,6 @@ def texture_from_image(image, wrap_ext="REPEAT"):
         if not reused:
             want = orig if auto_format else props.format
             t.format = choose_format(want, auto_format)
-            t.max_lod = int(image.get("bmd_max_lod", 0))
         external_size = image.get("bmd_external_size")
         if external_size and len(external_size) == 2:
             ext_w, ext_h = int(external_size[0]), int(external_size[1])
@@ -756,17 +774,14 @@ def texture_from_image(image, wrap_ext="REPEAT"):
                 mips = min(gx.max_mip_count(w, h), 4)
         t.mip_count = mips
 
-    ext_wrap = {"EXTEND": 0, "CLIP": 0, "REPEAT": 1, "MIRROR": 2}.get(wrap_ext, 1)
-    t.wrap_s = int(image.get("bmd_wrap_s", ext_wrap))
-    t.wrap_t = int(image.get("bmd_wrap_t", ext_wrap))
-    min_filter = int(image.get("bmd_min_filter", 5 if mips > 1 else 1))
-    if mips <= 1 and min_filter >= 2:
-        # Mipmap filtering without mip levels would sample past the image.
-        min_filter = 1
-    t.min_filter = min_filter
-    t.mag_filter = int(image.get("bmd_mag_filter", 1))
-    t.min_lod = int(image.get("bmd_min_lod", 0))
-    t.lod_bias = int(image.get("bmd_lod_bias", 0))
+    t.wrap_s = int(props.wrap_s)
+    t.wrap_t = int(props.wrap_t)
+    t.min_filter = int(props.min_filter)
+    t.mag_filter = int(props.mag_filter)
+    t.min_lod = int(props.min_lod)
+    t.max_lod = int(props.max_lod)
+    t.max_lod_custom = bool(props.max_lod_custom)
+    t.lod_bias = int(props.lod_bias)
     fl = image.get("bmd_flags10")
     flags = bytes.fromhex(fl) if fl else b"\0\0\0\0"
     if len(flags) < 4:
@@ -777,8 +792,9 @@ def texture_from_image(image, wrap_ext="REPEAT"):
 
 
 class _MaterialCollector:
-    def __init__(self, model):
+    def __init__(self, model, warn=None):
         self.model = model
+        self.warn = warn
         self.mat_index = {}
         self.images = {}   # tex name -> (Texture)
         self.pending = []  # (ExportMesh)
@@ -818,7 +834,8 @@ class _MaterialCollector:
                     with open(path, "rb") as f:
                         self._source = {t.key: t for t in j3d.parse(f.read()).textures}
                 except Exception as exc:
-                    print(f"[BMD] cannot read original model {path}: {exc}")
+                    _warn(self.warn, f"Could not read the original model '{path}' "
+                                     f"to restore textures: {exc}")
         return self._source
 
     def preload_original_textures(self, arm_obj, source_file, allow_missing, report):
@@ -847,7 +864,7 @@ class _MaterialCollector:
                 if legacy is not None and bc.texture_key(legacy) == key:
                     img = legacy
             if img is not None:
-                self._texture_for(img, "REPEAT")
+                self._texture_for(img)
                 continue
             tex = self._source_textures(source).get(key)
             if tex is not None:
@@ -856,9 +873,9 @@ class _MaterialCollector:
                 restored.append(key)
             else:
                 missing.append(key)
-        if restored and report:
-            report({"WARNING"}, f"{len(restored)} textures were missing in Blender and were restored "
-                                f"from the original model: {', '.join(restored)}")
+        if restored:
+            _warn(self.warn, f"{len(restored)} textures were missing in Blender and were restored "
+                             f"from the original model: {', '.join(restored)}")
         if missing and not allow_missing:
             raise ExportError(
                 f"{len(missing)} textures of the imported model no longer exist in Blender "
@@ -874,11 +891,11 @@ class _MaterialCollector:
                 return image
         return None
 
-    def _texture_for(self, image, wrap_ext):
+    def _texture_for(self, image):
         key = bc.texture_key(image)
         if key in self.images:
             return key
-        t = texture_from_image(image, wrap_ext)
+        t = texture_from_image(image, self.warn)
         self.images[key] = t
         self.model.textures.append(t)
         return key
@@ -908,11 +925,17 @@ class _MaterialCollector:
         cull_back = bool(bl_mat.use_backface_culling) if bl_mat else True
         name = (bl_mat.get("bmd_name") or bl_mat.name) if bl_mat else "default"
 
+        d = None
         if stored:
-            d = json.loads(stored)
+            try:
+                d = json.loads(stored)
+            except Exception as exc:
+                _warn(self.warn, f"Material '{name}': stored material data is invalid; "
+                                 f"rebuilding it from its nodes: {exc}")
+        if d is not None:
             tex_names = list(d.get("texNames", [None] * 8))
-            for slot, (img, ext) in nodes.items():
-                tex_names[slot] = self._texture_for(img, ext) if img else None
+            for slot, (img, _ext) in nodes.items():
+                tex_names[slot] = self._texture_for(img) if img else None
             # slots that previously had a texture but now have no node keep their name only
             # if the texture still exists in the scene
             for slot in range(8):
@@ -920,7 +943,7 @@ class _MaterialCollector:
                     base = tex_names[slot]
                     img = self._image_for_key(base)
                     if img is not None:
-                        tex_names[slot] = self._texture_for(img, "REPEAT")
+                        tex_names[slot] = self._texture_for(img)
                     else:
                         tex_names[slot] = None
             d["texNames"] = tex_names
@@ -942,12 +965,12 @@ class _MaterialCollector:
         tex_name = None
         has_alpha = False
         if 0 in nodes and nodes[0][0] is not None:
-            tex_name = self._texture_for(*nodes[0])
+            tex_name = self._texture_for(nodes[0][0])
             has_alpha = gx.has_alpha(self.images[tex_name].rgba)
         elif nodes:
             slot = min(nodes)
             if nodes[slot][0] is not None:
-                tex_name = self._texture_for(*nodes[slot])
+                tex_name = self._texture_for(nodes[slot][0])
                 has_alpha = gx.has_alpha(self.images[tex_name].rgba)
         if mode == "AUTO":
             blended = False
