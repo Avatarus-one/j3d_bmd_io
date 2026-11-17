@@ -367,7 +367,7 @@ def _parse_shp1(d, off):
     return shapes
 
 
-def _parse_tex1(d, off):
+def _parse_tex1(d, off, load_data=True):
     n = u16(d, off + 8)
     o_hdr = u32(d, off + 0x0C)
     o_names = u32(d, off + 0x10)
@@ -394,7 +394,11 @@ def _parse_tex1(d, off):
             # No image data in the file: reading from the header itself would yield garbage.
             t.external = True
             t.external_size = (w, h)
-            t.rgba = np.full((h, w, 4), 128, np.uint8)
+            if load_data:
+                t.rgba = np.full((h, w, 4), 128, np.uint8)
+            textures.append(t)
+            continue
+        if not load_data:
             textures.append(t)
             continue
         t.rgba, t.raw_data, t.raw_palette = gx.decode_texture_payload(
@@ -498,6 +502,55 @@ def parse(data):
     bmd.materials, bmd.material_names = mat3.parse_mat3(data, chunks["MAT3"], tex_names)
     bmd.shape_nodes = _walk_hierarchy(bmd.hierarchy, bmd.joints)
     bmd.world = compute_world_matrices(bmd.joints, bmd.maya)
+    return bmd
+
+
+def _file_chunks(data):
+    """Return ``(data, {tag: offset})`` after Yaz0 decompression and header checks."""
+    data = bytes(data)
+    if data[:4] == b"Yaz0":
+        data = yaz0_decompress(data)
+    if data[:4] != b"J3D2" or data[4:8] not in (b"bmd3", b"bdl4"):
+        raise J3DError("Not a J3D2 bmd3/bdl4 model file")
+    count = u32(data, 12)
+    chunks = {}
+    off = 32
+    for _ in range(count):
+        if off + 8 > len(data):
+            raise J3DError("Truncated file (chunk header)")
+        tag = data[off:off + 4].decode("ascii", "replace")
+        size = u32(data, off + 4)
+        if size < 8:
+            raise J3DError(f"Invalid chunk size for {tag}")
+        chunks[tag] = off
+        off += size
+    return data, chunks
+
+
+def parse_textures(data, load_data=True):
+    """Parse only the TEX1 chunk (used to restore textures without the rest of the model)."""
+    data, chunks = _file_chunks(data)
+    if "TEX1" not in chunks:
+        return []
+    return _parse_tex1(data, chunks["TEX1"], load_data=load_data)
+
+
+def parse_validation(data):
+    """Parse only the chunks needed by :func:`writer.validate_engine_layout`.
+
+    The full parser decodes every texture and vertex array; validation only
+    needs DRW1/EVP1/JNT1/SHP1, which keeps large 4K models fast to export.
+    """
+    data, chunks = _file_chunks(data)
+    for req in ("DRW1", "JNT1", "SHP1"):
+        if req not in chunks:
+            raise J3DError(f"Missing chunk {req}")
+    bmd = Bmd()
+    bmd.data = data
+    bmd.envelopes = _parse_evp1(data, chunks["EVP1"]) if "EVP1" in chunks else []
+    bmd.drw = _parse_drw1(data, chunks["DRW1"])
+    bmd.joints = _parse_jnt1(data, chunks["JNT1"])
+    bmd.shapes = _parse_shp1(data, chunks["SHP1"])
     return bmd
 
 

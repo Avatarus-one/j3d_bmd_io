@@ -656,6 +656,8 @@ def _begin_import(context, paths, operator):
         if target is not None:
             settings.target = target
 
+    settings.convert_units = bc.saved_convert_units(context, settings.target)
+
     window = context.window
     if window is not None:
         window.cursor_set('WAIT')

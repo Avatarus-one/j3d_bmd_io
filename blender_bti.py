@@ -187,7 +187,8 @@ def texture_availability(bmd_path, names, texc_dir=None):
 
 def check_external_textures(bmd, bmd_path, texc_dir=None):
     """Return (missing_names, suggested_folder) without modifying *bmd*."""
-    names = [t.name for t in bmd.textures if t.external]
+    textures = getattr(bmd, "textures", bmd)
+    names = [t.name for t in textures if t.external]
     if not names:
         return [], None
 

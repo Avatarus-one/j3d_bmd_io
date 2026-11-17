@@ -758,7 +758,7 @@ def _build_tex1(textures):
 def validate_engine_layout(data):
     """Check the invariants the game's loader relies on; raises J3DError when violated."""
     from . import model as _m
-    b = _m.parse(data)
+    b = _m.parse_validation(data)
     ne = len(b.envelopes)
     entries = len(b.drw) - ne                     # J3DModelLoader::readDraw: mEntryNum
     if entries <= 0:

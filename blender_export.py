@@ -2,6 +2,8 @@
 
 import base64
 import copy
+import hashlib
+import heapq
 import json
 import math
 import os
@@ -116,10 +118,11 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
     bone_index = _build_joints(model, arm_obj, scale)
     joint_map = {}
     if arm_obj is not None:
-        for bone in arm_obj.data.bones:
-            old = bone.get("bmd_index")
+        owners, _duplicates = joint_index_owners(
+            arm_obj.data, arm_obj.get("bmd_bone_names", []))
+        for old, bone in owners.items():
             new = bone_index.get(bone.name)
-            if old is not None and new is not None:
+            if new is not None:
                 joint_map[int(old)] = int(new)
 
     def warn(message):
@@ -204,21 +207,117 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
 # skeleton
 # --------------------------------------------------------------------------
 
-def ordered_bones(arm):
-    """Bones in J3D joint order: imported bones keep ``bmd_index``, new bones follow depth-first."""
+def is_duplicate_bone_name(name):
+    """True for Blender's automatic ``.001`` duplicate suffix."""
+    _base, sep, suffix = str(name).rpartition(".")
+    return bool(sep) and len(suffix) == 3 and suffix.isdigit()
+
+
+def strip_blender_suffix(name):
+    """Remove Blender's automatic ``.001`` duplicate suffix from an exported name."""
+    text = str(name)
+    base, sep, suffix = text.rpartition(".")
+    if sep and len(suffix) == 3 and suffix.isdigit():
+        return base
+    return text
+
+
+def exported_joint_name(bone):
+    """Joint name to write: the original name unless the user renamed the bone.
+
+    Blender appends unique suffixes (``.001`` or ``.<joint index>``) when a
+    file contains duplicate joint names.  Those are ignored, but a manual
+    rename must be exported.
+    """
+    imported_name = bone.get("bmd_bone_name")
+    if imported_name is not None and bone.name == str(imported_name):
+        return str(bone.get("bmd_joint_name") or bone.name)
+    return strip_blender_suffix(bone.name)
+
+
+def joint_index_owners(arm, imported_names=None):
+    """Return ``({bmd_index: bone}, [duplicate bones])`` for the armature.
+
+    Duplicated bones copy ``bmd_index`` from the original.  The bone named in
+    ``imported_names`` (or, failing that, the bone without a ``.001`` suffix)
+    keeps the index; the other bones are returned as duplicates.
+    """
+    names = [str(n) for n in (imported_names or [])]
+    groups = {}
+    for bone in arm.bones:
+        raw = bone.get("bmd_index")
+        if raw is None:
+            continue
+        try:
+            idx = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if idx >= 0:
+            groups.setdefault(idx, []).append(bone)
+
+    owners = {}
+    duplicates = []
+    for idx, group in groups.items():
+        owner = None
+        if idx < len(names):
+            owner = next((b for b in group if b.name == names[idx]), None)
+        if owner is None:
+            owner = next((b for b in group if not is_duplicate_bone_name(b.name)),
+                         group[0])
+        owners[idx] = owner
+        duplicates.extend(b for b in group if b is not owner)
+    return owners, duplicates
+
+
+def ordered_bones(arm, imported_names=None):
+    """Bones in J3D joint order.
+
+    Parents always precede their children, so the result is safe for both BMD
+    joint tables and BCK track order.  Imported bones keep their relative
+    ``bmd_index`` order whenever the hierarchy still allows it; new bones
+    (added or duplicated by the user) follow.  When several bones share one
+    ``bmd_index``, the bone named in ``imported_names`` keeps it, and the
+    others are treated as new bones.
+    """
     bones = list(arm.bones)
-    known = sorted([b for b in bones if "bmd_index" in b], key=lambda b: b["bmd_index"])
-    new = []
+    if not bones:
+        return []
 
-    def dfs(b):
-        if "bmd_index" not in b:
-            new.append(b)
-        for c in b.children:
-            dfs(c)
+    owners, _duplicates = joint_index_owners(arm, imported_names)
+    preferred = {b.name: idx for idx, b in owners.items()}
 
-    for r in [b for b in bones if b.parent is None]:
-        dfs(r)
-    return known + [b for b in new if b not in known]
+    # Imported indices first, then new bones in armature order.  The keys only
+    # decide between bones that are ready at the same time; the topological
+    # sort below still guarantees that parents come first.
+    next_key = max(preferred.values(), default=-1) + 1
+    keys = {}
+    for b in bones:
+        if b.name in preferred:
+            keys[b.name] = preferred[b.name]
+        else:
+            keys[b.name] = next_key
+            next_key += 1
+
+    children = {b.name: [] for b in bones}
+    indegree = {b.name: 0 for b in bones}
+    for b in bones:
+        if b.parent is not None and b.parent.name in indegree:
+            children[b.parent.name].append(b.name)
+            indegree[b.name] += 1
+
+    ready = [(keys[name], name) for name, degree in indegree.items() if degree == 0]
+    heapq.heapify(ready)
+    ordered = []
+    while ready:
+        _key, name = heapq.heappop(ready)
+        ordered.append(name)
+        for child in children[name]:
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                heapq.heappush(ready, (keys[child], child))
+    if len(ordered) != len(bones):
+        raise ExportError("Bone hierarchy contains a cycle")
+    return [arm.bones[name] for name in ordered]
 
 
 def _add_empty_shapes(model, mesh_objs, mats, joint_map=None):
@@ -281,6 +380,49 @@ def _add_empty_shapes(model, mesh_objs, mats, joint_map=None):
         added.add(shape_index)
 
 
+def remap_joint_references(old_to_new, mesh_objs=None):
+    """Update stored joint indices after a skeleton renumber.
+
+    ``bmd_shape_nodes`` tables and ``bmd_joint`` on mesh objects address joints
+    by index.  A BMD or BCK export can change the bone order, so those values
+    must follow the bones.
+    """
+    objects = bpy.data.objects if mesh_objs is None else mesh_objs
+    for obj in objects:
+        if obj.type != "MESH":
+            continue
+        changed = False
+        raw = obj.get("bmd_shape_nodes")
+        if raw:
+            try:
+                table = json.loads(raw)
+            except (TypeError, ValueError):
+                table = None
+            if table:
+                for info in table:
+                    if len(info) < 4:
+                        continue
+                    old_joint = int(info[0])
+                    new_joint = old_to_new.get(old_joint)
+                    if new_joint is not None and new_joint != old_joint:
+                        info[0] = int(new_joint)
+                        changed = True
+                if changed:
+                    obj["bmd_shape_nodes"] = json.dumps(table)
+        if "bmd_joint" in obj:
+            try:
+                old_joint = int(obj["bmd_joint"])
+            except (TypeError, ValueError):
+                old_joint = None
+            if old_joint is not None:
+                new_joint = old_to_new.get(old_joint)
+                if new_joint is not None and new_joint != old_joint:
+                    obj["bmd_joint"] = int(new_joint)
+                    changed = True
+        if changed:
+            obj.update_tag()
+
+
 def _update_bone_metadata(arm_obj, model, bone_index, mesh_objs):
     """Store the exported joint layout on the armature and shape-node tables.
 
@@ -288,14 +430,11 @@ def _update_bone_metadata(arm_obj, model, bone_index, mesh_objs):
     ``bmd_local``/``bmd_rest`` for unchanged bones.  After a BMD export those
     values must describe the file that was just written, not the previous one.
     """
-    old_indices = {}
-    for bone in arm_obj.data.bones:
-        old = bone.get("bmd_index")
-        if old is not None:
-            old_indices[bone.name] = int(old)
+    owners, _duplicates = joint_index_owners(
+        arm_obj.data, arm_obj.get("bmd_bone_names", []))
     new_by_old = {}
-    for name, old in old_indices.items():
-        new = bone_index.get(name)
+    for old, bone in owners.items():
+        new = bone_index.get(bone.name)
         if new is not None:
             new_by_old[old] = new
 
@@ -316,27 +455,8 @@ def _update_bone_metadata(arm_obj, model, bone_index, mesh_objs):
         bone["bmd_rest"] = [
             float(x) for x in bc.to_np(bone.matrix_local).reshape(-1)]
 
-    arm_obj["bmd_bone_names"] = [b.name for b in ordered_bones(arm_obj.data)]
-
-    for obj in mesh_objs:
-        raw = obj.get("bmd_shape_nodes")
-        if not raw:
-            continue
-        try:
-            table = json.loads(raw)
-        except (TypeError, ValueError):
-            continue
-        changed = False
-        for info in table:
-            if len(info) < 4:
-                continue
-            old_joint = int(info[0])
-            new_joint = new_by_old.get(old_joint)
-            if new_joint is not None and new_joint != old_joint:
-                info[0] = int(new_joint)
-                changed = True
-        if changed:
-            obj["bmd_shape_nodes"] = json.dumps(table)
+    arm_obj["bmd_bone_names"] = sorted(bone_index, key=bone_index.get)
+    remap_joint_references(new_by_old, mesh_objs)
 
 
 def _build_joints(model, arm_obj, scale):
@@ -351,7 +471,7 @@ def _build_joints(model, arm_obj, scale):
         model.joints.append(j3d.Joint("root"))
         return {}
 
-    ordered = ordered_bones(arm)
+    ordered = ordered_bones(arm, arm_obj.get("bmd_bone_names", []))
     index = {b.name: i for i, b in enumerate(ordered)}
 
     axis_fix = bc.R_FIX if arm_obj.get("bmd_bone_axis", "X") == "X" else np.eye(4)
@@ -378,7 +498,7 @@ def _build_joints(model, arm_obj, scale):
         return reuse_memo[b.name]
 
     for b in ordered:
-        j = j3d.Joint(b.name)
+        j = j3d.Joint(exported_joint_name(b))
         j.parent = index[b.parent.name] if b.parent else -1
         j.kind = int(b.get("bmd_kind", 1))
         j.scale_compensate = int(b.get("bmd_scale_comp", 0))
@@ -688,13 +808,22 @@ def _reuse_raw(image, t, w, h, warn=None):
             pal_raw = zlib.decompress(base64.b64decode(image["bmd_raw_pal"]))
             pal = gx.decode_palette(int(image["bmd_pal_fmt"]), pal_raw,
                                     int(image["bmd_pal_count"]))
-        ref = gx.decode(rfmt, data, rw, rh, pal).astype(np.int16)
-        cur = t.rgba.astype(np.int16)
-        diff = np.abs(ref - cur)
-        visible = ((ref[..., 3] > 0) | (cur[..., 3] > 0))[..., None]
-        worst = max(int(diff[..., 3].max()), int(np.where(visible, diff[..., :3], 0).max()))
-        if worst > 1:
-            return False
+        stored_hash = image.get("bmd_pixel_hash")
+        if stored_hash:
+            # The hash is of the pixels at import time.  Comparing it to the
+            # current pixels avoids decoding a 4K texture and comparing two
+            # full RGBA arrays.
+            if hashlib.sha1(t.rgba).hexdigest() != str(stored_hash):
+                return False
+        else:
+            ref = gx.decode(rfmt, data, rw, rh, pal).astype(np.int16)
+            cur = t.rgba.astype(np.int16)
+            diff = np.abs(ref - cur)
+            visible = ((ref[..., 3] > 0) | (cur[..., 3] > 0))[..., None]
+            worst = max(int(diff[..., 3].max()),
+                        int(np.where(visible, diff[..., :3], 0).max()))
+            if worst > 1:
+                return False
     except Exception as exc:
         _warn(warn, f"Image '{image.name}': could not reuse the original texture data; "
                     f"re-encoding from pixels: {exc}")
@@ -726,7 +855,11 @@ def texture_from_image(image, warn=None):
         raise ExportError(f"Image '{image.name}' has no pixel data")
     buf = np.empty(w * h * 4, np.float32)
     image.pixels.foreach_get(buf)
-    t.rgba = np.clip(np.rint(buf.reshape(h, w, 4)[::-1] * 255.0), 0, 255).astype(np.uint8)
+    pixels = buf.reshape(h, w, 4)[::-1]
+    pixels *= 255.0
+    np.rint(pixels, out=pixels)
+    np.clip(pixels, 0, 255, out=pixels)
+    t.rgba = pixels.astype(np.uint8)
     props = image.bmd
     orig = image.get("bmd_orig_format")
     external = bool(props.external)
@@ -841,7 +974,7 @@ class _MaterialCollector:
             if path and os.path.isfile(path):
                 try:
                     with open(path, "rb") as f:
-                        self._source = {t.key: t for t in j3d.parse(f.read()).textures}
+                        self._source = {t.key: t for t in j3d.parse_textures(f.read())}
                 except Exception as exc:
                     _warn(self.warn, f"Could not read the original model '{path}' "
                                      f"to restore textures: {exc}")
@@ -980,7 +1113,8 @@ class _MaterialCollector:
         mode = bl_mat.bmd.render_mode if bl_mat else "AUTO"
         alpha_ref = bl_mat.bmd.alpha_ref if bl_mat else 128
         cull_back = bool(bl_mat.use_backface_culling) if bl_mat else True
-        name = (bl_mat.get("bmd_name") or bl_mat.name) if bl_mat else "default"
+        name = ((bl_mat.get("bmd_name")
+                 or strip_blender_suffix(bl_mat.name)) if bl_mat else "default")
 
         d = None
         if stored:
@@ -1067,10 +1201,3 @@ class _MaterialCollector:
             if 0 <= mesh.material < len(remap):
                 mesh.material = remap[mesh.material]
         self.pending = [(m, remap[i]) for m, i in self.pending]
-        # unique material names (J3D tables are by index but names should be distinct)
-        seen = {}
-        names = self.model.material_names
-        for i, n in enumerate(names):
-            if n in seen:
-                names[i] = f"{n}_{i}"
-            seen[n] = True

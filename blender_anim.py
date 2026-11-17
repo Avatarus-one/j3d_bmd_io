@@ -21,7 +21,8 @@ import bpy
 import numpy as np
 
 from . import blender_common as bc
-from .blender_export import ordered_bones
+from .blender_export import (joint_index_owners, ordered_bones,
+                             remap_joint_references)
 from .j3d import anim
 from .j3d.model import matrix_to_euler
 
@@ -106,20 +107,60 @@ def rest_local(bone, fix, scale=1.0):
 # import
 # --------------------------------------------------------------------------
 
-def import_bck(context, filepath, scale=0.01, set_scene_range=True, report=None):
+def _bone_joint_map(arm_obj, njoints, report=None):
+    """Map BCK joint indices to bones, tolerating duplicates and stale indices.
+
+    Duplicated bones copy ``bmd_index`` from the original.  The bone whose name
+    is still listed in ``bmd_bone_names`` keeps the track; the duplicate is left
+    at rest and reported.  This keeps a BCK import working after any skeleton
+    edit instead of silently animating the wrong bone.
+    """
+    names = [str(n) for n in arm_obj.get("bmd_bone_names", [])]
+    bones, duplicates = joint_index_owners(arm_obj.data, names)
+
+    stale = sorted(idx for idx in bones if idx >= njoints)
+    missing = [j for j in range(njoints) if j not in bones]
+    if report:
+        if duplicates:
+            label = ", ".join(b.name for b in duplicates[:8])
+            if len(duplicates) > 8:
+                label += ", ..."
+            report({"WARNING"},
+                   "Bones with a duplicate bmd_index are not animated; the "
+                   "original bone keeps the track: " + label)
+        if stale:
+            label = ", ".join(str(i) for i in stale[:8])
+            if len(stale) > 8:
+                label += ", ..."
+            report({"WARNING"},
+                   f"Bones with joint indices outside the animation "
+                   f"(0..{njoints - 1}) are ignored: {label}")
+        if missing:
+            report({"WARNING"},
+                   f"Animation has {len(missing)} joints without a matching bone; "
+                   "their tracks are ignored")
+    return bones
+
+
+def import_bck(context, filepath, scale=0.01, set_scene_range=True, report=None,
+               set_fps=True):
     with open(filepath, "rb") as f:
         bck = anim.parse_bck(f.read())
     arm_obj = find_armature(context)
     s = float(scale)
     fix = bc.axis_fix(arm_obj)
 
-    bones = {b["bmd_index"]: b for b in arm_obj.data.bones if "bmd_index" in b}
+    if set_fps:
+        context.scene.render.fps = 30
+        context.scene.render.fps_base = 1.0
+
+    njoints = len(bck.tracks)
+    bones = _bone_joint_map(arm_obj, njoints, report)
     if not bones:
         raise AnimError("The armature has no imported J3D joint data (bmd_index)")
-    njoints = len(bck.tracks)
-    if njoints != len(bones) and report:
-        report({"WARNING"}, f"Animation has {njoints} joints but the armature has {len(bones)}; "
-                            "extra joints are ignored")
+    if not any(j < njoints for j in bones):
+        raise AnimError(
+            "No bone matches the animation's joint indices; import the model first")
 
     frames = np.arange(0, bck.duration + 1)
     samples = anim.sample(bck, frames)  # (joints, 9, frames)
@@ -128,28 +169,27 @@ def import_bck(context, filepath, scale=0.01, set_scene_range=True, report=None)
     action = bpy.data.actions.new(name)
     action.use_fake_user = True
     action["bmd_loop_mode"] = int(bck.loop_mode)
+    action["bmd_duration"] = int(bck.duration)
     ad = arm_obj.animation_data or arm_obj.animation_data_create()
     ad.action = action
 
-    prefs = bpy.context.preferences.edit
-    old_interp = None
-    try:
-        old_interp = prefs.keyframe_new_interpolation_type
-        prefs.keyframe_new_interpolation_type = "LINEAR"
-    except Exception:
-        pass
-    try:
-        sheared = []
-        for j in range(min(njoints, max(bones) + 1)):
-            bone = bones.get(j)
-            if bone is None:
-                continue
-            shear = _key_joint(arm_obj, bone, samples[j], frames, s, fix)
-            if shear > 1e-4:
-                sheared.append(bone.name)
-    finally:
-        if old_interp is not None:
-            prefs.keyframe_new_interpolation_type = old_interp
+    cyclic = bck.loop_mode == anim.LOOP_LOOP
+    sheared = []
+    for j in range(njoints):
+        bone = bones.get(j)
+        if bone is None:
+            continue
+        shear = _key_joint(arm_obj, bone, samples[j], frames, s, fix, cyclic=cyclic)
+        if shear > 1e-4:
+            sheared.append(bone.name)
+
+    # Blender 4.4+ actions use slots.  Creating F-curves directly does not bind
+    # the new slot to the armature, so the action would not be evaluated.
+    if hasattr(action, "slots") and len(action.slots):
+        try:
+            ad.action_slot = action.slots[0]
+        except Exception:
+            pass
 
     if sheared and report:
         names = ", ".join(sheared[:8])
@@ -162,17 +202,56 @@ def import_bck(context, filepath, scale=0.01, set_scene_range=True, report=None)
     if set_scene_range:
         context.scene.frame_start = 0
         context.scene.frame_end = int(bck.duration)
-    try:
-        context.scene.frame_set(0)
-    except Exception:
-        pass
+        try:
+            context.scene.frame_set(0)
+        except Exception:
+            pass
     if report:
         report({"INFO"}, f"Imported animation '{name}': {bck.duration + 1} frames, "
                          f"loop mode {anim.LOOP_NAMES[bck.loop_mode] if bck.loop_mode < 5 else bck.loop_mode}")
     return action
 
 
-def _key_joint(arm_obj, bone, smp, frames, s, fix):
+def _write_track_keys(action, data_path, axis, group, keys, frames):
+    """Insert sparse keys and set Bezier handles so they match the BCK tangents."""
+    fcurve = action.fcurves.find(data_path, index=axis)
+    if fcurve is None:
+        fcurve = action.fcurves.new(data_path, index=axis, action_group=group)
+
+    frame_at = [float(frames[int(round(t))]) for t, _v, _tin, _tout in keys]
+    for (t, v, _tin, _tout), frame in zip(keys, frame_at):
+        kp = fcurve.keyframe_points.insert(frame, float(v), options={"FAST"})
+        kp.interpolation = "BEZIER"
+        kp.handle_left_type = "FREE"
+        kp.handle_right_type = "FREE"
+    fcurve.update()
+
+    points = fcurve.keyframe_points
+    if len(points) != len(keys):
+        raise AnimError("Could not write BCK keys: duplicate frame times")
+    for i, kp in enumerate(points):
+        frame = frame_at[i]
+        value = float(keys[i][1])
+        tin = float(keys[i][2])
+        tout = float(keys[i][3])
+        if len(keys) == 1:
+            kp.handle_left = (frame, value)
+            kp.handle_right = (frame, value)
+            continue
+        if i > 0:
+            dt_prev = frame - frame_at[i - 1]
+        else:
+            dt_prev = frame_at[1] - frame
+        if i < len(keys) - 1:
+            dt_next = frame_at[i + 1] - frame
+        else:
+            dt_next = frame - frame_at[i - 1]
+        kp.handle_left = (frame - dt_prev / 3.0, value - tin * dt_prev / 3.0)
+        kp.handle_right = (frame + dt_next / 3.0, value + tout * dt_next / 3.0)
+    fcurve.update()
+
+
+def _key_joint(arm_obj, bone, smp, frames, s, fix, cyclic=False):
     pb = arm_obj.pose.bones[bone.name]
     rest_inv = np.linalg.inv(rest_local(bone, fix, s))
     n = len(frames)
@@ -190,14 +269,22 @@ def _key_joint(arm_obj, bone, smp, frames, s, fix):
             quat[i] = -quat[i]
 
     pb.rotation_mode = "QUATERNION"
-    channels = (("location", loc, (0, 0, 0)), ("rotation_quaternion", quat, (1, 0, 0, 0)),
-                ("scale", scl, (1, 1, 1)))
-    for prop, data, _rest in channels:
-        varying = np.abs(data - data[0]).max() > 1e-6
-        key_frames = range(n) if varying else [0]
-        for i in key_frames:
-            setattr(pb, prop, tuple(float(x) for x in data[i]))
-            pb.keyframe_insert(prop, frame=float(frames[i]), group=bone.name)
+    action = arm_obj.animation_data.action
+    channels = (
+        ("location", loc, 0.001 * s),
+        ("rotation_quaternion", quat, 5e-5),
+        ("scale", scl, 5e-5),
+    )
+    for prop, data, tolerance in channels:
+        data_path = pb.path_from_id(prop)
+        varying = np.abs(data - data[0]).max() > tolerance * 0.5
+        for axis in range(data.shape[1]):
+            if varying:
+                track = anim.fit_track(data[:, axis], tolerance, cyclic=cyclic)
+                keys = track.keys
+            else:
+                keys = [(0.0, float(data[0, axis]), 0.0, 0.0)]
+            _write_track_keys(action, data_path, axis, bone.name, keys, frames)
 
     return shear
 
@@ -227,6 +314,37 @@ def _continuous_euler(eul):
         out[j] = np.unwrap(out[j], axis=1)
     return out
 
+def _store_bck_layout(arm_obj, ordered, rests, s, fix):
+    """Store the joint layout written to the BCK on the bones.
+
+    A later BCK import maps tracks by ``bmd_index``.  After the user adds,
+    duplicates or reparents bones, the indices written by this export must be
+    the ones used by the next import, so they are refreshed here.  Bones whose
+    rest chain is unchanged keep their exact ``bmd_local`` (including negative
+    and non-uniform joint scales); edited bones get a fresh local transform.
+    Stored shape-node joint indices are remapped to the new layout as well.
+    """
+    index = {b.name: i for i, b in enumerate(ordered)}
+    unchanged = {b.name: _rest_chain_unchanged(b) for b in ordered}
+    owners, _duplicates = joint_index_owners(
+        arm_obj.data, arm_obj.get("bmd_bone_names", []))
+    old_to_new = {old: index[bone.name] for old, bone in owners.items()}
+    for b in ordered:
+        b["bmd_index"] = index[b.name]
+        b["bmd_parent"] = index[b.parent.name] if b.parent is not None else -1
+        b["bmd_rest"] = [float(x) for x in bc.to_np(b.matrix_local).reshape(-1)]
+        if not unchanged[b.name]:
+            L = bc.blender_local_to_j3d(rests[index[b.name]], s, fix,
+                                        b.parent is None)
+            R, sc, _shear = bc.split_trs(L[:3, :3])
+            b["bmd_local"] = [
+                float(x) for x in (*L[:3, 3], *matrix_to_euler(R), *sc)]
+    arm_obj["bmd_bone_names"] = [b.name for b in ordered]
+    mesh_objs = [obj for obj in bpy.data.objects
+                 if obj.type == "MESH" and bc.target_armature(obj) is arm_obj]
+    remap_joint_references(old_to_new, mesh_objs)
+
+
 def export_bck(context, filepath, scale=100.0, loop_mode="ONCE",
                frame_source="ACTION", report=None, custom_range=None):
     arm_obj = find_armature(context)
@@ -237,11 +355,17 @@ def export_bck(context, filepath, scale=100.0, loop_mode="ONCE",
     s = 1.0 / float(scale)
     fix = bc.axis_fix(arm_obj)
 
-    ordered = ordered_bones(arm_obj.data)
+    ordered = ordered_bones(arm_obj.data, arm_obj.get("bmd_bone_names", []))
     if not ordered:
         raise AnimError("The armature has no bones")
     extra_root = sum(1 for b in ordered if b.parent is None) > 1  # model export adds a root joint
     rests = [rest_local(b, fix, s) for b in ordered]
+    corrections = []
+    for b, exact in zip(ordered, rests):
+        blender_rest = bc.to_np(b.matrix_local)
+        if b.parent is not None:
+            blender_rest = np.linalg.inv(bc.to_np(b.parent.matrix_local)) @ blender_rest
+        corrections.append(exact @ np.linalg.inv(blender_rest))
 
     if frame_source == "CUSTOM":
         if custom_range is None:
@@ -252,8 +376,17 @@ def export_bck(context, filepath, scale=100.0, loop_mode="ONCE",
     else:
         f0, f1 = action.frame_range
         start, end = int(math.floor(f0)), int(math.ceil(f1))
+        if start == end and "bmd_duration" in action:
+            # A completely static clip has one key at frame 0; keep the
+            # duration that was imported instead of collapsing to one frame.
+            start = min(start, 0)
+            end = max(end, int(action["bmd_duration"]))
     if end < start:
         raise AnimError("End frame must not be before start frame")
+    if end - start > 0xFFFF:
+        raise AnimError(
+            f"The frame range {start}..{end} is too long for a BCK "
+            "(at most 65536 frames)")
     frames = list(range(start, end + 1))
     nj = len(ordered) + (1 if extra_root else 0)
     smp = np.zeros((nj, 9, len(frames)))
@@ -261,17 +394,20 @@ def export_bck(context, filepath, scale=100.0, loop_mode="ONCE",
 
     scene = context.scene
     current = scene.frame_current
+    current_subframe = scene.frame_subframe
     sheared = set()
     try:
         for fi, f in enumerate(frames):
             scene.frame_set(f)
             for j, bone in enumerate(ordered):
                 pb = arm_obj.pose.bones[bone.name]
-                basis = bc.to_np(pb.matrix_basis)
-                _R_basis, _sc_basis, shear = bc.split_trs(basis[:3, :3])
-                if shear > 1e-4:
-                    sheared.add(bone.name)
-                Lb = rests[j] @ basis
+                pose = bc.to_np(pb.matrix)
+                if pb.parent is not None:
+                    parent_pose = bc.to_np(pb.parent.matrix)
+                    local_pose = np.linalg.inv(parent_pose) @ pose
+                else:
+                    local_pose = pose
+                Lb = corrections[j] @ local_pose
                 L = bc.blender_local_to_j3d(Lb, s, fix, bone.parent is None)
                 R, sc, shear_l = bc.split_trs(L[:3, :3])
                 if shear_l > 1e-4:
@@ -281,7 +417,7 @@ def export_bck(context, filepath, scale=100.0, loop_mode="ONCE",
                 smp[j, [1, 4, 7], fi] = eul
                 smp[j, [2, 5, 8], fi] = L[:3, 3]
     finally:
-        scene.frame_set(current)
+        scene.frame_set(current, subframe=current_subframe)
 
     if sheared and report:
         names = ", ".join(sorted(sheared)[:8])
@@ -305,11 +441,14 @@ def export_bck(context, filepath, scale=100.0, loop_mode="ONCE",
     bck = anim.Bck()
     bck.loop_mode = mode
     bck.duration = len(frames) - 1
+    cyclic = mode == anim.LOOP_LOOP
     for j in range(nj):
-        bck.tracks.append([anim.fit_track(smp[j, k], tolerance[k % 3]) for k in range(9)])
+        bck.tracks.append([anim.fit_track(smp[j, k], tolerance[k % 3],
+                                          cyclic=cyclic) for k in range(9)])
     data = anim.write_bck(bck)
     with open(filepath, "wb") as f:
         f.write(data)
+    _store_bck_layout(arm_obj, ordered, rests, s, fix)
     try:
         action["bmd_loop_mode"] = mode
     except Exception:

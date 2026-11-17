@@ -14,17 +14,46 @@ from .j3d import gx_texture as gx
 from .j3d import material as mat3
 
 
-def saved_convert_units(context):
-    """Last Convert Units value stored on the scene (True when unset)."""
-    scene = getattr(context, "scene", None)
-    return bool(getattr(scene, "bmd_convert_units", True))
+_AUTO_ARM = object()
 
 
-def store_convert_units(context, value):
-    """Remember *value* as the shared Convert Units setting for this scene."""
-    scene = getattr(context, "scene", None)
-    if scene is not None and hasattr(scene, "bmd_convert_units"):
-        scene.bmd_convert_units = bool(value)
+def context_model_object(context):
+    """The active armature/mesh, or the first selected one."""
+    obj = getattr(context, "active_object", None)
+    if obj is not None and obj.type in {"ARMATURE", "MESH"}:
+        return obj
+    for obj in getattr(context, "selected_objects", ()) or ():
+        if obj.type in {"ARMATURE", "MESH"}:
+            return obj
+    return None
+
+
+def saved_convert_units(context, obj=_AUTO_ARM):
+    """Convert Units default for a model.
+
+    A model stores the scale it was imported with in ``bmd_scale`` (on the
+    armature, or on a static mesh).  Animations, shape keys and collision
+    should use the same units as the model; without a model the default is
+    converted units.  Pass ``None`` explicitly to disable the active/selected
+    object lookup.
+    """
+    if obj is _AUTO_ARM:
+        obj = context_model_object(context)
+    candidates = []
+    if obj is not None:
+        candidates.append(obj)
+        if getattr(obj, "type", None) == "MESH":
+            arm = target_armature(obj)
+            if arm is not None and arm is not obj:
+                candidates.append(arm)
+    for candidate in candidates:
+        scale = candidate.get("bmd_scale")
+        if scale is not None:
+            try:
+                return abs(float(scale) - 1.0) > 1e-6
+            except (TypeError, ValueError):
+                pass
+    return True
 
 # --- coordinate systems -------------------------------------------------------
 # J3D: +Y up, +Z forward.  Blender: +Z up, -Y forward.   p_blender = C @ p_j3d

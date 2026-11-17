@@ -126,10 +126,6 @@ def _export_target_changed(self, context):
         settings.base_name = _default_base_name(self.target)
 
 
-def _export_convert_units_changed(self, context):
-    """Keep the shared scene setting in sync with the BLS dialog."""
-    bc.store_convert_units(context, self.convert_units)
-
 class BMD_SK_ExportKeyItem(PropertyGroup):
     name: StringProperty()
     include: BoolProperty(
@@ -160,7 +156,6 @@ class BMD_SK_ExportSettings(PropertyGroup):
         description='Convert shape key positions to J3D units '
                     '(100 scale). Disable for model-unit meshes',
         default=True,
-        update=_export_convert_units_changed,
     )
     base_name: StringProperty(
         name='Base Key Name',
@@ -292,7 +287,7 @@ class BMD_SK_OT_export_files(Operator, ExportHelper):
         if target is not None:
             settings.target = target
 
-        settings.convert_units = bc.saved_convert_units(context)
+        settings.convert_units = bc.saved_convert_units(context, settings.target)
         settings.show_base = True
         _populate_export_keys(settings, settings.target)
 
@@ -348,7 +343,6 @@ def _perform_export(settings, operator, context):
         f'file: {stats["bytes"]} bytes'
     )
     context.scene.bmd_shape_keys_last_info = info
-    bc.store_convert_units(context, settings.convert_units)
     operator.report({'INFO'}, info)
     return {'FINISHED'}
 
@@ -416,7 +410,7 @@ class BMD_SK_OT_export_settings(Operator):
             self.report({'ERROR'}, 'Select an export file')
             return {'CANCELLED'}
 
-        settings.convert_units = bc.saved_convert_units(context)
+        settings.convert_units = bc.saved_convert_units(context, settings.target)
         settings.show_base = True
         _populate_export_keys(settings, settings.target)
 

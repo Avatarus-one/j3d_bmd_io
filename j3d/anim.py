@@ -4,6 +4,7 @@ No Blender dependency.  Rotations are handled in radians (XYZ Euler, R = Rz*Ry*R
 the same convention as the JNT1 joint data); all tangents are "value units per frame".
 """
 
+import heapq
 import math
 import struct
 
@@ -135,7 +136,21 @@ def sample(bck, frames):
 # curve fitting (used when exporting)
 # --------------------------------------------------------------------------
 
-def fit_track(values, tolerance, const_tolerance=None):
+def _segment_error(v, tg, a, b):
+    """Largest Hermite error inside ``[a, b]`` and the frame that should be split."""
+    if b - a < 2:
+        return 0.0, -1
+    f = np.arange(a + 1, b)
+    s = (f - a) / (b - a)
+    dt = b - a
+    h = ((2 * s**3 - 3 * s**2 + 1) * v[a] + (-2 * s**3 + 3 * s**2) * v[b]
+         + (s**3 - 2 * s**2 + s) * dt * tg[a] + (s**3 - s**2) * dt * tg[b])
+    err = np.abs(h - v[f])
+    i = int(err.argmax())
+    return float(err[i]), a + 1 + i
+
+
+def fit_track(values, tolerance, const_tolerance=None, cyclic=False):
     """Build a :class:`Track` from per-frame samples, keeping as few keys as the tolerance allows."""
     v = np.asarray(values, dtype=np.float64)
     n = len(v)
@@ -143,25 +158,44 @@ def fit_track(values, tolerance, const_tolerance=None):
         const_tolerance = tolerance * 0.5
     if n < 2 or (v.max() - v.min()) <= const_tolerance:
         return Track([(0.0, float(v[0]), 0.0, 0.0)])
-    tg = np.gradient(v)
-    keys = [0, n - 1]
-    while True:
-        err = np.zeros(n)
-        for a, b in zip(keys[:-1], keys[1:]):
-            if b - a < 2:
-                continue
-            f = np.arange(a + 1, b)
-            s = (f - a) / (b - a)
-            dt = b - a
-            h = ((2 * s**3 - 3 * s**2 + 1) * v[a] + (-2 * s**3 + 3 * s**2) * v[b]
-                 + (s**3 - 2 * s**2 + s) * dt * tg[a] + (s**3 - s**2) * dt * tg[b])
-            err[f] = np.abs(h - v[f])
-        i = int(err.argmax())
-        if err[i] <= tolerance:
-            break
-        keys.append(i)
-        keys.sort()
-    return Track([(float(i), float(v[i]), float(tg[i]), float(tg[i])) for i in keys])
+    if cyclic:
+        duplicate_end = abs(v[0] - v[-1]) <= max(const_tolerance, 1e-9)
+        if duplicate_end:
+            # The last frame repeats the first one: period is n - 1.
+            tg = np.empty(n)
+            if n > 2:
+                tg[1:-1] = (v[2:] - v[:-2]) / 2.0
+            edge = (v[1] - v[-2]) / 2.0 if n > 2 else 0.0
+            tg[0] = tg[-1] = edge
+        else:
+            # The whole sample range is the period; wrap across the seam.
+            tg = np.empty(n)
+            if n > 2:
+                tg[1:-1] = (v[2:] - v[:-2]) / 2.0
+            tg[0] = (v[1] - v[-1]) / 2.0
+            tg[-1] = (v[0] - v[-2]) / 2.0
+    else:
+        tg = np.gradient(v)
+
+    # Greedy adaptive fitting: split the worst segment at its worst frame.  A
+    # heap keeps the per-segment errors so a new key only recomputes the two
+    # segments it creates instead of the whole track.
+    keys = {0, n - 1}
+    pending = []
+
+    def push(a, b):
+        err, split = _segment_error(v, tg, a, b)
+        if split >= 0 and err > tolerance:
+            heapq.heappush(pending, (-err, a, b, split))
+
+    push(0, n - 1)
+    while pending:
+        _err, a, b, split = heapq.heappop(pending)
+        keys.add(split)
+        push(a, split)
+        push(split, b)
+    ordered = sorted(keys)
+    return Track([(float(i), float(v[i]), float(tg[i]), float(tg[i])) for i in ordered])
 
 
 # --------------------------------------------------------------------------
@@ -176,18 +210,39 @@ def _choose_angle_mult(bck):
             for _t, v, tin, tout in joint_tracks[k].keys:
                 hi = max(hi, v, tin, tout)
                 lo = min(lo, v, tin, tout)
-    mult = 0
-    while mult < 7:
+    for mult in range(8):
         unit = ROT_UNIT * (2.0 ** mult)
-        if hi / unit <= 32767.4 and lo / unit >= -32768.4:
+        if hi / unit <= 32767.0 and lo / unit >= -32768.0:
             break
-        mult += 1
+    else:
+        worst = max(abs(hi), abs(lo))
+        limit = 32767.0 * ROT_UNIT * 128.0
+        raise J3DError(
+            f"Rotation value {worst:.6g} rad does not fit in a BCK s16 track "
+            f"(the format supports up to {limit:.6g} rad)")
     # keep the original precision setting of a parsed file when it still fits
-    return max(mult, min(max(bck.angle_mult, 0), 7))
+    return max(mult, min(max(int(bck.angle_mult), 0), 7))
 
 
 def write_bck(bck):
-    """Serialise ``bck`` into a complete J3D1 bck1 file (bytes)."""
+    """Serialise ``bck`` into a complete J3D1 bck1 file (bytes).
+
+    The BCK format uses 16-bit counts and indices, and rotation key times are
+    signed 16-bit integers.  Values that cannot be represented raise
+    :class:`J3DError` instead of being silently clamped or overflowing.
+    """
+    njoints = len(bck.tracks)
+    if not 0 <= njoints <= 0xFFFF:
+        raise J3DError(
+            f"BCK has {njoints} joints; the format supports at most 65535")
+    if not 0 <= bck.duration <= 0xFFFF:
+        raise J3DError(
+            f"BCK duration {bck.duration} does not fit in 16 bits "
+            "(the format supports 0..65535 frames)")
+    if not 0 <= bck.loop_mode <= 0xFF:
+        raise J3DError(
+            f"BCK loop mode {bck.loop_mode} does not fit in 8 bits")
+
     mult = _choose_angle_mult(bck)
     unit = ROT_UNIT * (2.0 ** mult)
     arrays = ([], [], [])
@@ -196,13 +251,27 @@ def write_bck(bck):
 
     def encode(kind, x):
         if kind == KIND_ROT:
-            return int(max(-32768, min(32767, round(x / unit))))
-        return float(np.float32(x))
+            raw = int(round(float(x) / unit))
+            if not -32768 <= raw <= 32767:
+                raise J3DError(
+                    f"Rotation value {float(x):.6g} rad does not fit in a BCK "
+                    f"s16 track (angle_mult {mult})")
+            return raw
+        value = float(x)
+        if not math.isfinite(value) or abs(value) > 3.4028235e38:
+            raise J3DError(
+                f"Animation value {value:.6g} does not fit in a BCK float32")
+        return float(np.float32(value))
 
     for joint_tracks in bck.tracks:
+        if len(joint_tracks) != 9:
+            raise J3DError(
+                f"BCK joint entries must have 9 tracks, got {len(joint_tracks)}")
         for k, tr in enumerate(joint_tracks):
             kind = k % 3
             arr = arrays[kind]
+            if not tr.keys:
+                raise J3DError("BCK track has no keys")
             if len(tr.keys) == 1:
                 val = encode(kind, tr.keys[0][1])
                 idx = const_lookup[kind].get(val)
@@ -210,17 +279,46 @@ def write_bck(bck):
                     idx = len(arr)
                     const_lookup[kind][val] = idx
                     arr.append(val)
+                if idx > 0xFFFF:
+                    raise J3DError(
+                        f"BCK {TRACK_NAMES[k]} constant index {idx} does not fit "
+                        "in 16 bits")
                 entries += struct.pack(">HHH", 1, idx, 0)
                 continue
             double = any(abs(a - b) > 1e-12 for _, _, a, b in tr.keys)
             idx = len(arr)
+            if idx > 0xFFFF:
+                raise J3DError(
+                    f"BCK {TRACK_NAMES[k]} array starts at index {idx}, which does "
+                    "not fit in 16 bits")
+            if len(tr.keys) > 0xFFFF:
+                raise J3DError(
+                    f"BCK {TRACK_NAMES[k]} track has {len(tr.keys)} keys; the "
+                    "format supports at most 65535")
             for t, v, tin, tout in tr.keys:
-                arr.append(int(round(t)) if kind == KIND_ROT else float(t))
+                time_value = float(t)
+                if not math.isfinite(time_value):
+                    raise J3DError("BCK key time is not finite")
+                if kind == KIND_ROT:
+                    key_time = int(round(time_value))
+                    if not -32768 <= key_time <= 32767:
+                        raise J3DError(
+                            f"Rotation key time {t} does not fit in a BCK s16 "
+                            "(the format supports frames -32768..32767)")
+                    arr.append(key_time)
+                else:
+                    arr.append(time_value)
                 arr.append(encode(kind, v))
                 arr.append(encode(kind, tin))
                 if double:
                     arr.append(encode(kind, tout))
             entries += struct.pack(">HHH", len(tr.keys), idx, 1 if double else 0)
+
+    for kind, label in enumerate(("scale", "rotation", "translation")):
+        if len(arrays[kind]) > 0xFFFF:
+            raise J3DError(
+                f"BCK {label} array has {len(arrays[kind])} values; the format "
+                "supports at most 65535")
 
     o_joint = 0x40
     o_scale = align(o_joint + len(entries), 32)

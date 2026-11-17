@@ -114,7 +114,14 @@ def _texture_signature(t):
     )
     digest = hashlib.sha1()
     digest.update(repr(header).encode("utf-8", "surrogatepass"))
-    digest.update(t.rgba.tobytes())
+    if t.raw_data is not None:
+        # Hash the original encoded payload instead of the decoded RGBA.  This
+        # is exact and much faster for large (e.g. 4K CMPR) textures.
+        digest.update(t.raw_data)
+    else:
+        digest.update(b"placeholder")
+        if t.rgba is not None:
+            digest.update(f"{t.rgba.shape[1]}x{t.rgba.shape[0]}".encode("ascii"))
     return digest.hexdigest()
 
 
@@ -122,10 +129,6 @@ def _image_texture_signature(image):
     height, width = image.size[1], image.size[0]
     if width == 0 or height == 0:
         return None
-    buf = np.empty(width * height * 4, np.float32)
-    image.pixels.foreach_get(buf)
-    pixels = np.clip(np.rint(buf.reshape(height, width, 4)[::-1] * 255.0),
-                     0, 255).astype(np.uint8)
     fmt = gx.NAME_TO_FORMAT.get(str(image.get("bmd_orig_format", "")), None)
     if fmt is None:
         fmt = gx.NAME_TO_FORMAT.get(str(image.bmd.format), None)
@@ -150,7 +153,25 @@ def _image_texture_signature(image):
     )
     digest = hashlib.sha1()
     digest.update(repr(header).encode("utf-8", "surrogatepass"))
-    digest.update(pixels.tobytes())
+    if bool(image.bmd.external):
+        digest.update(b"placeholder")
+        digest.update(f"{width}x{height}".encode("ascii"))
+        return digest.hexdigest()
+    raw = image.get("bmd_raw")
+    if raw and not image.is_dirty:
+        try:
+            # Same basis as _texture_signature: the original encoded payload.
+            digest.update(zlib.decompress(base64.b64decode(raw)))
+            return digest.hexdigest()
+        except Exception:
+            pass
+    buf = np.empty(width * height * 4, np.float32)
+    image.pixels.foreach_get(buf)
+    pixels = buf.reshape(height, width, 4)[::-1]
+    pixels *= 255.0
+    np.rint(pixels, out=pixels)
+    np.clip(pixels, 0, 255, out=pixels)
+    digest.update(pixels.astype(np.uint8))
     return digest.hexdigest()
 
 
@@ -171,6 +192,10 @@ def apply_texture_metadata(image, texture, path=None):
     image["bmd_lod_bias"] = int(texture.lod_bias)
     image["bmd_flags10"] = texture.flags10.hex()
     image["bmd_orig_format"] = gx.FORMAT_NAMES.get(texture.format, str(texture.format))
+    if texture.rgba is not None and texture.raw_data is not None:
+        # Fast "unchanged since import" check on export (avoids decoding 4K
+        # textures just to compare every pixel).
+        image["bmd_pixel_hash"] = hashlib.sha1(texture.rgba).hexdigest()
     if texture.external:
         external_size = texture.external_size or (w, h)
         image["bmd_external_size"] = [int(external_size[0]), int(external_size[1])]
@@ -541,6 +566,8 @@ def _create_armature(context, coll, bmd, base, scale, bone_axis):
         b = arm.bones[names[i]]
         b["bmd_index"] = i
         b["bmd_parent"] = int(j.parent)
+        b["bmd_joint_name"] = j.name
+        b["bmd_bone_name"] = names[i]
         b["bmd_kind"] = int(j.kind)
         b["bmd_scale_comp"] = int(j.scale_compensate)
         if bmd.maya and j.scale_compensate and j.parent >= 0:

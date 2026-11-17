@@ -38,14 +38,17 @@ Import / Export`.
    materials and images.
    The model is always imported as one mesh object whose vertices keep the
    original BMD `VTX1` position order (`vertex i` is source position `i`).
-2. Edit meshes / textures. Append new bones rather than re-ordering existing ones.
-3. **Export** with the armature and meshes selected (*Selected Only*). The export
-   uses the shared **Convert Units** setting (see below) and writes J3D units
-   back (`100`) when it is enabled.
+2. Edit meshes / textures. Append new bones rather than re-ordering existing ones; reordering is
+   supported, but it changes joint indices (external files that address joints by index must follow).
+3. **Export** with the armature and meshes selected (*Selected Only*). **Convert Units** defaults to
+   the model's `bmd_scale`; when enabled the export writes J3D units back.
 
 ### What is preserved
 * Joint order, hierarchy and parameters of unchanged bones, INF1 flags (Maya mode on Uri). Animations
   address joints by index, so the order matters.
+* Original joint and material names are kept, and manual bone renames are exported. Blender's
+  automatic `.001` duplicate suffix is stripped on export; duplicated bones/materials keep the
+  original name (J3D addresses them by index).
 * The original vertex order is kept through a BMD -> Blender -> BMD round trip:
   exported positions are written in the imported order and distinct vertices that
   share the same coordinates are no longer merged. Export also restores the source
@@ -83,7 +86,8 @@ The game's loader computes the number of draw matrices as `DRW1 entries - envelo
 weighted ones as `view * envelope[k]`. The exporter therefore writes DRW1 exactly like the original
 tools: all rigid entries first, then one weighted entry per envelope in order, then the same
 envelopes once more as filler. Every export is checked against these rules before it is written
-(`validate_engine_layout`); an export that would crash the game raises an error instead.
+(`validate_engine_layout`), which parses only the DRW1/EVP1/JNT1/SHP1 chunks so large models stay
+fast; an export that would crash the game raises an error instead.
 
 ### Vertex formats
 Positions, normals and UVs have separate dropdowns with two choices each: **Float32** and **s16**.
@@ -217,8 +221,8 @@ pixels).
 
 Keys are imported as BLS position deltas relative to the BLS base key, rotated
 from J3D Y-up to Blender Z-up and added to the target mesh's Basis coordinates.
-**Convert Units** must stay enabled for meshes imported with the same setting
-turned on.
+**Convert Units** defaults to the model's `bmd_scale` (stored on the armature
+or static mesh).
 
 BLS files contain a key named `<cluster>__orig` with zero displacement. Its BLK
 track holds the remainder of the normalized weights (so it can be negative) and
@@ -283,26 +287,33 @@ prepended; its weights are recalculated as `1 - sum(other selected weights)`.
 
 ## Animations (.bck)
 **Import**: select the imported armature, then File -> Import -> *J3D Animation (.bck)*. A new action
-is created (named after the file, with a fake user) and keyed on every frame with linear
-interpolation; channels that never change get a single key. Frame `n` of the file is Blender frame
-`n`; the scene range can be set to the animation length. The loop mode is stored on the action
-(`bmd_loop_mode`).
+is created (named after the file, with a fake user). The BCK curves are fitted with sparse Bezier
+keys. Frame `n` of the file is Blender frame `n`; the scene range can be set to the animation
+length. **Set 30 FPS** sets the scene rate to the game's 30 fps. The loop mode and clip duration are
+stored on the action (`bmd_loop_mode`, `bmd_duration`).
 
 **Export**: make the armature active, assign the action, then File -> Export -> *J3D Animation (.bck)*.
 Every frame is sampled, converted back to joint-local scale / rotation / translation, and fitted
 with cubic Hermite curves using as few keys as the tolerances allow (rotation 2e-4 rad, translation
 0.01 units, scale 1e-4). Options: Loop Mode, Action / Scene / Custom frame range, and the **Convert
-Units** setting.
+Units** setting. The evaluated pose is sampled, so constraints, IK and drivers are baked. LOOP
+(repeat) clips use cyclic tangents across the loop seam.
 
-**Frame range**: *Action Range* uses the action's keyframe range. *Scene Range* samples the scene
+**Frame range**: *Action Range* uses the action's keyframe range (a completely static imported clip
+keeps its stored `bmd_duration` instead of collapsing to one frame). *Scene Range* samples the scene
 start/end frames. *Custom Range* uses the Start Frame / End Frame fields.
 
 Notes
-* The joint count of the animation equals the number of bones; bones keep their `bmd_index`.
-* Joints with a non-uniform rest scale (e.g. the eyebrows of Uri, 1.6 on X) are handled: the stored
-  joint-local transform is used for unchanged bones, so the animation is not scaled twice. In Maya
-  mode a joint that does not inherit its parent's scale gets `Inherit Scale: None` on its bone.
-  Negative joint scales are preserved.
+* Tracks are mapped to bones by `bmd_index`. Duplicated bones (which copy the index) are detected:
+  the original bone keeps the track, the duplicate is left at rest and reported. Stale or missing
+  indices are reported instead of silently animating the wrong bone.
+* Any skeleton edit is safe for the next BCK export: new, duplicated and reparented bones get fresh
+  indices and parent links, and `bmd_bone_names`/`bmd_local`/`bmd_rest` are refreshed. Stored
+  shape-node joint indices are remapped as well. Parents always precede their children, so the
+  exported joint order is valid for BMD and BCK files.
+* Joints with a non-uniform rest scale are handled: the stored joint-local transform is used for
+  unchanged bones, so the animation is not scaled twice. In Maya mode a joint that does not inherit
+  its parent's scale gets `Inherit Scale: None` on its bone. Negative joint scales are preserved.
 * A Blender pose bone cannot store the shear produced by rotating a non-uniformly scaled joint.
   Such channels are approximated (the importer/exporter reports a warning); unchanged bones and
   uniform scales are exact.

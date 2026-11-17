@@ -18,11 +18,6 @@ from . import blender_common as bc
 _PENDING_BMD_IMPORT = None
 
 
-def _export_convert_units_changed(self, context):
-    """Keep the shared scene setting in sync with any export dialog."""
-    bc.store_convert_units(context, self.convert_units)
-
-
 _BTI_STATUS = {
     "new": ("New", "EXPORT"),
     "update": ("Modified", "FILE_REFRESH"),
@@ -207,14 +202,14 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
             for p in paths:
                 try:
                     with open(p, "rb") as handle:
-                        bmd = j3d.parse(handle.read())
-                    names, folder = blender_bti.check_external_textures(bmd, p)
+                        textures = j3d.parse_textures(handle.read(), load_data=False)
+                    names, folder = blender_bti.check_external_textures(textures, p)
                 except (OSError, J3DError) as exc:
                     self.report({"ERROR"}, f"{os.path.basename(p)}: {exc}")
                     return {"CANCELLED"}
 
                 external_names = list(dict.fromkeys(
-                    t.name for t in bmd.textures if t.external))
+                    t.name for t in textures if t.external))
                 files.append({
                     "path": p,
                     "external": external_names,
@@ -258,7 +253,6 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
             except J3DError as exc:
                 self.report({"ERROR"}, f"{os.path.basename(p)}: {exc}")
                 return {"CANCELLED"}
-        bc.store_convert_units(context, self.convert_units)
         return {"FINISHED"}
 
 
@@ -410,7 +404,6 @@ class IMPORT_OT_bmd_texc(Operator):
                 return {"CANCELLED"}
 
         _PENDING_BMD_IMPORT = None
-        bc.store_convert_units(context, pending["convert_units"])
         return {"FINISHED"}
 
     def cancel(self, context):
@@ -429,7 +422,6 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
 
     convert_units: BoolProperty(
         name="Convert Units", default=True,
-        update=_export_convert_units_changed,
         description="Convert Blender units to J3D model units (scale 100). ")
     use_selection: BoolProperty(name="Selected Only", default=True,
                                 description="Export only selected objects (select the armature and meshes)")
@@ -540,7 +532,6 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
         except (blender_export.ExportError, J3DError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
-        bc.store_convert_units(context, self.convert_units)
         return {"FINISHED"}
 
 
@@ -1007,7 +998,6 @@ class IMPORT_OT_kcl(Operator, ImportHelper):
         except J3DError as exc:
             self.report({"ERROR"}, f"{os.path.basename(self.filepath)}: {exc}")
             return {"CANCELLED"}
-        bc.store_convert_units(context, self.convert_units)
         return {"FINISHED"}
 
 
@@ -1022,7 +1012,6 @@ class EXPORT_OT_kcl(Operator, ExportHelper):
 
     convert_units: BoolProperty(
         name="Convert Units", default=True,
-        update=_export_convert_units_changed,
         description="Convert Blender units to J3D units (scale 100)")
     use_selection: BoolProperty(name="Selected Only", default=True)
     apply_modifiers: BoolProperty(name="Apply Modifiers", default=True)
@@ -1059,7 +1048,6 @@ class EXPORT_OT_kcl(Operator, ExportHelper):
         except (blender_kcl.KclExportError, J3DError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
-        bc.store_convert_units(context, self.convert_units)
         return {"FINISHED"}
 
 
@@ -1079,6 +1067,9 @@ class IMPORT_OT_bck(Operator, ImportHelper):
         description="Convert J3D units to Blender units (scale 0.01)")
     set_scene_range: BoolProperty(name="Set Scene Range", default=True,
                                   description="Set the scene frame range to the animation length")
+    set_fps: BoolProperty(
+        name="Set 30 FPS", default=True,
+        description="Set the scene frame rate to the game's 30 fps without moving keyframes")
 
     def invoke(self, context, event):
         self.convert_units = bc.saved_convert_units(context)
@@ -1091,6 +1082,7 @@ class IMPORT_OT_bck(Operator, ImportHelper):
         layout.use_property_split = True
         layout.prop(self, "convert_units")
         layout.prop(self, "set_scene_range")
+        layout.prop(self, "set_fps")
 
     def execute(self, context):
         from . import blender_anim
@@ -1101,7 +1093,8 @@ class IMPORT_OT_bck(Operator, ImportHelper):
             paths = [self.filepath]
         for p in paths:
             try:
-                blender_anim.import_bck(context, p, scale, self.set_scene_range, self.report)
+                blender_anim.import_bck(context, p, scale, self.set_scene_range,
+                                        self.report, set_fps=self.set_fps)
             except (blender_anim.AnimError, J3DError) as exc:
                 self.report({"ERROR"}, f"{os.path.basename(p)}: {exc}")
                 return {"CANCELLED"}
@@ -1119,7 +1112,6 @@ class EXPORT_OT_bck(Operator, ExportHelper):
 
     convert_units: BoolProperty(
         name="Convert Units", default=True,
-        update=_export_convert_units_changed,
         description="Convert Blender units to J3D units (scale 100)")
     loop_mode: EnumProperty(name="Loop Mode", items=blender_anim_items(), default="ONCE")
     frame_source: EnumProperty(
@@ -1172,7 +1164,6 @@ class EXPORT_OT_bck(Operator, ExportHelper):
         except (blender_anim.AnimError, J3DError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
-        bc.store_convert_units(context, self.convert_units)
         return {"FINISHED"}
 
 
@@ -2117,10 +2108,6 @@ def register():
         type=bls_export_ui.BMD_SK_ExportSettings)
     bpy.types.Scene.bmd_blk_import_settings = PointerProperty(
         type=blk_import.BMD_SK_BlkImportSettings)
-    bpy.types.Scene.bmd_convert_units = BoolProperty(
-        name="Convert Units",
-        default=True,
-        description="Last used Convert Units setting for imports and exports")
     bpy.types.Scene.bmd_shape_keys_last_info = StringProperty(
         name="Last BLS import", default="")
 
@@ -2151,8 +2138,6 @@ def unregister():
     from . import blk_export, blk_import, bls_import_ui, bls_export_ui
     if hasattr(bpy.types.Scene, "bmd_shape_keys_last_info"):
         del bpy.types.Scene.bmd_shape_keys_last_info
-    if hasattr(bpy.types.Scene, "bmd_convert_units"):
-        del bpy.types.Scene.bmd_convert_units
     if hasattr(bpy.types.Scene, "bmd_blk_import_settings"):
         del bpy.types.Scene.bmd_blk_import_settings
     if hasattr(bpy.types.Scene, "bmd_shape_keys_export_settings"):
