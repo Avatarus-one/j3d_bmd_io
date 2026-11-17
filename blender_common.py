@@ -55,6 +55,211 @@ def saved_convert_units(context, obj=_AUTO_ARM):
                 pass
     return True
 
+
+VERTEX_FORMAT_ITEMS = [
+    ("F32", "Float32", "Write as float32"),
+    ("S16", "s16", "Write as signed 16-bit"),
+]
+
+
+class BMD_VertexFormatSettings(PropertyGroup):
+    """Per-model vertex formats shown in the 3D View BMD panel."""
+
+    loaded: BoolProperty(default=False)
+    position_format: EnumProperty(
+        name="Positions", items=VERTEX_FORMAT_ITEMS, default="F32")
+    position_frac: IntProperty(
+        name="Fraction", default=6, min=0, max=15,
+        description="Fraction bits for 16-bit positions")
+    normal_format: EnumProperty(
+        name="Normals", items=VERTEX_FORMAT_ITEMS, default="F32")
+    normal_frac: IntProperty(
+        name="Fraction", default=14, min=0, max=15,
+        description="Fraction bits for 16-bit normals")
+    uv_format: EnumProperty(
+        name="UVs", items=VERTEX_FORMAT_ITEMS, default="F32")
+    uv_frac: IntProperty(
+        name="Fraction", default=14, min=0, max=15,
+        description="Fraction bits for 16-bit UVs")
+
+
+def vertex_format_choice(fmt, default_frac):
+    if not fmt:
+        return "F32", default_frac
+    _components, typ, frac = fmt
+    if typ == 3:
+        return "S16", int(frac)
+    return "F32", default_frac
+
+
+def apply_vertex_formats(obj, formats):
+    """Copy imported BMD ``vtx_formats`` into the object's format settings."""
+    settings = getattr(obj, "bmd_vtx", None)
+    if settings is None:
+        return None
+    table = {}
+    for attr, components, typ, frac in formats:
+        table[int(attr)] = (int(components), int(typ), int(frac))
+    settings.position_format, settings.position_frac = vertex_format_choice(
+        table.get(9), 6)
+    settings.normal_format, settings.normal_frac = vertex_format_choice(
+        table.get(10), 14)
+    uv_attr = next((attr for attr in range(13, 21) if attr in table), 13)
+    settings.uv_format, settings.uv_frac = vertex_format_choice(
+        table.get(uv_attr), 14)
+    settings.loaded = True
+    return settings
+
+
+def ensure_vertex_formats(obj, read_only=False):
+    """Return the object's format settings, initializing them from the import.
+
+    During a panel draw Blender forbids writing ID properties, so ``read_only``
+    returns the current values (defaults) without initializing ``loaded``.
+    """
+    settings = getattr(obj, "bmd_vtx", None)
+    if settings is None:
+        return None
+    if not settings.loaded:
+        if read_only:
+            return settings
+        raw = obj.get("bmd_vtx_formats")
+        if raw:
+            try:
+                table = json.loads(raw) if isinstance(raw, str) else raw
+                formats = [(int(attr), *value) for attr, value in table.items()]
+                apply_vertex_formats(obj, formats)
+            except (TypeError, ValueError, AttributeError):
+                settings.loaded = True
+        else:
+            settings.loaded = True
+    return settings
+
+
+def initialize_vertex_formats():
+    """Initialize ``bmd_vtx`` for models imported before the panel existed."""
+    for obj in bpy.data.objects:
+        if obj.type not in {"MESH", "ARMATURE"}:
+            continue
+        if obj.library is not None or obj.override_library is not None:
+            continue
+        settings = getattr(obj, "bmd_vtx", None)
+        if settings is None or settings.loaded:
+            continue
+        raw = obj.get("bmd_vtx_formats")
+        if not raw:
+            continue
+        try:
+            table = json.loads(raw) if isinstance(raw, str) else raw
+            formats = [(int(attr), *value) for attr, value in table.items()]
+            apply_vertex_formats(obj, formats)
+        except Exception:
+            pass
+
+
+def export_stem(path, fallback=""):
+    """File stem of *path*, or *fallback* when the path is empty."""
+    if path:
+        return os.path.splitext(os.path.basename(str(path)))[0]
+    return fallback
+
+
+def last_export_path(obj, kind):
+    if obj is None:
+        return ""
+    return str(obj.get(f"bmd_last_export_{kind}", ""))
+
+
+def last_export_stem(obj, kind):
+    return export_stem(last_export_path(obj, kind), "")
+
+
+def remember_export(obj, kind, filepath):
+    if obj is None or not filepath:
+        return
+    try:
+        obj[f"bmd_last_export_{kind}"] = os.path.abspath(filepath)
+        if getattr(obj, "type", None) == "MESH":
+            scene = getattr(bpy.context, "scene", None)
+            if scene is not None:
+                scene[f"bmd_last_export_mesh_{kind}"] = obj.name
+    except Exception:
+        pass
+
+
+def last_export_mesh(kind):
+    """The mesh used by the last export of *kind*, if it still exists."""
+    scene = getattr(bpy.context, "scene", None)
+    if scene is not None:
+        name = scene.get(f"bmd_last_export_mesh_{kind}")
+        if name:
+            obj = bpy.data.objects.get(str(name))
+            if obj is not None and obj.type == "MESH":
+                return obj
+    for obj in bpy.data.objects:
+        if obj.type == "MESH" and obj.get(f"bmd_last_export_{kind}"):
+            return obj
+    return None
+
+
+def first_scene_mesh(context):
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return None
+    return next((o for o in scene.objects if o.type == "MESH"), None)
+
+
+def export_target_mesh(context, kind):
+    """Mesh for export defaults.
+
+    Priority: the selected mesh (or the selected armature's mesh), then the
+    mesh used by the last export of this format, then the first mesh in the
+    scene.
+    """
+    active = getattr(context, "active_object", None)
+    arm = active if active is not None and active.type == "ARMATURE" else None
+    if arm is None:
+        arm = next((o for o in getattr(context, "selected_objects", ()) or ()
+                    if o.type == "ARMATURE"), None)
+    mesh = model_mesh(context, arm)
+    if mesh is not None:
+        return mesh
+    mesh = last_export_mesh(kind)
+    if mesh is not None:
+        return mesh
+    return first_scene_mesh(context)
+
+
+def export_model_objects(context, use_selection=True):
+    """Return ``(armature, meshes)`` for a BMD export."""
+    objs = (context.selected_objects if use_selection
+            else [o for o in context.scene.objects if o.visible_get()])
+    meshes = [o for o in objs if o.type == "MESH"]
+    meshes.sort(key=lambda o: (o.get("bmd_shape_index", 1e9),
+                               o.get("bmd_order", 1e9), o.name))
+    armatures = [o for o in objs if o.type == "ARMATURE"]
+    for mesh in meshes:
+        arm = target_armature(mesh)
+        if arm is not None and arm not in armatures:
+            armatures.append(arm)
+    arm = armatures[0] if len(armatures) == 1 else None
+    return arm, meshes
+
+
+def model_mesh(context, owner=None):
+    """Selected mesh, or the first mesh deformed by *owner* (an armature)."""
+    obj = getattr(context, "active_object", None)
+    if obj is not None and obj.type == "MESH":
+        return obj
+    for selected in getattr(context, "selected_objects", ()) or ():
+        if selected.type == "MESH":
+            return selected
+    if owner is not None:
+        for candidate in context.scene.objects:
+            if candidate.type == "MESH" and target_armature(candidate) == owner:
+                return candidate
+    return None
+
 # --- coordinate systems -------------------------------------------------------
 # J3D: +Y up, +Z forward.  Blender: +Z up, -Y forward.   p_blender = C @ p_j3d
 C = np.array([[1, 0, 0, 0],
@@ -833,17 +1038,21 @@ def register_classes():
     bpy.utils.register_class(BMDMaterialProps)
     bpy.utils.register_class(BMDImageProps)
     bpy.utils.register_class(BMDTextureSlot)
+    bpy.utils.register_class(BMD_VertexFormatSettings)
     bpy.types.Material.bmd = PointerProperty(type=BMDMaterialProps)
     bpy.types.Image.bmd = PointerProperty(type=BMDImageProps)
     bpy.types.Object.bmd_texture_list = CollectionProperty(type=BMDTextureSlot)
     bpy.types.Object.bmd_texture_index = IntProperty(default=0, min=0)
+    bpy.types.Object.bmd_vtx = PointerProperty(type=BMD_VertexFormatSettings)
 
 
 def unregister_classes():
+    del bpy.types.Object.bmd_vtx
     del bpy.types.Object.bmd_texture_index
     del bpy.types.Object.bmd_texture_list
     del bpy.types.Image.bmd
     del bpy.types.Material.bmd
+    bpy.utils.unregister_class(BMD_VertexFormatSettings)
     bpy.utils.unregister_class(BMDTextureSlot)
     bpy.utils.unregister_class(BMDImageProps)
     bpy.utils.unregister_class(BMDMaterialProps)

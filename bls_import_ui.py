@@ -1164,6 +1164,9 @@ class BMD_SK_OT_settings(Operator):
             self.report({'ERROR'}, f'Import failed: {exc}')
             return {'CANCELLED'}
 
+        if session.files:
+            settings.target["bmd_bls_source"] = session.files[-1].path
+
         parts = [f'created: {stats["created"]}']
 
         if stats['updated']:

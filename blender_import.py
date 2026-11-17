@@ -84,6 +84,8 @@ def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=Tru
     bc.sync_texture_legacy(arm_obj)
     arm_obj["bmd_source"] = os.path.abspath(filepath)
     arm_obj["bmd_vtx_formats"] = json.dumps({str(a): [c, t, f] for a, c, t, f in bmd.vtx_formats})
+    if hasattr(arm_obj, "bmd_vtx"):
+        bc.apply_vertex_formats(arm_obj, bmd.vtx_formats)
     arm_obj["bmd_inf_flags"] = int(bmd.inf_flags)
     arm_obj["bmd_sub_version"] = bmd.sub_version.hex()
     arm_obj["bmd_scale"] = float(scale)

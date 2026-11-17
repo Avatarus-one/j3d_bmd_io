@@ -257,6 +257,8 @@ def apply_blk_animation(context, obj, animation, mapping, filepath="",
     action = bpy.data.actions.new(name)
     action.use_fake_user = True
     action["bmd_loop_mode"] = int(animation.loop_mode)
+    if filepath:
+        action["bmd_source"] = os.path.abspath(filepath)
     animation_data.action = action
 
     applied = 0

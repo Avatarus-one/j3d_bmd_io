@@ -242,16 +242,8 @@ def open_export_dialog():
 
 
 def _export_mesh_target(context):
-    """Return the active mesh, or the first selected mesh."""
-    target = context.active_object
-
-    if target is None or target.type != 'MESH':
-        target = next(
-            (obj for obj in context.selected_objects if obj.type == 'MESH'),
-            None,
-        )
-
-    return target if target is not None and target.type == 'MESH' else None
+    """Selected mesh/armature, last BLS export mesh, or the first scene mesh."""
+    return bc.export_target_mesh(context, "bls")
 
 
 class BMD_SK_OT_export_files(Operator, ExportHelper):
@@ -267,9 +259,18 @@ class BMD_SK_OT_export_files(Operator, ExportHelper):
         target = _export_mesh_target(context)
 
         if target is not None:
-            name = target.name or (target.data.name if target.data else '')
-            if name:
-                self.filepath = bpy.path.ensure_ext(name, self.filename_ext)
+            imported = bc.export_stem(target.get("bmd_bls_source", ""), "")
+            last = bc.last_export_path(target, "bls")
+            if last:
+                self.filepath = last
+            elif imported:
+                self.filepath = bpy.path.ensure_ext(imported, self.filename_ext)
+            else:
+                fallback = (target.name
+                            or (target.data.name if target.data else ''))
+                if fallback:
+                    self.filepath = bpy.path.ensure_ext(
+                        fallback, self.filename_ext)
 
         return ExportHelper.invoke(self, context, _event)
 

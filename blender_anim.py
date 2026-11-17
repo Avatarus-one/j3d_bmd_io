@@ -43,12 +43,22 @@ LOOP_ITEMS = [
 
 def find_armature(context):
     obj = context.active_object
-    if obj is not None and obj.type == "ARMATURE":
-        return obj
+    if obj is not None:
+        if obj.type == "ARMATURE":
+            return obj
+        if obj.type == "MESH":
+            arm = bc.target_armature(obj)
+            if arm is not None:
+                return arm
     for o in context.selected_objects:
         if o.type == "ARMATURE":
             return o
-    raise AnimError("Select the imported armature first")
+    for o in context.selected_objects:
+        if o.type == "MESH":
+            arm = bc.target_armature(o)
+            if arm is not None:
+                return arm
+    raise AnimError("Select the imported armature or its mesh first")
 
 
 def _rest_chain_unchanged(bone):
@@ -170,6 +180,7 @@ def import_bck(context, filepath, scale=0.01, set_scene_range=True, report=None,
     action.use_fake_user = True
     action["bmd_loop_mode"] = int(bck.loop_mode)
     action["bmd_duration"] = int(bck.duration)
+    action["bmd_source"] = os.path.abspath(filepath)
     ad = arm_obj.animation_data or arm_obj.animation_data_create()
     ad.action = action
 
@@ -453,6 +464,7 @@ def export_bck(context, filepath, scale=100.0, loop_mode="ONCE",
         action["bmd_loop_mode"] = mode
     except Exception:
         pass
+    bc.remember_export(action, "bck", filepath)
     if report:
         keys = sum(len(t.keys) for jt in bck.tracks for t in jt)
         report({"INFO"}, f"Exported {len(frames)} frames for {nj} joints ({keys} keys, "

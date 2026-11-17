@@ -145,6 +145,11 @@ def export_kcl(context, filepath, scale=100.0, use_selection=True, apply_modifie
                default_attr=0, keep_area=True, report=None):
     objs = [o for o in (context.selected_objects if use_selection else context.scene.objects)
             if o.type == "MESH"]
+    if use_selection and not objs:
+        armatures = [o for o in context.selected_objects if o.type == "ARMATURE"]
+        if len(armatures) == 1:
+            objs = [o for o in context.scene.objects
+                    if o.type == "MESH" and bc.target_armature(o) == armatures[0]]
     if not objs:
         raise KclExportError("No mesh objects to export (select the collision mesh or untick 'Selected Only')")
     depsgraph = context.evaluated_depsgraph_get()
@@ -203,6 +208,7 @@ def export_kcl(context, filepath, scale=100.0, use_selection=True, apply_modifie
     blob = kcl.write(tris, attrs, template)
     with open(filepath, "wb") as f:
         f.write(blob)
+    bc.remember_export(objs[0], "kcl", filepath)
     if report:
         report({"INFO"}, f"Wrote {len(tris)} collision triangles ({len(blob)} bytes) to "
                          f"{os.path.basename(filepath)}. Keep using the original room.plc.")

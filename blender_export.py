@@ -67,7 +67,7 @@ def _format_override(choice, components, fraction):
 
 def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifiers=False,
                source_file="", allow_missing_textures=False,
-               keep_vertex_formats=True, report=None, limit_weights=False,
+               keep_vertex_formats=True, report=None,
                optimize_bmd=False, bls_compatible=False,
                position_format="AUTO", normal_format="AUTO", uv_format="AUTO",
                position_frac=6, normal_frac=14, uv_frac=14):
@@ -79,6 +79,11 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
         target = bc.target_armature(obj)
         if target is not None:
             armatures.add(target)
+    if use_selection and not mesh_objs and len(armatures) == 1:
+        # The user selected only the armature: export the meshes it deforms.
+        arm = next(iter(armatures))
+        mesh_objs = [o for o in context.scene.objects
+                     if o.type == "MESH" and bc.target_armature(o) == arm]
     if len(armatures) > 1:
         raise ExportError(
             "The export contains meshes from multiple armatures. "
@@ -155,7 +160,7 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
     normal_updates = []
     for obj in mesh_objs:
         _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modifiers,
-                            context, limit_weights, normal_updates, joint_map, warn)
+                            context, normal_updates, joint_map, warn)
     if not model.meshes:
         raise ExportError("The selected meshes have no faces to export")
     _add_empty_shapes(model, mesh_objs, mats, joint_map)
@@ -184,18 +189,12 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
         except ValueError as exc:
             warn(f"Object '{obj.name}': could not update normal metadata: {exc}")
 
-    exported_formats = {
-        str(attr): [components, typ, frac]
-        for attr, (components, typ, frac) in getattr(model, "exported_formats", {}).items()
-    }
-    if exported_formats:
-        serialized = json.dumps(exported_formats, separators=(",", ":"))
-        for obj in mesh_objs:
-            obj["bmd_export_formats"] = serialized
     with open(filepath, "wb") as f:
         f.write(data)
     if arm_obj is not None:
         _update_bone_metadata(arm_obj, model, bone_index, mesh_objs)
+    bc.remember_export(mesh_objs[0] if mesh_objs else arm_obj,
+                       "bmd", filepath)
     if report:
         report({"INFO"}, f"Exported {len(model.meshes)} meshes, {len(model.joints)} joints, "
                          f"{len(model.materials)} materials, {len(model.textures)} textures "
@@ -566,10 +565,10 @@ def _eval_mesh(obj, apply_modifiers, context):
 
 
 def _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modifiers, context,
-                        limit_weights=False, normal_updates=None, joint_map=None, warn=None):
+                        normal_updates=None, joint_map=None, warn=None):
     me, cleanup = _eval_mesh(obj, apply_modifiers, context)
     try:
-        _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_weights,
+        _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale,
                           normal_updates, joint_map, warn)
     finally:
         if cleanup:
@@ -579,7 +578,7 @@ def _export_mesh_object(model, obj, arm_obj, bone_index, mats, scale, apply_modi
                 m.show_viewport = True
 
 
-def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_weights=False,
+def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale,
                       normal_updates=None, joint_map=None, warn=None):
     me.calc_loop_triangles()
     nt = len(me.loop_triangles)
@@ -685,11 +684,10 @@ def _export_mesh_data(model, obj, me, arm_obj, bone_index, mats, scale, limit_we
                 ws[j] = ws.get(j, 0.0) + g.weight
         if not ws:
             ws = {parent_joint if parent_joint is not None else root: 1.0}
-        max_weights = 4 if limit_weights else writer.MAX_ENVELOPE_WEIGHTS
+        max_weights = writer.MAX_ENVELOPE_WEIGHTS
         if len(ws) > max_weights:
-            if not limit_weights:
-                _warn(warn, f"Object '{obj.name}': vertex {i} has more than "
-                            f"{writer.MAX_ENVELOPE_WEIGHTS} influences; clamping")
+            _warn(warn, f"Object '{obj.name}': vertex {i} has more than "
+                        f"{writer.MAX_ENVELOPE_WEIGHTS} influences; clamping")
             ws = dict(sorted(ws.items(), key=lambda kv: -kv[1])[:max_weights])
         tot = sum(ws.values())
         key = tuple(sorted((j, round(w / tot, 5)) for j, w in ws.items()))

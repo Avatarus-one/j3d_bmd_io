@@ -6,6 +6,7 @@ import bpy
 import numpy as np
 
 from . import bmd_metadata
+from . import blender_common as bc
 from .j3d import bls_writer
 
 
@@ -130,7 +131,7 @@ def validate_export(obj, key_names, base_name, convert_units=True):
     shape_keys = mesh.shape_keys
 
     if shape_keys is None or len(shape_keys.key_blocks) < 2:
-        return ["No shape keys"]
+        return ["No shape keys found"]
 
     blocks = list(shape_keys.key_blocks)
     by_name = {block.name: block for block in blocks[1:]}
@@ -582,6 +583,7 @@ def export_bls(obj, filepath, key_names, convert_units=True, base_name=None):
     with open(filepath, "wb") as file:
         file.write(data)
 
+    bc.remember_export(obj, "bls", filepath)
     return {
         "keys": len(keys),
         "vertices": len(vertex_indices),

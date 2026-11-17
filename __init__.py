@@ -79,82 +79,12 @@ def _bck_frame_source_changed(operator, context):
     _bck_sync_frame_range(operator, context)
 
 
-def _decode_vtx_formats(raw):
+@bpy.app.handlers.persistent
+def _load_post_initialize_vertex_formats(*_args):
     try:
-        value = json.loads(raw) if isinstance(raw, str) else raw
-        return {int(attr): tuple(fmt) for attr, fmt in value.items()}
-    except (TypeError, ValueError, AttributeError):
-        return {}
-
-
-def _detect_vertex_formats(context):
-    """Find formats of the last successful export, then of the imported BMD."""
-    preferred = []
-    active = context.active_object
-    if active is not None:
-        preferred.append(active)
-    for obj in context.selected_objects:
-        if obj not in preferred:
-            preferred.append(obj)
-
-    # 1. Formats remembered from a previous successful export.
-    for obj in preferred:
-        if obj.type == "MESH":
-            raw = obj.get("bmd_export_formats")
-            if raw:
-                formats = _decode_vtx_formats(raw)
-                if formats:
-                    return formats
-
-    # 2. Formats of the imported BMD (stored on the armature).
-    for obj in preferred:
-        if obj.type == "ARMATURE":
-            raw = obj.get("bmd_vtx_formats")
-            if raw:
-                formats = _decode_vtx_formats(raw)
-                if formats:
-                    return formats
-
-    # 3. Imported BMD formats through the armature of a selected mesh.
-    for obj in preferred:
-        if obj.type == "MESH":
-            armature = bc.target_armature(obj)
-            if armature is not None:
-                raw = armature.get("bmd_vtx_formats")
-                if raw:
-                    formats = _decode_vtx_formats(raw)
-                    if formats:
-                        return formats
-
-    # 4. Nothing selected: use the scene's single remembered export, or its
-    #    single imported model.  This covers file-menu invocation with a lost
-    #    selection.
-    meshes = [
-        obj for obj in context.scene.objects
-        if obj.type == "MESH" and obj.get("bmd_export_formats")]
-    if len(meshes) == 1:
-        formats = _decode_vtx_formats(meshes[0].get("bmd_export_formats"))
-        if formats:
-            return formats
-
-    armatures = [
-        obj for obj in context.scene.objects
-        if obj.type == "ARMATURE" and obj.get("bmd_vtx_formats")]
-    if len(armatures) == 1:
-        formats = _decode_vtx_formats(armatures[0].get("bmd_vtx_formats"))
-        if formats:
-            return formats
-
-    return {}
-
-
-def _format_choice(fmt, default_frac):
-    if not fmt:
-        return "F32", default_frac
-    _components, typ, frac = fmt
-    if typ == 3:
-        return "S16", int(frac)
-    return "F32", default_frac
+        bc.initialize_vertex_formats()
+    except Exception:
+        pass
 
 
 class IMPORT_OT_bmd(Operator, ImportHelper):
@@ -433,63 +363,17 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
                                 description="Path of the file this model was imported from. Only needed "
                                             "when the path remembered at import no longer exists; used "
                                             "to restore textures that are gone from Blender")
-    position_format: EnumProperty(
-        name="Positions",
-        items=[
-            ("F32", "Float32", "Write positions as float32"),
-            ("S16", "s16", "Write positions as signed 16-bit"),
-        ],
-        default="F32")
-    position_frac: IntProperty(
-        name="Fraction", default=6, min=0, max=15,
-        description="Fraction bits for 16-bit positions")
-    normal_format: EnumProperty(
-        name="Normals",
-        items=[
-            ("F32", "Float32", "Write normals as float32"),
-            ("S16", "s16", "Write normals as signed 16-bit"),
-        ],
-        default="F32")
-    normal_frac: IntProperty(
-        name="Fraction", default=14, min=0, max=15,
-        description="Fraction bits for 16-bit normals")
-    uv_format: EnumProperty(
-        name="UVs",
-        items=[
-            ("F32", "Float32", "Write UVs as float32"),
-            ("S16", "s16", "Write UVs as signed 16-bit"),
-        ],
-        default="F32")
-    uv_frac: IntProperty(
-        name="Fraction", default=14, min=0, max=15,
-        description="Fraction bits for 16-bit UVs")
-    limit_weights: BoolProperty(
-        name="Limit 4 Weights per Vertex", default=False,
-        description="Limit exported vertices to 4 bone influences. Leave off to preserve all "
-                    "influences (BMD EVP1 supports up to 255 weights per vertex); more than 4 may "
-                    "not work in engines that assume standard 4-bone skinning")
     allow_missing_textures: BoolProperty(name="Allow Missing Textures", default=False,
                                          description="Export even if textures of the imported model "
                                                      "are gone (shifts texture indices!)")
 
-    def _apply_detected_formats(self, context):
-        formats = _detect_vertex_formats(context)
-        self.position_format, self.position_frac = _format_choice(
-            formats.get(9), self.position_frac)
-        self.normal_format, self.normal_frac = _format_choice(
-            formats.get(10), self.normal_frac)
-        uv_attr = next((attr for attr in range(13, 21) if attr in formats), 13)
-        self.uv_format, self.uv_frac = _format_choice(
-            formats.get(uv_attr), self.uv_frac)
-
     def invoke(self, context, _event):
-        self._apply_detected_formats(context)
         self.convert_units = bc.saved_convert_units(context)
-
+        mesh = bc.export_target_mesh(context, "bmd")
+        last = bc.last_export_path(mesh, "bmd")
+        fallback = mesh.name if mesh is not None else "model"
+        self.filepath = last or bpy.path.ensure_ext(fallback, self.filename_ext)
         result = ExportHelper.invoke(self, context, _event)
-        # File-select operators can restore their last-used properties while
-        # opening; apply the detected formats once more before the panel draws.
-        self._apply_detected_formats(context)
         self.convert_units = bc.saved_convert_units(context)
         return result
 
@@ -500,35 +384,33 @@ class EXPORT_OT_bmd(Operator, ExportHelper):
         layout.prop(self, "use_selection")
         layout.prop(self, "apply_modifiers")
         layout.prop(self, "source_file")
-        layout.prop(self, "limit_weights")
         layout.prop(self, "allow_missing_textures")
-
-        formats = layout.box()
-        formats.label(text="Vertex Formats", icon="MESH_DATA")
-        formats.prop(self, "position_format")
-        if self.position_format == "S16":
-            formats.prop(self, "position_frac")
-            formats.label(text="16-bit positions: BLS blend shapes will not deform",
-                          icon="ERROR")
-        formats.prop(self, "normal_format")
-        if self.normal_format == "S16":
-            formats.prop(self, "normal_frac")
-        formats.prop(self, "uv_format")
-        if self.uv_format == "S16":
-            formats.prop(self, "uv_frac")
 
     def execute(self, context):
         from . import blender_export
         from .j3d.common import J3DError
         scale = 100.0 if self.convert_units else 1.0
+        arm_obj, meshes = bc.export_model_objects(context, self.use_selection)
+        owner = arm_obj or (meshes[0] if meshes else None)
+        formats = bc.ensure_vertex_formats(owner) if owner is not None else None
+        if formats is not None:
+            position_format = formats.position_format
+            normal_format = formats.normal_format
+            uv_format = formats.uv_format
+            position_frac = formats.position_frac
+            normal_frac = formats.normal_frac
+            uv_frac = formats.uv_frac
+        else:
+            position_format = normal_format = uv_format = "AUTO"
+            position_frac, normal_frac, uv_frac = 6, 14, 14
         try:
             blender_export.export_bmd(
                 context, self.filepath, scale, self.use_selection,
                 self.apply_modifiers, self.source_file,
                 self.allow_missing_textures, True,
-                self.report, self.limit_weights, False, False,
-                self.position_format, self.normal_format, self.uv_format,
-                self.position_frac, self.normal_frac, self.uv_frac)
+                self.report, False, False,
+                position_format, normal_format, uv_format,
+                position_frac, normal_frac, uv_frac)
         except (blender_export.ExportError, J3DError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -1024,7 +906,19 @@ class EXPORT_OT_kcl(Operator, ExportHelper):
 
     def invoke(self, context, event):
         self.convert_units = bc.saved_convert_units(context)
-
+        if self.use_selection:
+            active = context.active_object
+            arm = active if active is not None and active.type == "ARMATURE" else None
+            if arm is None:
+                arm = next((o for o in context.selected_objects
+                            if o.type == "ARMATURE"), None)
+            mesh = bc.model_mesh(context, arm)
+        else:
+            mesh = next((o for o in context.scene.objects
+                         if o.type == "MESH" and o.visible_get()), None)
+        last = bc.last_export_path(mesh, "kcl")
+        fallback = mesh.name if mesh is not None else "room"
+        self.filepath = last or bpy.path.ensure_ext(fallback, self.filename_ext)
         result = ExportHelper.invoke(self, context, event)
         self.convert_units = bc.saved_convert_units(context)
         return result
@@ -1124,8 +1018,35 @@ class EXPORT_OT_bck(Operator, ExportHelper):
     custom_start: IntProperty(name="Start Frame", default=0)
     custom_end: IntProperty(name="End Frame", default=0)
 
+    @classmethod
+    def poll(cls, context):
+        from . import blender_anim
+        try:
+            arm = blender_anim.find_armature(context)
+        except blender_anim.AnimError:
+            return False
+        return (arm.animation_data is not None
+                and arm.animation_data.action is not None)
+
     def invoke(self, context, event):
         self.convert_units = bc.saved_convert_units(context)
+        from . import blender_anim
+        try:
+            arm = blender_anim.find_armature(context)
+        except blender_anim.AnimError:
+            arm = None
+        action = arm.animation_data.action if arm and arm.animation_data else None
+        last = bc.last_export_path(action, "bck")
+        if action is not None:
+            self.filepath = bpy.path.ensure_ext(action.name, self.filename_ext)
+        elif last:
+            self.filepath = last
+        elif arm is not None:
+            mesh = bc.model_mesh(context, arm)
+            fallback = mesh.name if mesh is not None else "animation"
+            self.filepath = bpy.path.ensure_ext(fallback, self.filename_ext)
+        else:
+            self.filepath = bpy.path.ensure_ext("animation", self.filename_ext)
 
         result = ExportHelper.invoke(self, context, event)
         self.convert_units = bc.saved_convert_units(context)
@@ -1208,6 +1129,23 @@ class EXPORT_OT_blk(Operator, ExportHelper):
     filename_ext = ".blk"
     filter_glob: StringProperty(default="*.blk", options={"HIDDEN"})
 
+    def invoke(self, context, event):
+        target = bc.export_target_mesh(context, "blk")
+        action = None
+        if target is not None and target.data and target.data.shape_keys:
+            animation_data = target.data.shape_keys.animation_data
+            action = animation_data.action if animation_data else None
+        last = bc.last_export_path(action, "blk")
+        if action is not None:
+            self.filepath = bpy.path.ensure_ext(action.name, self.filename_ext)
+        elif last:
+            self.filepath = last
+        elif target is not None:
+            self.filepath = bpy.path.ensure_ext(target.name, self.filename_ext)
+        else:
+            self.filepath = bpy.path.ensure_ext("animation", self.filename_ext)
+        return ExportHelper.invoke(self, context, event)
+
     def execute(self, context):
         from . import blk_export, bls_export_ui
 
@@ -1221,12 +1159,7 @@ class EXPORT_OT_blk(Operator, ExportHelper):
             self.report({"ERROR"}, "Export settings are unavailable")
             return {"CANCELLED"}
 
-        target = context.active_object
-
-        if target is None or target.type != "MESH":
-            target = next(
-                (obj for obj in context.selected_objects if obj.type == "MESH"),
-                None)
+        target = bc.export_target_mesh(context, "blk")
 
         if target is not None:
             settings.target = target
@@ -1424,39 +1357,60 @@ def _texture_mesh(context, owner=None):
     return None
 
 
-def _texture_owner(context):
-    """Object that owns the BMD texture list (armature, or a mesh without one)."""
-    obj = context.active_object
-    if obj is not None:
+_LAST_MODEL = None
+
+
+def _valid_model(obj):
+    if obj is None:
+        return None
+    try:
+        if obj.name in bpy.data.objects:
+            return obj
+    except ReferenceError:
+        pass
+    return None
+
+
+def _selected_model(context):
+    """The BMD model targeted by both sidebar panels.
+
+    A mesh with an armature resolves to the armature.  Selecting an unrelated
+    object shows no model; clearing the selection keeps the last valid model.
+    """
+    global _LAST_MODEL
+    active = getattr(context, "active_object", None)
+    if active is not None:
+        if active.type == "ARMATURE":
+            _LAST_MODEL = active
+            return active
+        if active.type == "MESH":
+            model = bc.target_armature(active) or active
+            _LAST_MODEL = model
+            return model
+        return None
+    selected = list(getattr(context, "selected_objects", ()) or ())
+    for obj in selected:
         if obj.type == "ARMATURE":
+            _LAST_MODEL = obj
             return obj
         if obj.type == "MESH":
-            arm = bc.target_armature(obj)
-            if (arm is not None
-                    and (len(arm.bmd_texture_list) or "bmd_textures" in arm)):
-                return arm
-            return obj
-    for selected in context.selected_objects:
-        if selected.type == "ARMATURE":
-            return selected
-        if selected.type == "MESH":
-            arm = bc.target_armature(selected)
-            if (arm is not None
-                    and (len(arm.bmd_texture_list) or "bmd_textures" in arm)):
-                return arm
-            return selected
-    scene = getattr(context, "scene", None)
-    if scene is not None:
-        for candidate in scene.objects:
-            if (candidate.type == "ARMATURE"
-                    and ("bmd_textures" in candidate
-                         or len(candidate.bmd_texture_list))):
-                return candidate
-            if (candidate.type == "MESH"
-                    and ("bmd_textures" in candidate
-                         or len(candidate.bmd_texture_list))):
-                return candidate
-    return None
+            model = bc.target_armature(obj) or obj
+            _LAST_MODEL = model
+            return model
+    if selected:
+        return None
+    model = _valid_model(_LAST_MODEL)
+    if model is None:
+        _LAST_MODEL = None
+    return model
+
+
+def _format_owner(context):
+    return _selected_model(context)
+
+
+def _texture_owner(context):
+    return _selected_model(context)
 
 
 def _active_material(context):
@@ -1887,26 +1841,58 @@ class BMD_OT_texture_move(Operator):
         return {"FINISHED"}
 
 
-class BMD_PT_textures(Panel):
-    bl_label = "BMD Textures"
+class BMD_PT_formats(Panel):
+    bl_label = "Vertex Formats"
+    bl_order = 1
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "J3D"
 
     @classmethod
     def poll(cls, context):
-        return _texture_owner(context) is not None
+        return True
 
     def draw(self, context):
         layout = self.layout
-        owner = _texture_owner(context)
+        layout.use_property_decorate = False
+        owner = _selected_model(context)
         if owner is None:
+            layout.label(text="Select a BMD Model", icon="INFO")
             return
-        mesh = _texture_mesh(context, owner)
-        if mesh is not None:
-            layout.label(text=mesh.name, icon="MESH_DATA")
-        else:
-            layout.label(text=owner.name, icon="OBJECT_DATA")
+        formats = bc.ensure_vertex_formats(owner, read_only=True)
+        if formats is None:
+            layout.label(text="Select a BMD Model", icon="INFO")
+            return
+        _draw_bmd_prop(layout, formats, "position_format", "Positions", 0.3)
+        if formats.position_format == "S16":
+            _draw_bmd_prop(layout, formats, "position_frac", "Fraction", 0.3)
+            layout.label(text="16-bit positions: BLS blend shapes will not deform",
+                         icon="ERROR")
+        _draw_bmd_prop(layout, formats, "normal_format", "Normals", 0.3)
+        if formats.normal_format == "S16":
+            _draw_bmd_prop(layout, formats, "normal_frac", "Fraction", 0.3)
+        _draw_bmd_prop(layout, formats, "uv_format", "UVs", 0.3)
+        if formats.uv_format == "S16":
+            _draw_bmd_prop(layout, formats, "uv_frac", "Fraction", 0.3)
+
+
+class BMD_PT_textures(Panel):
+    bl_label = "BMD Textures"
+    bl_order = 2
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "J3D"
+
+    @classmethod
+    def poll(cls, context):
+        return True
+
+    def draw(self, context):
+        layout = self.layout
+        owner = _selected_model(context)
+        if owner is None:
+            layout.label(text="Select a BMD Model", icon="INFO")
+            return
         coll = bc.ensure_texture_list(owner)
         row = layout.row(align=True)
         row.operator(BMD_OT_texture_add.bl_idname, text="Add", icon="ADD")
@@ -1949,13 +1935,13 @@ class BMD_PT_textures(Panel):
                 pass
         image_col.template_ID_preview(slot, "image", new="", open="",
                                       unlink=BMD_OT_texture_clear_image.bl_idname)
+        if key:
+            box.label(text=f"Used by {bc.material_slot_users(owner, index)} material slot(s)",
+                      icon="MATERIAL")
         if slot.image is not None:
             settings = box.box()
             settings.label(text="Texture Settings", icon="PREFERENCES")
             _draw_bmd_image_settings(settings, slot.image)
-        if key:
-            box.label(text=f"Used by {bc.material_slot_users(owner, index)} material slot(s)",
-                      icon="MATERIAL")
 
 
 def menu_import(self, context):
@@ -1995,7 +1981,7 @@ _classes = (IMPORT_OT_bmd, BMDImportFileState, IMPORT_OT_bmd_texc,
             BMD_OT_texture_clear_image, BMD_OT_texture_move,
             BMD_OT_material_set_texture, BMD_OT_material_add_texture,
             BMD_OT_material_remove_texture, BMD_OT_material_texture_menu,
-            BMD_OT_texture_focus, BMD_PT_textures)
+            BMD_OT_texture_focus, BMD_PT_formats, BMD_PT_textures)
 _file_handlers = []
 
 
@@ -2084,6 +2070,12 @@ def _make_file_handlers():
 def register():
     global _file_handlers
     bc.register_classes()
+    try:
+        bc.initialize_vertex_formats()
+    except Exception:
+        pass
+    if _load_post_initialize_vertex_formats not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_load_post_initialize_vertex_formats)
     for c in _classes:
         bpy.utils.register_class(c)
     try:
@@ -2126,6 +2118,10 @@ def unregister():
         if bpy.app.timers.is_registered(_populate_slot_maps):
             bpy.app.timers.unregister(_populate_slot_maps)
     except Exception:
+        pass
+    try:
+        bpy.app.handlers.load_post.remove(_load_post_initialize_vertex_formats)
+    except ValueError:
         pass
     bpy.types.NODE_MT_context_menu.remove(menu_node_import_bti)
     bpy.types.IMAGE_MT_image.remove(menu_image_import_bti)

@@ -90,8 +90,8 @@ envelopes once more as filler. Every export is checked against these rules befor
 fast; an export that would crash the game raises an error instead.
 
 ### Vertex formats
-Positions, normals and UVs have separate dropdowns with two choices each: **Float32** and **s16**.
-When **s16** is selected, a **Fraction** field appears next to it.
+Positions, normals and UVs are set in the 3D View sidebar, **J3D > BMD Vertex Formats**. Each has
+two choices: **Float32** and **s16**.
 
 **Positions**
 
@@ -343,8 +343,7 @@ matching collision mesh.
   approximates those channels.
 * BMD export rejects meshes with more than 65535 unique positions, normals or UV coordinates
   (split the mesh first) and empty mesh selections.
-* By default all bone influences are preserved (the BMD `EVP1` limit is 255 per vertex). Enable
-  **Limit 4 Weights per Vertex** on export to cap skinning at 4 influences, which may be required by
-  engines that assume standard 4-bone skinning. Shapes are written as triangle lists (no strips), so
-  files are larger than the originals. MDL3 (BDL display lists) is not written.
+* All bone influences are preserved up to the BMD `EVP1` limit (255 per vertex). Shapes are written
+  as triangle lists (no strips), so files are larger than the originals. MDL3 (BDL display lists) is
+  not written.
 * Only `bck` (joint animations) is supported, not `btk` / `btp` / `bpk` / `brk` / `bca`.

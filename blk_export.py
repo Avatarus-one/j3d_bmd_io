@@ -9,6 +9,7 @@ import bpy
 from bpy.props import EnumProperty, IntProperty
 from bpy.types import Operator
 
+from . import blender_common as bc
 from . import bls_export_ui
 from .blender_anim import LOOP_ITEMS
 from .j3d import anim, blk
@@ -67,6 +68,9 @@ def export_blk(context, filepath, key_names=None, loop_mode="ONCE",
 
     animation_data = keys.animation_data
     action = animation_data.action if animation_data else None
+
+    if not _has_shape_key_tracks(action):
+        raise BlkExportError("The shape keys have no animation tracks")
 
     try:
         mode = anim.LOOP_NAMES.index(loop_mode)
@@ -142,6 +146,9 @@ def export_blk(context, filepath, key_names=None, loop_mode="ONCE",
             action["bmd_loop_mode"] = mode
         except Exception:
             pass
+    bc.remember_export(action or obj, "blk", filepath)
+    if obj is not None and obj is not action:
+        bc.remember_export(obj, "blk", filepath)
 
     if report:
         parts = [
@@ -163,6 +170,17 @@ def open_export_dialog():
         print(f"BLK exporter: could not open settings dialog: {exc}")
 
     return None
+
+
+def _has_shape_key_tracks(action):
+    """True when *action* animates at least one shape-key value."""
+    if action is None:
+        return False
+    for fcurve in action.fcurves:
+        path = fcurve.data_path
+        if "key_blocks[" in path and path.endswith(".value"):
+            return True
+    return False
 
 
 def _target_action(context):
@@ -305,6 +323,10 @@ class BMD_SK_OT_blk_export_settings(Operator):
             layout.label(text="No shape keys found", icon="ERROR")
             return
 
+        if not _has_shape_key_tracks(_target_action(context)):
+            layout.label(text="No shape-key animation tracks found", icon="ERROR")
+            return
+
         visible = len(settings.tree_rows) if settings.expanded else 1
         rows = min(max(1, visible), bls_export_ui.MAX_EXPORT_ROWS)
         layout.template_list(
@@ -334,6 +356,10 @@ class BMD_SK_OT_blk_export_settings(Operator):
 
         if not names:
             self.report({"WARNING"}, "No shape keys selected for export")
+            return {"CANCELLED"}
+
+        if not _has_shape_key_tracks(_target_action(context)):
+            self.report({"WARNING"}, "No shape-key animation tracks found")
             return {"CANCELLED"}
 
         custom_range = ((self.custom_start, self.custom_end)
