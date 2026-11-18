@@ -77,30 +77,11 @@ def _get_settings(context=None):
 
 CONVERTED_DELTA_SCALE = 0.01
 
-# Base-key mesh matching.  A handful of vertices is enough to identify the
-# model, and the tolerance is expressed in J3D units so it scales with the
-# imported mesh (0.01 by default).
-MATCH_MAX_VERTICES = 50
-MATCH_TOLERANCE = 2.0
-MATCH_MIN_VERTICES = 5
-MATCH_MIN_RATIO = 0.1
-
 
 def _delta_scale(settings):
     """Return the BLS delta scale selected by the Convert Units checkbox."""
     return CONVERTED_DELTA_SCALE if settings.convert_units else 1.0
 
-def _session_base_key_name(session):
-    """Return the base-key name from the first usable BLS file in the session."""
-    if session is None:
-        return None
-
-    for file_entry in session.files:
-        for key_entry in file_entry.keys:
-            if key_entry.record.is_base:
-                return key_entry.name
-
-    return None
 
 def _refresh_file_includes(settings):
     """Make every file checkbox reflect its selectable key checkboxes.
@@ -133,130 +114,6 @@ def _target_vertex_count(target):
     return len(target.data.vertices)
 
 
-def _session_base_slots(session):
-    """Return the base-key slots with the most entries in the session."""
-    best = []
-
-    for file_entry in session.files:
-        for key_entry in file_entry.keys:
-            if (key_entry.is_base and
-                    len(key_entry.record.slots) > len(best)):
-                best = key_entry.record.slots
-
-    return best
-
-
-def _mesh_base_match(context, mesh, slots):
-    """Return ``(ratio, average_distance, scale)`` for a mesh, or None.
-
-    Up to :data:`MATCH_MAX_VERTICES` base-key vertices are compared in the
-    mesh's local space.  Both unit conventions are tried because a from-scratch
-    mesh has no stored ``bmd_scale``.
-    """
-    if mesh is None or mesh.type != 'MESH' or mesh.data is None:
-        return None
-
-    vertices = mesh.data.vertices
-    usable = [slot for slot in slots if 0 <= slot.vertex < len(vertices)]
-
-    if len(usable) < MATCH_MIN_VERTICES:
-        return None
-
-    step = max(1, len(usable) // MATCH_MAX_VERTICES)
-    sample = usable[::step][:MATCH_MAX_VERTICES]
-
-    if len(sample) < MATCH_MIN_VERTICES:
-        return None
-
-    source = np.array(
-        [slot.base_position for slot in sample], dtype=np.float64)
-    actual = np.array(
-        [vertices[slot.vertex].co[:] for slot in sample], dtype=np.float64)
-
-    saved = bc.saved_convert_units(context, mesh)
-    scales = (0.01, 1.0) if saved else (1.0, 0.01)
-    best = None
-
-    for scale in scales:
-        expected = bc.point_to_blender(source, scale)
-        distances = np.linalg.norm(expected - actual, axis=1)
-        matches = int(np.count_nonzero(
-            distances <= MATCH_TOLERANCE * scale))
-        ratio = matches / len(sample)
-        score = (ratio, -float(distances.mean()))
-
-        if best is None or score > best[0]:
-            best = (score, ratio, float(distances.mean()), scale, matches)
-
-    _score, ratio, average, scale, matches = best
-
-    if matches < MATCH_MIN_VERTICES or ratio < MATCH_MIN_RATIO:
-        return None
-
-    return ratio, average, scale
-
-
-def _find_mesh_by_base_key(context, session, current=None):
-    """Return ``(mesh, scale)`` that best matches the BLS base key.
-
-    A mesh selected by the user wins when it matches the base key, even if
-    duplicate meshes in the scene produce a marginally better score.  Without
-    a usable selection the previous target and then the rest of the scene are
-    checked.
-    """
-    slots = _session_base_slots(session)
-
-    if not slots:
-        return None
-
-    selected = context.active_object
-
-    if selected is None or selected.type != 'MESH':
-        selected = next(
-            (obj for obj in context.selected_objects if obj.type == 'MESH'),
-            None,
-        )
-
-    if selected is not None:
-        try:
-            result = _mesh_base_match(context, selected, slots)
-        except Exception:
-            result = None
-
-        if result is not None:
-            return selected, result[2]
-
-    candidates = []
-
-    if current is not None and current.type == 'MESH':
-        candidates.append(current)
-
-    for obj in context.scene.objects:
-        if obj.type == 'MESH' and obj not in candidates:
-            candidates.append(obj)
-
-    best = None
-    best_score = None
-
-    for mesh in candidates:
-        try:
-            result = _mesh_base_match(context, mesh, slots)
-        except Exception:
-            result = None
-
-        if result is None:
-            continue
-
-        ratio, average, scale = result
-        score = (ratio, -average)
-
-        if best_score is None or score > best_score:
-            best = (mesh, scale)
-            best_score = score
-
-    return best
-
-
 def _redraw(context):
     """Force the dialog to redraw after a checkbox changes."""
     area = getattr(context, 'area', None)
@@ -277,16 +134,6 @@ def _redraw(context):
             screen_area.tag_redraw()
 
 
-def _existing_keys(target):
-    """Build session-side descriptions of the target mesh's shape keys."""
-    return [
-        bls_session.ExistingKey(name, displacement)
-        for name, displacement in bls_import.existing_shape_key_displacements(
-            target
-        )
-    ]
-
-
 def _reanalyse_session(context):
     """Re-run duplicate/conflict analysis with the current import settings."""
     global _SESSION
@@ -301,7 +148,7 @@ def _reanalyse_session(context):
 
     bls_session.reanalyse(
         _SESSION,
-        _existing_keys(settings.target),
+        bls_import.existing_keys(settings.target),
         _target_vertex_count(settings.target),
         delta_scale=_delta_scale(settings),
     )
@@ -787,7 +634,7 @@ def _begin_import(context, paths, operator):
         session = bls_session.build_session(
             paths,
             recursive=True,
-            existing_keys=_existing_keys(settings.target),
+            existing_keys=bls_import.existing_keys(settings.target),
             vertex_count=_target_vertex_count(settings.target),
             delta_scale=_delta_scale(settings),
         )
@@ -806,7 +653,7 @@ def _begin_import(context, paths, operator):
     # are enough to pick the right model even when the target field was left on
     # another object.
     try:
-        matched = _find_mesh_by_base_key(context, session, settings.target)
+        matched = bls_import.find_mesh_by_base_key(context, session, settings.target)
     except Exception:
         matched = None
 
@@ -826,7 +673,7 @@ def _begin_import(context, paths, operator):
 
             bls_session.reanalyse(
                 session,
-                _existing_keys(mesh),
+                bls_import.existing_keys(mesh),
                 _target_vertex_count(mesh),
                 delta_scale=_delta_scale(settings),
             )
@@ -1173,7 +1020,7 @@ class BMD_SK_OT_settings(Operator):
         # session was built, so refresh duplicate/conflict detection.
         bls_session.reanalyse(
             _SESSION,
-            _existing_keys(settings.target),
+            bls_import.existing_keys(settings.target),
             _target_vertex_count(settings.target),
             delta_scale=_delta_scale(settings),
         )
@@ -1255,7 +1102,7 @@ class BMD_SK_OT_settings(Operator):
                 settings.target,
                 jobs,
                 delta_scale=_delta_scale(settings),
-                base_key_name=_session_base_key_name(session),
+                base_key_name=bls_import.session_base_key_name(session),
             )
         except Exception as exc:
             self.report({'ERROR'}, f'Import failed: {exc}')

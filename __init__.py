@@ -53,6 +53,9 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
         description="Convert J3D model units to Blender units (scale 0.01). ")
     bone_axis: EnumProperty(name="Bone Orientation", items=bc.BONE_AXIS_ITEMS, default="X")
     import_textures: BoolProperty(name="Import Textures", default=True)
+    import_shape_keys: BoolProperty(
+        name="Import Shape Keys", default=True,
+        description="Import compatible BLS shape keys found next to the model")
 
     def draw(self, context):
         layout = self.layout
@@ -60,6 +63,7 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
         layout.prop(self, "convert_units")
         layout.prop(self, "bone_axis")
         layout.prop(self, "import_textures")
+        layout.prop(self, "import_shape_keys")
 
     def execute(self, context):
         from . import blender_import
@@ -107,6 +111,7 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
                     "scale": scale,
                     "bone_axis": self.bone_axis,
                     "import_textures": self.import_textures,
+                    "import_shape_keys": self.import_shape_keys,
                     "convert_units": self.convert_units,
                     "files": files,
                     "missing": missing,
@@ -128,12 +133,18 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
 
         for p in paths:
             try:
-                blender_import.import_bmd(
+                arm = blender_import.import_bmd(
                     context, p, scale, self.bone_axis,
                     self.import_textures, report=self.report)
             except J3DError as exc:
                 self.report({"ERROR"}, f"{os.path.basename(p)}: {exc}")
                 return {"CANCELLED"}
+
+            if self.import_shape_keys:
+                from . import bls_import
+                bls_import.import_shape_keys_for_bmd(
+                    context, arm, p, scale, report=self.report)
+
         return {"FINISHED"}
 
 
@@ -275,7 +286,7 @@ class IMPORT_OT_bmd_texc(Operator):
 
         for path in pending["paths"]:
             try:
-                blender_import.import_bmd(
+                arm = blender_import.import_bmd(
                     context, path, pending["scale"], pending["bone_axis"],
                     pending["import_textures"], report=self.report,
                     texc_dir=texc_dir)
@@ -283,6 +294,12 @@ class IMPORT_OT_bmd_texc(Operator):
                 _PENDING_BMD_IMPORT = None
                 self.report({"ERROR"}, f"{os.path.basename(path)}: {exc}")
                 return {"CANCELLED"}
+
+            if pending.get("import_shape_keys", True):
+                from . import bls_import
+                bls_import.import_shape_keys_for_bmd(
+                    context, arm, path, pending["scale"],
+                    report=self.report)
 
         _PENDING_BMD_IMPORT = None
         return {"FINISHED"}

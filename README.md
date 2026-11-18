@@ -36,6 +36,8 @@ Import / Export`.
 1. **Import** with **Convert Units** enabled (default): the model is scaled to
    `0.01` (100 J3D units = 1 m). You get an armature (one bone per joint),
    materials and images.
+   **Import Shape Keys** (default on) scans the model folder and its sibling
+   `bls` folder for the BLS that matches the imported mesh.
    The model is always imported as one mesh object whose vertices keep the
    original BMD `VTX1` position order (`vertex i` is source position `i`).
 2. Edit meshes / textures. Append new bones rather than re-ordering existing ones; reordering is
