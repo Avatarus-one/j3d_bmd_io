@@ -3,24 +3,119 @@
 from __future__ import annotations
 
 import math
-import os
 
 import bpy
-from bpy.props import EnumProperty, IntProperty
-from bpy.types import Operator
 
 from . import blender_common as bc
-from . import bls_export_ui
-from .blender_anim import LOOP_ITEMS
 from .j3d import anim, blk
-from .j3d.common import J3DError
-
-
-BLK_LOOP_ITEMS = [item for item in LOOP_ITEMS if item[0] != "AUTO"]
 
 
 class BlkExportError(Exception):
     pass
+
+
+def _shape_key_name(path):
+    prefix = 'key_blocks["'
+    suffix = '"].value'
+
+    if path.startswith(prefix) and path.endswith(suffix):
+        return path[len(prefix):-len(suffix)]
+
+    return None
+
+
+def _action_key_slot(action, keys):
+    """Return the action slot that drives *keys*, or the first key slot."""
+    if action is None or keys is None:
+        return None
+
+    slots = list(getattr(action, "slots", ()))
+    identifier = f"KE{keys.name}"
+
+    for slot in slots:
+        if slot.target_id_type == "KEY" and slot.identifier == identifier:
+            return slot
+
+    for slot in slots:
+        if slot.target_id_type == "KEY":
+            return slot
+
+    return None
+
+
+def _action_targets_keys(action, keys):
+    """True when *action* animates the shape keys of *keys*."""
+    if action is None or keys is None:
+        return False
+
+    slot = _action_key_slot(action, keys)
+
+    if slot is not None and slot.identifier == f"KE{keys.name}":
+        return True
+
+    names = {block.name for block in keys.key_blocks[1:]}
+
+    try:
+        curves = action.fcurves
+    except Exception:  # actions without a legacy single-slot view
+        return False
+
+    for curve in curves:
+        if _shape_key_name(curve.data_path) in names:
+            return True
+
+    return False
+
+
+def _shape_key_actions(keys):
+    """Return the shape-key actions of *keys*, active action first."""
+    if keys is None:
+        return []
+
+    found = []
+    seen = set()
+
+    def add(action):
+        if action is None or action.name in seen:
+            return
+
+        if not _has_shape_key_tracks(action):
+            return
+
+        if not _action_targets_keys(action, keys):
+            return
+
+        seen.add(action.name)
+        found.append(action)
+
+    animation_data = keys.animation_data
+
+    if animation_data is not None:
+        add(animation_data.action)
+
+        for track in animation_data.nla_tracks:
+            for strip in track.strips:
+                add(strip.action)
+
+    for action in sorted(bpy.data.actions, key=lambda item: item.name.lower()):
+        add(action)
+
+    return found
+
+
+def _action_frame_range(action):
+    """Return the inclusive frame range shown in the animation list."""
+    if action is None:
+        return 0, 0
+
+    start, end = action.frame_range
+    start, end = int(math.floor(start)), int(math.ceil(end))
+
+    if start == end and "bmd_duration" in action:
+        start = min(start, 0)
+        end = max(end, int(action["bmd_duration"]))
+
+    return start, end
 
 
 def find_mesh(context):
@@ -50,11 +145,13 @@ def _targets(keys):
 
 def export_blk(context, filepath, key_names=None, loop_mode="ONCE",
                frame_source="ACTION", report=None, target=None,
-               custom_range=None):
+               custom_range=None, action=None):
     """Export the shape-key animation of *target* to *filepath*.
 
     *key_names* selects which shape keys are animated; other keys are skipped.
     *custom_range* is ``(start, end)`` for ``frame_source="CUSTOM"``.
+    *action* selects the animation to sample; the active action is used when
+    it is omitted.
     """
     obj = target if target is not None else find_mesh(context)
 
@@ -67,7 +164,9 @@ def export_blk(context, filepath, key_names=None, loop_mode="ONCE",
         raise BlkExportError("The mesh has no shape keys")
 
     animation_data = keys.animation_data
-    action = animation_data.action if animation_data else None
+
+    if action is None:
+        action = animation_data.action if animation_data is not None else None
 
     if not _has_shape_key_tracks(action):
         raise BlkExportError("The shape keys have no animation tracks")
@@ -109,6 +208,24 @@ def export_blk(context, filepath, key_names=None, loop_mode="ONCE",
     scene = context.scene
     current = scene.frame_current
     sampled = []
+    previous_action = None
+    previous_slot = None
+    switched = False
+
+    if action is not None:
+        if animation_data is None:
+            animation_data = keys.animation_data_create()
+
+        if animation_data.action is not action:
+            previous_action = animation_data.action
+            previous_slot = getattr(animation_data, "action_slot", None)
+            animation_data.action = action
+            slot = _action_key_slot(action, keys)
+
+            if slot is not None and hasattr(animation_data, "action_slot"):
+                animation_data.action_slot = slot
+
+            switched = True
 
     try:
         for name, block in selected_targets:
@@ -121,6 +238,13 @@ def export_blk(context, filepath, key_names=None, loop_mode="ONCE",
             sampled.append((name, block, values))
     finally:
         scene.frame_set(current)
+
+        if switched:
+            animation_data.action = previous_action
+
+            if (previous_slot is not None
+                    and hasattr(animation_data, "action_slot")):
+                animation_data.action_slot = previous_slot
 
     orig_values = []
 
@@ -162,221 +286,19 @@ def export_blk(context, filepath, key_names=None, loop_mode="ONCE",
     return animation
 
 
-def open_export_dialog():
-    """Timer callback: open the BLK export dialog after the file browser."""
-    try:
-        bpy.ops.bmd_shape_keys.blk_export_settings("INVOKE_DEFAULT")
-    except Exception as exc:  # pragma: no cover - only in unusual UI states
-        print(f"BLK exporter: could not open settings dialog: {exc}")
-
-    return None
-
-
 def _has_shape_key_tracks(action):
     """True when *action* animates at least one shape-key value."""
     if action is None:
         return False
-    for fcurve in action.fcurves:
+
+    try:
+        curves = action.fcurves
+    except Exception:  # actions without a legacy single-slot view
+        return False
+
+    for fcurve in curves:
         path = fcurve.data_path
         if "key_blocks[" in path and path.endswith(".value"):
             return True
+
     return False
-
-
-def _target_action(context):
-    """Return the active shape-key action of the dialog's target mesh."""
-    settings = bls_export_ui._get_export_settings(context)
-    target = settings.target if settings is not None else None
-
-    if target is not None and target.type == "MESH" and target.data is not None:
-        keys = target.data.shape_keys
-
-        if keys is not None and keys.animation_data is not None:
-            return keys.animation_data.action
-
-    return None
-
-
-def _loop_mode_name(action):
-    """Loop mode stored on *action*, or Once for a fresh animation."""
-    if action is None:
-        return "ONCE"
-
-    try:
-        mode = int(action.get("bmd_loop_mode", anim.LOOP_ONCE))
-    except (TypeError, ValueError):
-        return "ONCE"
-
-    if 0 <= mode < len(anim.LOOP_NAMES):
-        return anim.LOOP_NAMES[mode]
-
-    return "ONCE"
-
-
-def _sync_frame_range(operator, context):
-    """Fill Start/End Frame from the selected frame-range variant."""
-    if operator.frame_source == "SCENE":
-        operator.custom_start = context.scene.frame_start
-        operator.custom_end = context.scene.frame_end
-    elif operator.frame_source == "ACTION":
-        action = _target_action(context)
-
-        if action is None:
-            operator.custom_start = context.scene.frame_start
-            operator.custom_end = context.scene.frame_end
-        else:
-            start, end = action.frame_range
-            operator.custom_start = int(math.floor(start))
-            operator.custom_end = int(math.ceil(end))
-
-
-def _frame_source_changed(operator, context):
-    _sync_frame_range(operator, context)
-
-
-_TARGET_MISSING = object()
-
-
-def _sync_target_settings(operator, context):
-    """Refresh loop mode and range fields when the dialog target changes."""
-    settings = bls_export_ui._get_export_settings(context)
-    target = settings.target if settings is not None else None
-
-    if getattr(operator, "_target_cache", _TARGET_MISSING) is target:
-        return
-
-    operator._target_cache = target
-    operator.loop_mode = _loop_mode_name(_target_action(context))
-
-    if operator.frame_source == "ACTION":
-        _sync_frame_range(operator, context)
-
-
-class BMD_SK_OT_blk_export_settings(Operator):
-    bl_idname = "bmd_shape_keys.blk_export_settings"
-    bl_label = "Export BLK"
-    bl_description = "Choose which shape-key animations to write"
-    bl_options = {"REGISTER", "UNDO"}
-
-    loop_mode: EnumProperty(name="Loop Mode", items=BLK_LOOP_ITEMS,
-                            default="ONCE")
-    frame_source: EnumProperty(
-        name="Frame Range",
-        items=[("ACTION", "Action Range",
-                "Frame range of the shape-key action"),
-               ("SCENE", "Scene Range", "Scene start / end frame"),
-               ("CUSTOM", "Custom Range",
-                "Use the Start Frame and End Frame fields")],
-        default="ACTION",
-        update=_frame_source_changed)
-    custom_start: IntProperty(name="Start Frame", default=0)
-    custom_end: IntProperty(name="End Frame", default=0)
-
-    def invoke(self, context, _event):
-        settings = bls_export_ui._get_export_settings(context)
-
-        if settings is None or not settings.blk_filepath:
-            self.report({"ERROR"}, "Select an export file first")
-            return {"CANCELLED"}
-
-        settings.show_base = False
-        bls_export_ui._populate_export_keys(settings, settings.target)
-
-        self.frame_source = "ACTION"
-        _sync_target_settings(self, context)
-
-        return context.window_manager.invoke_props_dialog(
-            self, width=620, confirm_text="Export")
-
-    def draw(self, context):
-        layout = self.layout
-        settings = bls_export_ui._get_export_settings(context)
-
-        if settings is None:
-            layout.label(text="BLK export settings are unavailable", icon="ERROR")
-            return
-
-        _sync_target_settings(self, context)
-
-        box = layout.box()
-        box.label(text=f"File: {os.path.basename(settings.blk_filepath)}", icon="FILE")
-        row = box.row()
-        row.alert = settings.target is None
-        row.prop(settings, "target")
-        box.prop(self, "loop_mode")
-        box.prop(self, "frame_source")
-        range_row = box.row(align=True)
-        range_row.enabled = self.frame_source == "CUSTOM"
-        range_row.prop(self, "custom_start")
-        range_row.prop(self, "custom_end")
-
-        if (self.frame_source == "CUSTOM"
-                and self.custom_end < self.custom_start):
-            layout.label(text="End Frame must not be before Start Frame",
-                         icon="ERROR")
-
-        if settings.target is None:
-            layout.label(text="Select a target mesh", icon="INFO")
-            return
-
-        if not settings.keys:
-            layout.label(text="No shape keys found", icon="ERROR")
-            return
-
-        if not _has_shape_key_tracks(_target_action(context)):
-            layout.label(text="No shape-key animation tracks found", icon="ERROR")
-            return
-
-        visible = len(settings.tree_rows) if settings.expanded else 1
-        rows = min(max(1, visible), bls_export_ui.MAX_EXPORT_ROWS)
-        layout.template_list(
-            "BMD_SK_UL_export_tree", "",
-            settings, "tree_rows",
-            settings, "active_tree_row",
-            rows=rows,
-            maxrows=bls_export_ui.MAX_EXPORT_ROWS,
-        )
-        layout.label(
-            text="Selected shape keys must match the BLS keys",
-            icon="INFO",
-        )
-
-        if not any(item.include for item in settings.keys):
-            layout.label(text="Select at least one shape key to export",
-                         icon="ERROR")
-
-    def execute(self, context):
-        settings = bls_export_ui._get_export_settings(context)
-
-        if settings is None or settings.target is None or not settings.blk_filepath:
-            self.report({"ERROR"}, "BLK export settings are incomplete")
-            return {"CANCELLED"}
-
-        names = [item.name for item in settings.keys if item.include]
-
-        if not names:
-            self.report({"WARNING"}, "No shape keys selected for export")
-            return {"CANCELLED"}
-
-        if not _has_shape_key_tracks(_target_action(context)):
-            self.report({"WARNING"}, "No shape-key animation tracks found")
-            return {"CANCELLED"}
-
-        custom_range = ((self.custom_start, self.custom_end)
-                        if self.frame_source == "CUSTOM" else None)
-
-        try:
-            export_blk(context, settings.blk_filepath, names,
-                       self.loop_mode, self.frame_source, self.report,
-                       target=settings.target, custom_range=custom_range)
-        except (BlkExportError, J3DError) as exc:
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-        except Exception as exc:  # e.g. file-system errors
-            self.report({"ERROR"}, f"Export failed: {exc}")
-            return {"CANCELLED"}
-
-        return {"FINISHED"}
-
-
-CLASSES = (BMD_SK_OT_blk_export_settings,)

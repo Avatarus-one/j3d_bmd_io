@@ -4,7 +4,6 @@ Includes BMD/BDL models, BCK animations, BLS shape keys and KCL collision.
 """
 
 import json
-import math
 import os
 
 import bpy
@@ -28,55 +27,6 @@ _BTI_STATUS = {
 }
 
 MAX_BTI_TREE_ROWS = 12
-
-
-def blender_anim_items():
-    from .blender_anim import LOOP_ITEMS
-    return [item for item in LOOP_ITEMS if item[0] != "AUTO"]
-
-
-def _bck_action(context):
-    from . import blender_anim
-    try:
-        arm = blender_anim.find_armature(context)
-    except blender_anim.AnimError:
-        return None
-    ad = arm.animation_data
-    return ad.action if ad else None
-
-
-def _bck_loop_mode(context):
-    from . import blender_anim
-    from .j3d import anim
-    action = _bck_action(context)
-    if action is None:
-        return "ONCE"
-    try:
-        mode = int(action.get("bmd_loop_mode", anim.LOOP_ONCE))
-    except (TypeError, ValueError):
-        return "ONCE"
-    if 0 <= mode < len(anim.LOOP_NAMES):
-        return anim.LOOP_NAMES[mode]
-    return "ONCE"
-
-
-def _bck_sync_frame_range(operator, context):
-    if operator.frame_source == "SCENE":
-        operator.custom_start = context.scene.frame_start
-        operator.custom_end = context.scene.frame_end
-    elif operator.frame_source == "ACTION":
-        action = _bck_action(context)
-        if action is None:
-            operator.custom_start = context.scene.frame_start
-            operator.custom_end = context.scene.frame_end
-        else:
-            start, end = action.frame_range
-            operator.custom_start = int(math.floor(start))
-            operator.custom_end = int(math.ceil(end))
-
-
-def _bck_frame_source_changed(operator, context):
-    _bck_sync_frame_range(operator, context)
 
 
 @bpy.app.handlers.persistent
@@ -178,8 +128,9 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
 
         for p in paths:
             try:
-                blender_import.import_bmd(context, p, scale, self.bone_axis,
-                                          self.import_textures, report=self.report)
+                blender_import.import_bmd(
+                    context, p, scale, self.bone_axis,
+                    self.import_textures, report=self.report)
             except J3DError as exc:
                 self.report({"ERROR"}, f"{os.path.basename(p)}: {exc}")
                 return {"CANCELLED"}
@@ -956,43 +907,24 @@ class IMPORT_OT_bck(Operator, ImportHelper):
     files: CollectionProperty(type=OperatorFileListElement, options={"HIDDEN", "SKIP_SAVE"})
     directory: StringProperty(subtype="DIR_PATH", options={"HIDDEN"})
 
-    convert_units: BoolProperty(
-        name="Convert Units", default=True,
-        description="Convert J3D units to Blender units (scale 0.01)")
-    set_scene_range: BoolProperty(name="Set Scene Range", default=True,
-                                  description="Set the scene frame range to the animation length")
-    set_fps: BoolProperty(
-        name="Set 30 FPS", default=True,
-        description="Set the scene frame rate to the game's 30 fps without moving keyframes")
-
-    def invoke(self, context, event):
-        self.convert_units = bc.saved_convert_units(context)
-        result = ImportHelper.invoke(self, context, event)
-        self.convert_units = bc.saved_convert_units(context)
-        return result
-
-    def draw(self, context):
-        layout = self.layout
-        layout.use_property_split = True
-        layout.prop(self, "convert_units")
-        layout.prop(self, "set_scene_range")
-        layout.prop(self, "set_fps")
-
     def execute(self, context):
-        from . import blender_anim
-        from .j3d.common import J3DError
-        scale = 0.01 if self.convert_units else 1.0
-        paths = [os.path.join(self.directory, f.name) for f in self.files] if self.files else []
+        from . import bck_import_ui
+
+        paths = []
+
+        if self.files:
+            directory = self.directory or os.path.dirname(self.filepath)
+            for element in self.files:
+                if element.name:
+                    paths.append(os.path.join(directory, element.name))
+        elif self.filepath:
+            paths.append(self.filepath)
+
         if not paths:
-            paths = [self.filepath]
-        for p in paths:
-            try:
-                blender_anim.import_bck(context, p, scale, self.set_scene_range,
-                                        self.report, set_fps=self.set_fps)
-            except (blender_anim.AnimError, J3DError) as exc:
-                self.report({"ERROR"}, f"{os.path.basename(p)}: {exc}")
-                return {"CANCELLED"}
-        return {"FINISHED"}
+            self.report({"ERROR"}, "No BCK files selected")
+            return {"CANCELLED"}
+
+        return bck_import_ui.begin_import(context, paths, self)
 
 
 class EXPORT_OT_bck(Operator, ExportHelper):
@@ -1004,39 +936,17 @@ class EXPORT_OT_bck(Operator, ExportHelper):
     filename_ext = ".bck"
     filter_glob: StringProperty(default="*.bck", options={"HIDDEN"})
 
-    convert_units: BoolProperty(
-        name="Convert Units", default=True,
-        description="Convert Blender units to J3D units (scale 100)")
-    loop_mode: EnumProperty(name="Loop Mode", items=blender_anim_items(), default="ONCE")
-    frame_source: EnumProperty(
-        name="Frame Range",
-        items=[("ACTION", "Action Range", "Frame range of the keyframes in the action"),
-               ("SCENE", "Scene Range", "Scene start / end frame"),
-               ("CUSTOM", "Custom Range", "Use the Start Frame and End Frame fields")],
-        default="ACTION",
-        update=_bck_frame_source_changed)
-    custom_start: IntProperty(name="Start Frame", default=0)
-    custom_end: IntProperty(name="End Frame", default=0)
-
-    @classmethod
-    def poll(cls, context):
-        from . import blender_anim
-        try:
-            arm = blender_anim.find_armature(context)
-        except blender_anim.AnimError:
-            return False
-        return (arm.animation_data is not None
-                and arm.animation_data.action is not None)
-
     def invoke(self, context, event):
-        self.convert_units = bc.saved_convert_units(context)
-        from . import blender_anim
+        from . import bck_common
+
         try:
-            arm = blender_anim.find_armature(context)
-        except blender_anim.AnimError:
+            arm = bck_common.find_armature(context)
+        except bck_common.AnimError:
             arm = None
+
         action = arm.animation_data.action if arm and arm.animation_data else None
         last = bc.last_export_path(action, "bck")
+
         if action is not None:
             self.filepath = bpy.path.ensure_ext(action.name, self.filename_ext)
         elif last:
@@ -1048,43 +958,21 @@ class EXPORT_OT_bck(Operator, ExportHelper):
         else:
             self.filepath = bpy.path.ensure_ext("animation", self.filename_ext)
 
-        result = ExportHelper.invoke(self, context, event)
-        self.convert_units = bc.saved_convert_units(context)
-        self.loop_mode = _bck_loop_mode(context)
-        if self.frame_source != "CUSTOM":
-            _bck_sync_frame_range(self, context)
-        return result
-
-    def draw(self, context):
-        layout = self.layout
-        layout.use_property_split = True
-        layout.prop(self, "convert_units")
-        layout.prop(self, "loop_mode")
-        layout.prop(self, "frame_source")
-        start_row = layout.row()
-        start_row.enabled = self.frame_source == "CUSTOM"
-        start_row.prop(self, "custom_start")
-        end_row = layout.row()
-        end_row.enabled = self.frame_source == "CUSTOM"
-        end_row.prop(self, "custom_end")
-        if (self.frame_source == "CUSTOM"
-                and self.custom_end < self.custom_start):
-            layout.label(text="End Frame must not be before Start Frame",
-                         icon="ERROR")
+        return ExportHelper.invoke(self, context, event)
 
     def execute(self, context):
-        from . import blender_anim
-        from .j3d.common import J3DError
-        scale = 100.0 if self.convert_units else 1.0
-        custom_range = ((self.custom_start, self.custom_end)
-                        if self.frame_source == "CUSTOM" else None)
+        from . import bck_export_ui, bck_common
+
+        settings = context.scene.bmd_bck_export_settings
+        settings.filepath = self.filepath
+
         try:
-            blender_anim.export_bck(context, self.filepath, scale,
-                                    self.loop_mode, self.frame_source, self.report,
-                                    custom_range=custom_range)
-        except (blender_anim.AnimError, J3DError) as exc:
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
+            settings.target = bck_common.find_armature(context)
+        except bck_common.AnimError:
+            settings.target = None
+
+        bpy.app.timers.register(
+            bck_export_ui.open_export_dialog, first_interval=0.05)
         return {"FINISHED"}
 
 
@@ -1111,13 +999,13 @@ class IMPORT_OT_blk(Operator, ImportHelper):
         return ImportHelper.invoke(self, context, event)
 
     def execute(self, context):
-        from . import blk_import
+        from . import blk_import_ui
 
         if not self.filepath:
             self.report({"ERROR"}, "No BLK file selected")
             return {"CANCELLED"}
 
-        return blk_import.begin_import(context, self.filepath, self)
+        return blk_import_ui.begin_import(context, self.filepath, self)
 
 
 class EXPORT_OT_blk(Operator, ExportHelper):
@@ -1147,7 +1035,7 @@ class EXPORT_OT_blk(Operator, ExportHelper):
         return ExportHelper.invoke(self, context, event)
 
     def execute(self, context):
-        from . import blk_export, bls_export_ui
+        from . import blk_export_ui, bls_export_ui
 
         if not self.filepath:
             self.report({"ERROR"}, "No BLK file selected")
@@ -1168,7 +1056,7 @@ class EXPORT_OT_blk(Operator, ExportHelper):
         settings.show_base = False
         bls_export_ui._populate_export_keys(settings, settings.target)
 
-        bpy.app.timers.register(blk_export.open_export_dialog,
+        bpy.app.timers.register(blk_export_ui.open_export_dialog,
                                 first_interval=0.05)
         return {"FINISHED"}
 
@@ -1315,16 +1203,11 @@ class BMD_PT_j3d(Panel):
             (EXPORT_OT_bck.bl_idname, "Export Animation", "EXPORT"),
         ))
 
-        from . import bls_import_ui
-        bls_items = [
+        _draw_format_box(layout, "Shape Keys (.bls)", (
             ("bmd_shape_keys.import_files", "Import Shape Keys", "IMPORT"),
             ("bmd_shape_keys.import_folder", "Import Shape Keys (Folder)", "IMPORT"),
             ("bmd_shape_keys.export_files", "Export Shape Keys", "EXPORT"),
-        ]
-        if bls_import_ui.has_pending_import():
-            bls_items.append(
-                ("bmd_shape_keys.settings", "Import Settings", "PREFERENCES"))
-        _draw_format_box(layout, "Shape Keys (.bls)", bls_items)
+        ))
 
         _draw_format_box(layout, "Shape Key Animation (.blk)", (
             (IMPORT_OT_blk.bl_idname, "Import Animation", "IMPORT"),
@@ -2085,21 +1968,33 @@ def register():
     except Exception:
         pass
 
-    from . import blk_export, blk_import, bls_import_ui, bls_export_ui
+    from . import (bck_export_ui, bck_import_ui, blk_export_ui,
+                   blk_import_ui, bls_import_ui, bls_export_ui)
+    for c in bck_export_ui.CLASSES:
+        bpy.utils.register_class(c)
+    for c in bck_import_ui.CLASSES:
+        bpy.utils.register_class(c)
     for c in bls_import_ui.CLASSES:
         bpy.utils.register_class(c)
     for c in bls_export_ui.CLASSES:
         bpy.utils.register_class(c)
-    for c in blk_import.CLASSES:
+    for c in blk_import_ui.CLASSES:
         bpy.utils.register_class(c)
-    for c in blk_export.CLASSES:
+    for c in blk_export_ui.CLASSES:
         bpy.utils.register_class(c)
+    blk_export_ui.register_hooks()
     bpy.types.Scene.bmd_shape_keys_settings = PointerProperty(
         type=bls_import_ui.BMD_SK_Settings)
+    bpy.types.Scene.bmd_bck_import_settings = PointerProperty(
+        type=bck_import_ui.BMD_ANIM_BckImportSettings)
+    bpy.types.Scene.bmd_bck_export_settings = PointerProperty(
+        type=bck_export_ui.BMD_ANIM_BCKExportSettings)
     bpy.types.Scene.bmd_shape_keys_export_settings = PointerProperty(
         type=bls_export_ui.BMD_SK_ExportSettings)
     bpy.types.Scene.bmd_blk_import_settings = PointerProperty(
-        type=blk_import.BMD_SK_BlkImportSettings)
+        type=blk_import_ui.BMD_SK_BlkImportSettings)
+    bpy.types.Scene.bmd_blk_export_settings = PointerProperty(
+        type=blk_export_ui.BMD_SK_BlkExportSettings)
     bpy.types.Scene.bmd_shape_keys_last_info = StringProperty(
         name="Last BLS import", default="")
 
@@ -2131,18 +2026,30 @@ def unregister():
         bpy.utils.unregister_class(fh)
     _file_handlers = []
 
-    from . import blk_export, blk_import, bls_import_ui, bls_export_ui
+    from . import (bck_export_ui, bck_import_ui, blk_export_ui,
+                   blk_import_ui, bls_import_ui, bls_export_ui)
     if hasattr(bpy.types.Scene, "bmd_shape_keys_last_info"):
         del bpy.types.Scene.bmd_shape_keys_last_info
     if hasattr(bpy.types.Scene, "bmd_blk_import_settings"):
         del bpy.types.Scene.bmd_blk_import_settings
+    if hasattr(bpy.types.Scene, "bmd_blk_export_settings"):
+        del bpy.types.Scene.bmd_blk_export_settings
+    if hasattr(bpy.types.Scene, "bmd_bck_export_settings"):
+        del bpy.types.Scene.bmd_bck_export_settings
+    if hasattr(bpy.types.Scene, "bmd_bck_import_settings"):
+        del bpy.types.Scene.bmd_bck_import_settings
     if hasattr(bpy.types.Scene, "bmd_shape_keys_export_settings"):
         del bpy.types.Scene.bmd_shape_keys_export_settings
     if hasattr(bpy.types.Scene, "bmd_shape_keys_settings"):
         del bpy.types.Scene.bmd_shape_keys_settings
-    for c in reversed(blk_export.CLASSES):
+    for c in reversed(bck_export_ui.CLASSES):
         bpy.utils.unregister_class(c)
-    for c in reversed(blk_import.CLASSES):
+    for c in reversed(bck_import_ui.CLASSES):
+        bpy.utils.unregister_class(c)
+    blk_export_ui.unregister_hooks()
+    for c in reversed(blk_export_ui.CLASSES):
+        bpy.utils.unregister_class(c)
+    for c in reversed(blk_import_ui.CLASSES):
         bpy.utils.unregister_class(c)
     for c in reversed(bls_export_ui.CLASSES):
         bpy.utils.unregister_class(c)

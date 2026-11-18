@@ -216,8 +216,7 @@ pixels).
 2. Select the target mesh, then `File > Import > J3D Shape Keys (.bls)` or
    `J3D Shape Keys from Folder (.bls)`. The same commands are in the `J3D`
    sidebar, **Import / Export** panel, under **Shape Keys (.bls)**.
-3. In the dialog choose the target mesh, open each file, uncheck or rename keys
-   as needed, and press OK.
+3. In the dialog choose the target mesh, review the keys and press OK.
 
 Keys are imported as BLS position deltas relative to the BLS base key, rotated
 from J3D Y-up to Blender Z-up and added to the target mesh's Basis coordinates.
@@ -276,28 +275,39 @@ Requirements and limits:
 
 **Import**: select the mesh with shape keys and use `File > Import > J3D Shape
 Key Animation (.blk)` or the **Shape Key Animation (.blk)** box in the `J3D`
-sidebar. After choosing a file, a dialog lists the BLK tracks; tracks are
-auto-assigned in the current shape-key order.
+sidebar. The dialog shows the animation, the target mesh, and a BLS file field.
+The BLS path is stored per mesh. Tracks are named from the BLS keys; without a
+usable BLS they are assigned in shape-key order. Missing BLS keys are imported
+on confirm (duplicate and conflicting keys are skipped).
 
 **Export**: select the mesh with the shape-key action, then
 `File > Export > J3D Shape Key Animation (.blk)`.
-Only checked keys are exported, in the current shape-key order, so the tracks
-match the keys written by the BLS export dialog. An `orig` track is always
-prepended; its weights are recalculated as `1 - sum(other selected weights)`.
+After choosing the file, the dialog shows the target mesh and the animation that
+will be exported above the shape-key list. The key selection is shared by all
+animations of the same mesh. Only checked keys are exported, in the current
+shape-key order, so the tracks match the keys written by the BLS export dialog.
+An `orig` track is always prepended; its weights are recalculated as
+`1 - sum(other selected weights)`.
 
 ## Animations (.bck)
-**Import**: select the imported armature, then File -> Import -> *J3D Animation (.bck)*. A new action
-is created (named after the file, with a fake user). The BCK curves are fitted with sparse Bezier
-keys. Frame `n` of the file is Blender frame `n`; the scene range can be set to the animation
-length. **Set 30 FPS** sets the scene rate to the game's 30 fps. The loop mode and clip duration are
-stored on the action (`bmd_loop_mode`, `bmd_duration`).
+**Import**: select the imported armature (or its mesh), then File -> Import -> *J3D Animation (.bck)*.
+The dialog shows the target and a list of animations; a compatible armature in the scene is selected
+automatically. Compatibility uses the original joint count stored at BMD import, so bones added or
+removed later do not make the model incompatible; a custom armature uses its current bone count.
+An animation may contain fewer joints than the model — the remaining joints stay at rest — while an
+animation with more joints than the model is rejected. Each animation creates a new action (named
+after the file, with a fake user). The BCK curves are fitted with sparse Bezier keys. Frame `n` of the
+file is Blender frame `n`; the scene range is always set to the animation length and the scene rate to
+the game's 30 fps. The loop mode and clip duration are stored on the action (`bmd_loop_mode`,
+`bmd_duration`).
 
-**Export**: make the armature active, assign the action, then File -> Export -> *J3D Animation (.bck)*.
-Every frame is sampled, converted back to joint-local scale / rotation / translation, and fitted
-with cubic Hermite curves using as few keys as the tolerances allow (rotation 2e-4 rad, translation
-0.01 units, scale 1e-4). Options: Loop Mode, Action / Scene / Custom frame range, and the **Convert
-Units** setting. The evaluated pose is sampled, so constraints, IK and drivers are baked. LOOP
-(repeat) clips use cyclic tangents across the loop seam.
+**Export**: select the armature with its action, then File -> Export -> *J3D Animation (.bck)*.
+After choosing the file, the dialog shows the armature and its animations, together with Loop Mode,
+Action / Scene / Custom frame range, and the **Convert Units** setting. Every frame is sampled,
+converted back to joint-local scale / rotation / translation, and fitted with cubic Hermite curves
+using as few keys as the tolerances allow (rotation 2e-4 rad, translation 0.01 units, scale 1e-4).
+The evaluated pose is sampled, so constraints, IK and drivers are baked. LOOP (repeat) clips use
+cyclic tangents across the loop seam.
 
 **Frame range**: *Action Range* uses the action's keyframe range (a completely static imported clip
 keeps its stored `bmd_duration` instead of collapsing to one frame). *Scene Range* samples the scene

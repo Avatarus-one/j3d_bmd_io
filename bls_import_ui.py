@@ -6,6 +6,7 @@ import os
 import textwrap
 
 import bpy
+import numpy as np
 from bpy.props import (
     BoolProperty,
     CollectionProperty,
@@ -46,11 +47,8 @@ _SYNCING = False
 _DRAW_COLLIDING_NAMES = {}
 _DRAW_COLLIDING_FILES = frozenset()
 
-# Number of file rows visible at once; the scroll slider moves the window.
-VISIBLE_FILES = 10
-
-# Number of key rows visible at once inside a file.
-VISIBLE_KEYS = 10
+# Number of rows visible in the file/key tree at once.
+MAX_TREE_ROWS = 10
 
 _STATUS_LABELS = {
     bls_session.UNIQUE: 'OK',
@@ -78,6 +76,14 @@ def _get_settings(context=None):
 
 
 CONVERTED_DELTA_SCALE = 0.01
+
+# Base-key mesh matching.  A handful of vertices is enough to identify the
+# model, and the tolerance is expressed in J3D units so it scales with the
+# imported mesh (0.01 by default).
+MATCH_MAX_VERTICES = 50
+MATCH_TOLERANCE = 2.0
+MATCH_MIN_VERTICES = 5
+MATCH_MIN_RATIO = 0.1
 
 
 def _delta_scale(settings):
@@ -125,6 +131,130 @@ def _target_vertex_count(target):
         return None
 
     return len(target.data.vertices)
+
+
+def _session_base_slots(session):
+    """Return the base-key slots with the most entries in the session."""
+    best = []
+
+    for file_entry in session.files:
+        for key_entry in file_entry.keys:
+            if (key_entry.is_base and
+                    len(key_entry.record.slots) > len(best)):
+                best = key_entry.record.slots
+
+    return best
+
+
+def _mesh_base_match(context, mesh, slots):
+    """Return ``(ratio, average_distance, scale)`` for a mesh, or None.
+
+    Up to :data:`MATCH_MAX_VERTICES` base-key vertices are compared in the
+    mesh's local space.  Both unit conventions are tried because a from-scratch
+    mesh has no stored ``bmd_scale``.
+    """
+    if mesh is None or mesh.type != 'MESH' or mesh.data is None:
+        return None
+
+    vertices = mesh.data.vertices
+    usable = [slot for slot in slots if 0 <= slot.vertex < len(vertices)]
+
+    if len(usable) < MATCH_MIN_VERTICES:
+        return None
+
+    step = max(1, len(usable) // MATCH_MAX_VERTICES)
+    sample = usable[::step][:MATCH_MAX_VERTICES]
+
+    if len(sample) < MATCH_MIN_VERTICES:
+        return None
+
+    source = np.array(
+        [slot.base_position for slot in sample], dtype=np.float64)
+    actual = np.array(
+        [vertices[slot.vertex].co[:] for slot in sample], dtype=np.float64)
+
+    saved = bc.saved_convert_units(context, mesh)
+    scales = (0.01, 1.0) if saved else (1.0, 0.01)
+    best = None
+
+    for scale in scales:
+        expected = bc.point_to_blender(source, scale)
+        distances = np.linalg.norm(expected - actual, axis=1)
+        matches = int(np.count_nonzero(
+            distances <= MATCH_TOLERANCE * scale))
+        ratio = matches / len(sample)
+        score = (ratio, -float(distances.mean()))
+
+        if best is None or score > best[0]:
+            best = (score, ratio, float(distances.mean()), scale, matches)
+
+    _score, ratio, average, scale, matches = best
+
+    if matches < MATCH_MIN_VERTICES or ratio < MATCH_MIN_RATIO:
+        return None
+
+    return ratio, average, scale
+
+
+def _find_mesh_by_base_key(context, session, current=None):
+    """Return ``(mesh, scale)`` that best matches the BLS base key.
+
+    A mesh selected by the user wins when it matches the base key, even if
+    duplicate meshes in the scene produce a marginally better score.  Without
+    a usable selection the previous target and then the rest of the scene are
+    checked.
+    """
+    slots = _session_base_slots(session)
+
+    if not slots:
+        return None
+
+    selected = context.active_object
+
+    if selected is None or selected.type != 'MESH':
+        selected = next(
+            (obj for obj in context.selected_objects if obj.type == 'MESH'),
+            None,
+        )
+
+    if selected is not None:
+        try:
+            result = _mesh_base_match(context, selected, slots)
+        except Exception:
+            result = None
+
+        if result is not None:
+            return selected, result[2]
+
+    candidates = []
+
+    if current is not None and current.type == 'MESH':
+        candidates.append(current)
+
+    for obj in context.scene.objects:
+        if obj.type == 'MESH' and obj not in candidates:
+            candidates.append(obj)
+
+    best = None
+    best_score = None
+
+    for mesh in candidates:
+        try:
+            result = _mesh_base_match(context, mesh, slots)
+        except Exception:
+            result = None
+
+        if result is None:
+            continue
+
+        ratio, average, scale = result
+        score = (ratio, -average)
+
+        if best_score is None or score > best_score:
+            best = (mesh, scale)
+            best_score = score
+
+    return best
 
 
 def _redraw(context):
@@ -217,6 +347,9 @@ def _apply_session_to_settings(settings, session):
         _SYNCING = False
 
     _refresh_file_includes(settings)
+
+    if not settings.tree_rows:
+        _rebuild_tree(settings)
 
 
 def _colliding_names(settings):
@@ -388,6 +521,11 @@ class BMD_SK_FileItem(PropertyGroup):
     label: StringProperty()
     summary: StringProperty()
     error: StringProperty()
+    expanded: BoolProperty(
+        name='Expanded',
+        description='Show the keys stored in this file',
+        default=True,
+    )
     include: BoolProperty(
         name='Include file',
         description='Include all selectable keys from this file',
@@ -416,6 +554,14 @@ class BMD_SK_KeyItem(PropertyGroup):
     normal_count: IntProperty()
 
 
+class BMD_SK_TreeRow(PropertyGroup):
+    """One row of the file/key tree in the import dialog."""
+
+    kind: StringProperty()
+    file_index: IntProperty()
+    key_index: IntProperty()
+
+
 class BMD_SK_Settings(PropertyGroup):
     target: PointerProperty(
         name='Target Mesh',
@@ -426,14 +572,13 @@ class BMD_SK_Settings(PropertyGroup):
     )
     files: CollectionProperty(type=BMD_SK_FileItem)
     keys: CollectionProperty(type=BMD_SK_KeyItem)
+    tree_rows: CollectionProperty(type=BMD_SK_TreeRow)
 
-    # Navigation state of the settings dialog.
-    view_file: IntProperty(default=-1)
+    # Index of the key whose details are shown below the tree.
     detail_key_index: IntProperty(default=-1)
 
     # UIList selection state.
-    active_file: IntProperty(default=-1)
-    active_key: IntProperty(default=-1)
+    active_tree_row: IntProperty(default=0, min=0)
 
     convert_units: BoolProperty(
         name='Convert Units',
@@ -448,6 +593,27 @@ class BMD_SK_Settings(PropertyGroup):
 # Session -> properties
 # ---------------------------------------------------------------------------
 
+def _rebuild_tree(settings):
+    """Rebuild the flat file/key row list used by the dialog's UIList."""
+    settings.tree_rows.clear()
+
+    for file_index, _file_item in enumerate(settings.files):
+        file_row = settings.tree_rows.add()
+        file_row.kind = 'file'
+        file_row.file_index = file_index
+
+        for key_item in settings.keys:
+            if key_item.file_index != file_index or key_item.is_original:
+                continue
+
+            key_row = settings.tree_rows.add()
+            key_row.kind = 'key'
+            key_row.file_index = file_index
+            key_row.key_index = key_item.global_index
+
+    settings.active_tree_row = 0
+
+
 def _populate_settings(_context, settings, session):
     global _SYNCING
 
@@ -456,10 +622,9 @@ def _populate_settings(_context, settings, session):
     try:
         settings.files.clear()
         settings.keys.clear()
-        settings.view_file = -1
+        settings.tree_rows.clear()
         settings.detail_key_index = -1
-        settings.active_file = -1
-        settings.active_key = -1
+        settings.active_tree_row = 0
 
         for file_index, file_entry in enumerate(session.files):
             file_item = settings.files.add()
@@ -468,6 +633,9 @@ def _populate_settings(_context, settings, session):
             file_item.label = file_entry.display_name
             file_item.summary = file_entry.summary
             file_item.error = file_entry.error
+            # A single file is expanded for review; folders with several
+            # files start collapsed so the list stays compact.
+            file_item.expanded = len(session.files) == 1
 
             for key_index, key_entry in enumerate(file_entry.keys):
                 key_item = settings.keys.add()
@@ -490,6 +658,7 @@ def _populate_settings(_context, settings, session):
         _SYNCING = False
 
     _refresh_file_includes(settings)
+    _rebuild_tree(settings)
 
 
 def _counts(settings):
@@ -540,54 +709,6 @@ def _file_has_selectable(settings, file_index):
 # ---------------------------------------------------------------------------
 # Small operators
 # ---------------------------------------------------------------------------
-
-class BMD_SK_OT_open_file(Operator):
-    bl_idname = 'bmd_shape_keys.open_file'
-    bl_label = 'Show file keys'
-    bl_description = 'Show the keys stored in this file'
-    bl_options = {'INTERNAL'}
-
-    file_index: IntProperty()
-
-    @classmethod
-    def description(cls, context, properties):
-        """Tooltip shows the same local path as the file list."""
-        settings = _get_settings(context)
-        index = properties.file_index
-
-        if settings is not None and 0 <= index < len(settings.files):
-            return (
-                f'{settings.files[index].label}\n'
-                f'Show the keys stored in this file'
-            )
-
-        return cls.bl_description
-
-    def execute(self, context):
-        settings = context.scene.bmd_shape_keys_settings
-
-        if 0 <= self.file_index < len(settings.files):
-            settings.view_file = self.file_index
-            settings.detail_key_index = -1
-            settings.active_key = -1
-
-        return {'FINISHED'}
-
-
-class BMD_SK_OT_back_files(Operator):
-    bl_idname = 'bmd_shape_keys.back_files'
-    bl_label = 'Back to file list'
-    bl_description = 'Return to the list of files'
-    bl_options = {'INTERNAL'}
-
-    def execute(self, context):
-        settings = context.scene.bmd_shape_keys_settings
-        settings.view_file = -1
-        settings.detail_key_index = -1
-        settings.active_file = -1
-        settings.active_key = -1
-        return {'FINISHED'}
-
 
 class BMD_SK_OT_key_details(Operator):
     bl_idname = 'bmd_shape_keys.key_details'
@@ -640,7 +761,7 @@ def _open_settings_dialog():
 
 
 def _begin_import(context, paths, operator):
-    global _SESSION
+    global _SESSION, _SYNCING
 
     scene = context.scene
     settings = scene.bmd_shape_keys_settings
@@ -680,6 +801,35 @@ def _begin_import(context, paths, operator):
     if not session.files:
         operator.report({'ERROR'}, 'No .bls files found')
         return {'CANCELLED'}
+
+    # Match the BLS base key against the scene meshes.  A few sampled vertices
+    # are enough to pick the right model even when the target field was left on
+    # another object.
+    try:
+        matched = _find_mesh_by_base_key(context, session, settings.target)
+    except Exception:
+        matched = None
+
+    if matched is not None:
+        mesh, match_scale = matched
+        convert_units = match_scale == 0.01
+
+        if (mesh is not settings.target or
+                convert_units != settings.convert_units):
+            _SYNCING = True
+
+            try:
+                settings.target = mesh
+                settings.convert_units = convert_units
+            finally:
+                _SYNCING = False
+
+            bls_session.reanalyse(
+                session,
+                _existing_keys(mesh),
+                _target_vertex_count(mesh),
+                delta_scale=_delta_scale(settings),
+            )
 
     _SESSION = session
     _populate_settings(context, settings, session)
@@ -803,15 +953,13 @@ def _draw_summary(layout, settings):
                 stat_row.label(text=text)
 
 
-def _draw_key_details(layout, settings, file_index):
+def _draw_key_details(layout, settings):
     index = settings.detail_key_index
 
     if not (0 <= index < len(settings.keys)):
         return
 
     key_item = settings.keys[index]
-    if key_item.file_index != file_index:
-        return
 
     box = layout.box()
     box.label(
@@ -833,214 +981,171 @@ def _draw_key_details(layout, settings, file_index):
     _wrap_label(box, meta)
 
 
-class BMD_SK_UL_files(UIList):
-    """File list for the settings dialog."""
+def _draw_key_row(layout, settings, key_item):
+    key_index = key_item.global_index
 
-    bl_idname = 'BMD_SK_UL_files'
+    selectable = key_item.status in _SELECTABLE
+    final_name = key_item.new_name.strip() or key_item.name
+    is_collision = (
+        selectable and
+        key_item.include and
+        final_name.casefold() in _DRAW_COLLIDING_NAMES
+    )
 
-    def draw_item(self, context, layout, data, item, icon, active_data,
-                  active_propname, index, flt_flag):
-        settings = data
-        file_index = item.file_index
+    row = layout.row(align=True)
+    row.alert = is_collision
 
-        row = layout.row(align=True)
-        row.alert = bool(item.error) or file_index in _DRAW_COLLIDING_FILES
+    # Indent the keys under their file, like the BLS export tree.
+    row.label(text='', icon='BLANK1')
 
-        check = row.row(align=True)
-        check.enabled = (
-            not item.error and
-            _file_has_selectable(settings, file_index)
-        )
-        check.prop(item, 'include', text='')
+    check = row.row(align=True)
+    check.active = selectable
+    check.enabled = selectable
+    check.prop(key_item, 'include', text='')
 
-        split = row.split(factor=0.62, align=True)
+    # The original name is a plain-looking button so clicking it shows
+    # the key details, just like clicking its status.
+    split = row.split(factor=0.4, align=True)
 
-        name_col = split.column(align=True)
-        name_row = name_col.row(align=True)
-        name_row.alignment = 'LEFT'
-        # Grey out files without selectable keys, but keep the name
-        # clickable so their key list can still be reviewed.
-        name_row.active = _file_has_selectable(settings, file_index)
-        op = name_row.operator(
-            'bmd_shape_keys.open_file',
-            text=item.label,
-            emboss=False,
-            icon='ERROR' if item.error else 'FILE',
-        )
-        op.file_index = file_index
+    name_col = split.column(align=True)
+    name_col.active = selectable
+    name_row = name_col.row(align=True)
+    name_row.alignment = 'LEFT'
+    op = name_row.operator(
+        'bmd_shape_keys.key_details',
+        text=key_item.name,
+        emboss=False,
+    )
+    op.key_index = key_index
 
-        summary_col = split.column(align=True)
-        summary_col.alignment = 'LEFT'
-        summary_col.label(text=item.summary)
+    # New name input; the status keeps a fixed-ish trailing area.
+    rest = split.column(align=True)
+    rest_split = rest.split(factor=0.75, align=True)
+
+    input_col = rest_split.column(align=True)
+    input_row = input_col.row(align=True)
+    input_row.use_property_split = False
+    input_row.active = selectable
+    input_row.prop(key_item, 'new_name', text='')
+
+    status_col = rest_split.column(align=True)
+
+    label = _STATUS_LABELS.get(key_item.status, key_item.status)
+    status_icon = _STATUS_ICONS.get(key_item.status, 'DOT')
+
+    # Status is clickable and its tooltip is the per-key explanation.
+    status_row = status_col.row(align=True)
+    status_row.alignment = 'LEFT'
+    op = status_row.operator(
+        'bmd_shape_keys.key_details',
+        text=label,
+        icon=status_icon,
+        emboss=False,
+    )
+    op.key_index = key_index
 
 
-class BMD_SK_UL_keys(UIList):
-    """Key list for the file opened in the dialog."""
+def _draw_file_row(layout, settings, file_index):
+    file_item = settings.files[file_index]
+    selectable = _file_has_selectable(settings, file_index)
 
-    bl_idname = 'BMD_SK_UL_keys'
+    row = layout.row(align=True)
+    row.alert = bool(file_item.error) or file_index in _DRAW_COLLIDING_FILES
+
+    check = row.row(align=True)
+    check.enabled = not file_item.error and selectable
+    check.prop(file_item, 'include', text='')
+
+    split = row.split(factor=0.62, align=True)
+
+    name_col = split.column(align=True)
+    name_row = name_col.row(align=True)
+    name_row.alignment = 'LEFT'
+    name_row.prop(
+        file_item,
+        'expanded',
+        text=file_item.label,
+        icon='TRIA_DOWN' if file_item.expanded else 'TRIA_RIGHT',
+        emboss=False,
+    )
+
+    summary_col = split.column(align=True)
+    summary_col.alignment = 'LEFT'
+    summary_col.label(text=file_item.summary)
+
+
+class BMD_SK_UL_tree(UIList):
+    """Scrollable file list with each file's keys nested below it."""
+
+    bl_idname = 'BMD_SK_UL_tree'
 
     def filter_items(self, context, data, propname):
-        items = getattr(data, propname)
-        view_file = data.view_file
+        rows = getattr(data, propname)
+        flags = []
 
-        flags = [
-            self.bitflag_filter_item
-            if item.file_index == view_file and not item.is_original
-            else 0
-            for item in items
-        ]
+        for row in rows:
+            if row.kind == 'file':
+                flags.append(self.bitflag_filter_item)
+                continue
+
+            expanded = (
+                0 <= row.file_index < len(data.files) and
+                data.files[row.file_index].expanded
+            )
+            flags.append(self.bitflag_filter_item if expanded else 0)
+
         return flags, []
 
     def draw_item(self, context, layout, data, item, icon, active_data,
-                  active_propname, index, flt_flag):
+                  active_propname, index, flt_flag=0):
         settings = data
-        key_item = item
-        key_index = key_item.global_index
 
-        selectable = key_item.status in _SELECTABLE
-        final_name = key_item.new_name.strip() or key_item.name
-        is_collision = (
-            selectable and
-            key_item.include and
-            final_name.casefold() in _DRAW_COLLIDING_NAMES
-        )
+        if item.kind == 'file':
+            _draw_file_row(layout, settings, item.file_index)
+            return
 
-        row = layout.row(align=True)
-        row.alert = is_collision
-
-        check = row.row(align=True)
-        check.active = selectable
-        check.enabled = selectable
-        check.prop(key_item, 'include', text='')
-
-        # The original name is a plain-looking button so clicking it shows
-        # the key details, just like clicking its status.
-        split = row.split(factor=0.4, align=True)
-
-        name_col = split.column(align=True)
-        name_col.active = selectable
-        name_row = name_col.row(align=True)
-        name_row.alignment = 'LEFT'
-        op = name_row.operator(
-            'bmd_shape_keys.key_details',
-            text=key_item.name,
-            emboss=False,
-        )
-        op.key_index = key_index
-
-        # New name input; the status keeps a fixed-ish trailing area.
-        rest = split.column(align=True)
-        rest_split = rest.split(factor=0.75, align=True)
-
-        input_col = rest_split.column(align=True)
-        input_row = input_col.row(align=True)
-        input_row.use_property_split = False
-        input_row.active = selectable
-        input_row.prop(key_item, 'new_name', text='')
-
-        status_col = rest_split.column(align=True)
-
-        label = _STATUS_LABELS.get(key_item.status, key_item.status)
-        status_icon = _STATUS_ICONS.get(key_item.status, 'DOT')
-
-        # Status is clickable and its tooltip is the per-key explanation.
-        status_row = status_col.row(align=True)
-        status_row.alignment = 'LEFT'
-        op = status_row.operator(
-            'bmd_shape_keys.key_details',
-            text=label,
-            icon=status_icon,
-            emboss=False,
-        )
-        op.key_index = key_index
+        if 0 <= item.key_index < len(settings.keys):
+            _draw_key_row(layout, settings, settings.keys[item.key_index])
 
 
-def _draw_file_list_uilist(layout, settings):
-    count = len(settings.files)
+def _visible_tree_rows(settings):
+    """Count the rows the tree shows with the current expansion state."""
+    count = 0
 
-    header = layout.row(align=True)
-    header.label(text=f'Files: {count}', icon='FILE_FOLDER')
+    for row in settings.tree_rows:
+        if row.kind == 'file':
+            count += 1
+        elif (
+            0 <= row.file_index < len(settings.files) and
+            settings.files[row.file_index].expanded
+        ):
+            count += 1
 
-    if count == 0:
+    return count
+
+
+def _draw_tree(layout, settings):
+    if not settings.files:
         layout.label(text='No files to import', icon='ERROR')
         return
 
     _prepare_draw_collisions(settings)
 
+    rows = min(max(1, _visible_tree_rows(settings)), MAX_TREE_ROWS)
     layout.template_list(
-        'BMD_SK_UL_files',
+        'BMD_SK_UL_tree',
         '',
         settings,
-        'files',
+        'tree_rows',
         settings,
-        'active_file',
-        rows=min(VISIBLE_FILES, count),
-        maxrows=VISIBLE_FILES,
-    )
-
-
-def _draw_file_keys_uilist(layout, settings):
-    file_index = settings.view_file
-    file_item = settings.files[file_index]
-
-    _prepare_draw_collisions(settings)
-
-    back = layout.row()
-    back.operator(
-        'bmd_shape_keys.back_files',
-        text='Back to file list',
-        icon='BACK',
-    )
-
-    box = layout.box()
-    header = box.row(align=True)
-    header.alert = (
-        bool(file_item.error) or
-        file_index in _DRAW_COLLIDING_FILES
-    )
-
-    check = header.row(align=True)
-    check.enabled = (
-        _file_has_selectable(settings, file_index) and not file_item.error
-    )
-    check.prop(file_item, 'include', text='')
-
-    header.label(
-        text=file_item.label,
-        icon='ERROR' if file_item.error else 'FILE',
-    )
-    right = header.row(align=True)
-    right.alignment = 'LEFT'
-    right.label(text=file_item.summary)
-
-    if file_item.error:
-        _wrap_label(box, f'Read error: {file_item.error}')
-        return
-
-    total_keys = sum(
-        1 for key_item in settings.keys
-        if key_item.file_index == file_index
-        and not key_item.is_original
-    )
-
-    if total_keys == 0:
-        box.label(text='No keys in this file', icon='INFO')
-        return
-
-    box.template_list(
-        'BMD_SK_UL_keys',
-        '',
-        settings,
-        'keys',
-        settings,
-        'active_key',
-        rows=min(VISIBLE_KEYS, total_keys),
-        maxrows=VISIBLE_KEYS,
+        'active_tree_row',
+        rows=rows,
+        maxrows=MAX_TREE_ROWS,
     )
 
     if _DRAW_COLLIDING_NAMES:
         _wrap_label(
-            box,
+            layout,
             'Warning: several keys have the same final name: '
             + ', '.join(sorted(_DRAW_COLLIDING_NAMES.values()))
             + '. Only the first one will be imported.',
@@ -1048,7 +1153,7 @@ def _draw_file_keys_uilist(layout, settings):
             icon='ERROR',
         )
 
-    _draw_key_details(layout, settings, file_index)
+    _draw_key_details(layout, settings)
 
 
 class BMD_SK_OT_settings(Operator):
@@ -1086,15 +1191,7 @@ class BMD_SK_OT_settings(Operator):
 
         _draw_target_and_options(layout, settings)
         _draw_summary(layout, settings)
-
-        if not settings.files:
-            layout.label(text='No files to import', icon='ERROR')
-            return
-
-        if 0 <= settings.view_file < len(settings.files):
-            _draw_file_keys_uilist(layout, settings)
-        else:
-            _draw_file_list_uilist(layout, settings)
+        _draw_tree(layout, settings)
 
     def execute(self, context):
         global _SESSION
@@ -1165,7 +1262,7 @@ class BMD_SK_OT_settings(Operator):
             return {'CANCELLED'}
 
         if session.files:
-            settings.target["bmd_bls_source"] = session.files[-1].path
+            settings.target["bmd_bls_source"] = session.files[0].path
 
         parts = [f'created: {stats["created"]}']
 
@@ -1196,19 +1293,12 @@ class BMD_SK_OT_settings(Operator):
         return {'FINISHED'}
 
 
-def has_pending_import():
-    """Return True while a parsed BLS session waits for the settings dialog."""
-    return _SESSION is not None
-
-
 CLASSES = (
     BMD_SK_FileItem,
     BMD_SK_KeyItem,
+    BMD_SK_TreeRow,
     BMD_SK_Settings,
-    BMD_SK_UL_files,
-    BMD_SK_UL_keys,
-    BMD_SK_OT_open_file,
-    BMD_SK_OT_back_files,
+    BMD_SK_UL_tree,
     BMD_SK_OT_key_details,
     BMD_SK_OT_import_files,
     BMD_SK_OT_import_folder,

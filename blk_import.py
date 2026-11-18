@@ -7,36 +7,19 @@ import os
 
 import bpy
 import numpy as np
-from bpy.props import (
-    BoolProperty,
-    CollectionProperty,
-    EnumProperty,
-    IntProperty,
-    PointerProperty,
-    StringProperty,
-)
-from bpy.types import Operator, PropertyGroup, UIList
 
 from . import blender_common as bc
-from .j3d import anim, blk
-
-
-MAX_TRACK_ROWS = 10
-_BLK_SESSION = None
+from . import bls_import
+from . import bls_session
+from .j3d import anim
 
 
 class BlkImportError(Exception):
     pass
 
 
-def _get_settings(context=None):
-    context = context or bpy.context
-    scene = getattr(context, "scene", None)
-    return getattr(scene, "bmd_blk_import_settings", None)
-
-
-def find_mesh(context):
-    """Return the active mesh, or the first selected mesh."""
+def _selected_mesh(context):
+    """Return the active mesh, the first selected mesh, or None."""
     obj = context.active_object
 
     if obj is not None and obj.type == "MESH":
@@ -46,7 +29,17 @@ def find_mesh(context):
         if candidate.type == "MESH":
             return candidate
 
-    raise BlkImportError("Select the mesh with shape keys first")
+    return None
+
+
+def find_mesh(context):
+    """Return the active mesh, or the first selected mesh."""
+    obj = _selected_mesh(context)
+
+    if obj is None:
+        raise BlkImportError("Select the mesh with shape keys first")
+
+    return obj
 
 
 def _shape_keys(obj):
@@ -61,84 +54,153 @@ def _shape_keys(obj):
     return keys
 
 
-def _auto_assign(settings):
-    """Assign tracks to shape keys in their current order."""
-    target = settings.target
-    blocks = []
-
-    if target is not None and target.type == "MESH" and target.data is not None:
-        keys = target.data.shape_keys
-
-        if keys is not None:
-            blocks = list(keys.key_blocks)[1:]
-
-    for index, item in enumerate(settings.tracks):
-        if index < len(blocks):
-            item.shape_key = blocks[index].name
-        elif target is not None:
-            item.shape_key = ""
+def _delta_scale(target):
+    return 0.01 if bc.saved_convert_units(bpy.context, target) else 1.0
 
 
-def _target_changed(self, context):
-    settings = _get_settings(context)
-
-    if settings is not None:
-        _auto_assign(settings)
-
-
-def _shape_key_items(_self, context):
-    """Shape keys selectable for a BLK track; Basis is not offered."""
-    settings = _get_settings(context)
-    target = settings.target if settings is not None else None
-    items = [("", "None", "Do not import this track")]
-
-    if (target is not None and target.type == "MESH"
-            and target.data is not None
-            and target.data.shape_keys is not None):
-        for block in list(target.data.shape_keys.key_blocks)[1:]:
-            items.append((block.name, block.name, ""))
-
-    return items
-
-
-class BMD_SK_BlkTrackItem(PropertyGroup):
-    track_index: IntProperty()
-    label: StringProperty()
-    shape_key: EnumProperty(name="Shape Key", items=_shape_key_items)
-    include: BoolProperty(name="Import", default=True)
-
-
-class BMD_SK_BlkImportSettings(PropertyGroup):
-    target: PointerProperty(
-        name="Target Mesh",
-        description="Mesh that will receive the animation",
-        type=bpy.types.Object,
-        poll=bc.mesh_object_poll,
-        update=_target_changed,
-    )
-    filepath: StringProperty(subtype="FILE_PATH")
-    tracks: CollectionProperty(type=BMD_SK_BlkTrackItem)
-    active_track: IntProperty(default=0, min=0)
+def _bls_session_for(target, path):
+    if target is None or not path:
+        return None, "BLS file not found"
+    path = bpy.path.abspath(path)
+    if not os.path.isfile(path):
+        return None, "BLS file not found"
+    try:
+        existing = [
+            bls_session.ExistingKey(name, displacement)
+            for name, displacement in
+            bls_import.existing_shape_key_displacements(target)
+        ]
+        session = bls_session.build_session(
+            [path],
+            recursive=False,
+            existing_keys=existing,
+            vertex_count=len(target.data.vertices) if target.data else 0,
+            delta_scale=_delta_scale(target),
+        )
+    except Exception as exc:
+        return None, str(exc)
+    if not session.files:
+        return None, "No BLS data"
+    file_entry = session.files[0]
+    if file_entry.error:
+        return None, file_entry.error
+    return session, ""
 
 
-class BMD_SK_UL_blk_tracks(UIList):
-    bl_idname = "BMD_SK_UL_blk_tracks"
+def _animated_keys(file_entry):
+    return [key for key in file_entry.keys
+            if not key.is_base and not key.is_original]
 
-    def draw_item(self, context, layout, data, item, icon, active_data,
-                  active_propname, index, flt_flag):
-        settings = data
-        row = layout.row(align=True)
-        check = row.row()
-        check.prop(item, "include", text="")
-        row.label(text=item.label)
-        target = settings.target
 
-        if (target is not None and target.type == "MESH"
-                and target.data is not None
-                and target.data.shape_keys is not None):
-            row.prop(item, "shape_key", text="")
-        else:
-            row.label(text="No shape keys", icon="ERROR")
+def _mesh_bls_key_info(mesh, path, cache=None):
+    """Return ``(key_count, keys_fit)`` for *mesh* and its BLS file."""
+    if mesh is None or mesh.type != "MESH" or mesh.data is None:
+        return None
+
+    path = bpy.path.abspath(str(path)) if path else ""
+
+    if not path or not os.path.isfile(path):
+        return None
+
+    cache_key = (path, len(mesh.data.vertices))
+
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
+    result = None
+
+    try:
+        session = bls_session.build_session(
+            [path],
+            recursive=False,
+            vertex_count=len(mesh.data.vertices),
+            delta_scale=_delta_scale(mesh),
+        )
+    except Exception:
+        session = None
+
+    if session is not None and session.files:
+        file_entry = session.files[0]
+
+        if not file_entry.error:
+            keys = _animated_keys(file_entry)
+            fits = not any(
+                key.status == bls_session.INCOMPATIBLE for key in keys)
+            result = (len(keys), fits)
+
+    if cache is not None:
+        cache[cache_key] = result
+
+    return result
+
+
+def collect_target_candidates(context, selected=None):
+    """Return meshes with a usable saved BLS, selected mesh first."""
+    cache = {}
+    candidates = []
+    seen = set()
+
+    def add(mesh):
+        if mesh is None or mesh.type != "MESH" or mesh in seen:
+            return
+
+        source = mesh.get("bmd_bls_source", "")
+
+        if not source:
+            return
+
+        info = _mesh_bls_key_info(mesh, source, cache)
+
+        if info is None or not info[1]:
+            return
+
+        seen.add(mesh)
+        candidates.append(
+            bc.TargetCandidate(
+                mesh, mesh, info[0], bpy.path.abspath(str(source))))
+
+    add(selected)
+
+    for obj in context.scene.objects:
+        if obj.type == "MESH":
+            add(obj)
+
+    return candidates
+
+
+def find_exact_target(track_count, candidates):
+    """Return the first candidate with exactly *track_count* keys, or None.
+
+    The candidate list can be collected once for a batch import; this keeps
+    the exact-count rule while avoiding repeated scene/BLS scans.
+    """
+    for candidate in candidates:
+        if candidate.capacity == track_count:
+            return candidate
+
+    return None
+
+
+def find_compatible_mesh(context, track_count, selected=None):
+    """Return the mesh whose saved BLS has exactly *track_count* keys.
+
+    The selected mesh wins when it matches.  Otherwise the scene is searched
+    for a matching mesh; if none matches, the selected mesh (or None) is
+    returned so the dialog can still show its status.
+    """
+    candidate = find_exact_target(
+        track_count, collect_target_candidates(context, selected))
+
+    if candidate is not None:
+        return candidate.object
+
+    return selected
+
+
+def _key_target_name(key):
+    if key.status == bls_session.CONFLICT:
+        return key.name
+    return key.new_name or key.name
 
 
 def _expand_slider_range(key_block, values):
@@ -247,6 +309,10 @@ def apply_blk_animation(context, obj, animation, mapping, filepath="",
     frames = np.arange(0, animation.duration + 1)
     name = os.path.splitext(os.path.basename(filepath))[0] or "blk"
 
+    # BLK playback is authored at the game's 30 fps.
+    context.scene.render.fps = 30
+    context.scene.render.fps_base = 1.0
+
     # Drop slider ranges left over from a previous animation; only the new
     # track values may expand them below.
     for block in keys.key_blocks[1:]:
@@ -303,200 +369,3 @@ def apply_blk_animation(context, obj, animation, mapping, filepath="",
                f"{animation.duration + 1} frames, loop mode {mode}")
 
     return action
-
-
-def _populate_tracks(settings, animation, filepath):
-    settings.filepath = filepath
-    settings.tracks.clear()
-    display_index = 0
-
-    for index, _track in enumerate(animation.tracks):
-        # The first track is the original/zero key (Maya "orig").
-        if index == 0:
-            continue
-
-        display_index += 1
-        item = settings.tracks.add()
-        item.track_index = index
-        item.label = f"Track {display_index}"
-        item.include = True
-
-    settings.active_track = 0
-    _auto_assign(settings)
-
-
-def begin_import(context, filepath, operator):
-    """Parse a BLK file and open the track-assignment dialog."""
-    global _BLK_SESSION
-
-    try:
-        with open(filepath, "rb") as file:
-            animation = blk.parse_blk(file.read())
-    except Exception as exc:
-        operator.report({"ERROR"}, f"Could not read BLK: {exc}")
-        return {"CANCELLED"}
-
-    settings = _get_settings(context)
-
-    if settings is None:
-        operator.report({"ERROR"}, "BLK import settings are unavailable")
-        return {"CANCELLED"}
-
-    try:
-        target = find_mesh(context)
-    except BlkImportError:
-        target = None
-
-    if target is not None:
-        settings.target = target
-
-    _populate_tracks(settings, animation, filepath)
-    _BLK_SESSION = animation
-
-    bpy.app.timers.register(_open_settings_dialog, first_interval=0.05)
-    return {"FINISHED"}
-
-
-def _open_settings_dialog():
-    try:
-        bpy.ops.bmd_shape_keys.blk_settings("INVOKE_DEFAULT")
-    except Exception as exc:  # pragma: no cover - only in unusual UI states
-        print(f"BLK importer: could not open settings dialog: {exc}")
-
-    return None
-
-
-class BMD_SK_OT_blk_auto_assign(Operator):
-    bl_idname = "bmd_shape_keys.blk_auto_assign"
-    bl_label = "Auto Assign"
-    bl_description = "Assign tracks to shape keys in their current order"
-    bl_options = {"REGISTER"}
-
-    def execute(self, context):
-        settings = _get_settings(context)
-
-        if settings is not None:
-            _auto_assign(settings)
-
-        return {"FINISHED"}
-
-
-class BMD_SK_OT_blk_settings(Operator):
-    bl_idname = "bmd_shape_keys.blk_settings"
-    bl_label = "Import BLK"
-    bl_description = "Assign BLK tracks to shape keys and import the animation"
-    bl_options = {"REGISTER", "UNDO"}
-
-    set_scene_range: BoolProperty(
-        name="Set Scene Range", default=True,
-        description="Set the scene frame range to the animation length")
-
-    def invoke(self, context, _event):
-        if _BLK_SESSION is None:
-            self.report({"ERROR"}, "No BLK file is loaded")
-            return {"CANCELLED"}
-
-        settings = _get_settings(context)
-
-        if settings is None:
-            self.report({"ERROR"}, "BLK import settings are unavailable")
-            return {"CANCELLED"}
-
-        if not settings.tracks:
-            self.report({"ERROR"}, "The BLK file has no tracks")
-            return {"CANCELLED"}
-
-        _auto_assign(settings)
-        return context.window_manager.invoke_props_dialog(
-            self, width=620, confirm_text="Import")
-
-    def draw(self, context):
-        layout = self.layout
-        settings = _get_settings(context)
-
-        if settings is None:
-            layout.label(text="BLK import settings are unavailable", icon="ERROR")
-            return
-
-        box = layout.box()
-        box.label(text=f"File: {os.path.basename(settings.filepath)}", icon="FILE")
-        row = box.row()
-        row.alert = settings.target is None
-        row.prop(settings, "target")
-        box.prop(self, "set_scene_range")
-
-        if settings.target is None:
-            layout.label(text="Select the mesh with shape keys", icon="INFO")
-            return
-
-        if not settings.tracks:
-            layout.label(text="The BLK file has no tracks", icon="ERROR")
-            return
-
-        rows = min(max(1, len(settings.tracks)), MAX_TRACK_ROWS)
-        layout.template_list(
-            "BMD_SK_UL_blk_tracks", "",
-            settings, "tracks",
-            settings, "active_track",
-            rows=rows,
-            maxrows=MAX_TRACK_ROWS,
-        )
-        layout.operator("bmd_shape_keys.blk_auto_assign", text="Auto Assign",
-                        icon="FILE_REFRESH")
-        layout.label(text="Tracks are assigned in shape-key order by default",
-                     icon="INFO")
-
-        if not any(item.include and item.shape_key for item in settings.tracks):
-            layout.label(text="Assign at least one track to a shape key",
-                         icon="ERROR")
-
-    def execute(self, context):
-        global _BLK_SESSION
-
-        settings = _get_settings(context)
-
-        if _BLK_SESSION is None or settings is None or settings.target is None:
-            self.report({"ERROR"}, "BLK import data is unavailable")
-            return {"CANCELLED"}
-
-        mapping = []
-        used = set()
-
-        for item in settings.tracks:
-            if not item.include or not item.shape_key:
-                continue
-
-            if item.shape_key in used:
-                self.report({"WARNING"},
-                            f"Shape key '{item.shape_key}' is assigned to "
-                            f"more than one track")
-
-            used.add(item.shape_key)
-            mapping.append((item.track_index, item.shape_key))
-
-        if not mapping:
-            self.report({"WARNING"}, "No tracks assigned to shape keys")
-            return {"CANCELLED"}
-
-        try:
-            apply_blk_animation(
-                context, settings.target, _BLK_SESSION, mapping,
-                filepath=settings.filepath,
-                set_scene_range=self.set_scene_range,
-                report=self.report,
-            )
-        except Exception as exc:
-            self.report({"ERROR"}, f"Import failed: {exc}")
-            return {"CANCELLED"}
-
-        _BLK_SESSION = None
-        return {"FINISHED"}
-
-
-CLASSES = (
-    BMD_SK_BlkTrackItem,
-    BMD_SK_BlkImportSettings,
-    BMD_SK_UL_blk_tracks,
-    BMD_SK_OT_blk_auto_assign,
-    BMD_SK_OT_blk_settings,
-)

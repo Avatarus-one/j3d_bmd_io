@@ -411,7 +411,13 @@ def _analyse(session, existing_keys=None, vertex_count=None, delta_scale=0.01):
 
             match = None
             for other in existing:
-                if other.record.matches(entry.record, delta_scale=delta_scale):
+                # BLS-vs-BLS comparisons are scale-independent: both records
+                # are in model units, so use the fixed model-unit tolerance
+                # instead of the Convert Units scale.
+                if other.record.matches(
+                        entry.record,
+                        tolerance=bls.MODEL_DISPLACEMENT_TOLERANCE,
+                        delta_scale=1.0):
                     match = other
                     break
 

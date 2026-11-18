@@ -83,6 +83,11 @@ ZERO_DELTA = 1e-9
 # and tiny model-to-model differences that are invisible after import.
 DISPLACEMENT_TOLERANCE = 1e-3
 
+# BLS records are compared with each other in model units.  This is the
+# converted-unit tolerance expressed in model units, so Duplicate/Conflict
+# detection does not depend on the Convert Units checkbox.
+MODEL_DISPLACEMENT_TOLERANCE = DISPLACEMENT_TOLERANCE * 10.0
+
 
 # ---------------------------------------------------------------------------
 # Low-level helpers

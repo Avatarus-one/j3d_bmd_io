@@ -117,6 +117,21 @@ def _default_base_name(target):
     name = target.data.name or target.name
     return f'{name}__base'
 
+_target_changed_hooks = []
+
+
+def add_target_changed_hook(callback):
+    if callback not in _target_changed_hooks:
+        _target_changed_hooks.append(callback)
+
+
+def remove_target_changed_hook(callback):
+    try:
+        _target_changed_hooks.remove(callback)
+    except ValueError:
+        pass
+
+
 def _export_target_changed(self, context):
     """Repopulate the export list when the target mesh changes."""
     settings = _get_export_settings(context)
@@ -124,6 +139,12 @@ def _export_target_changed(self, context):
 
     if settings is not None:
         settings.base_name = _default_base_name(self.target)
+
+    for callback in list(_target_changed_hooks):
+        try:
+            callback(context, self.target)
+        except Exception:
+            pass
 
 
 class BMD_SK_ExportKeyItem(PropertyGroup):
@@ -414,6 +435,7 @@ class BMD_SK_OT_export_settings(Operator):
         settings.convert_units = bc.saved_convert_units(context, settings.target)
         settings.show_base = True
         _populate_export_keys(settings, settings.target)
+        settings.expanded = True
 
         if settings.target is not None and not settings.base_name.strip():
             settings.base_name = _default_base_name(settings.target)

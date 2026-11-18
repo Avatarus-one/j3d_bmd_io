@@ -3,6 +3,7 @@
 import json
 import math
 import os
+from dataclasses import dataclass
 
 import numpy as np
 import bpy
@@ -228,6 +229,68 @@ def export_target_mesh(context, kind):
     if mesh is not None:
         return mesh
     return first_scene_mesh(context)
+
+
+@dataclass(frozen=True)
+class TargetCandidate:
+    """One object that can receive an imported animation.
+
+    ``object`` is what the dialog shows (and what the user selects).
+    ``target`` is what actually receives the data (an armature for BCK, a mesh
+    for BLK, ...).  ``capacity`` is the number of joints/keys available.
+    ``data`` is an optional format-specific payload (for example the BLS path
+    of a mesh) that can be reused without parsing the file again.
+    """
+
+    object: object
+    target: object
+    capacity: int
+    data: object = None
+
+
+def target_priority(required, candidate):
+    """Return the candidate's priority for *required* units, or None.
+
+    An exact capacity is the best match.  A larger capacity is allowed, but
+    the priority drops with the difference; a smaller capacity cannot hold the
+    animation and is skipped.
+    """
+    if required <= 0 or required > candidate.capacity:
+        return None
+
+    difference = candidate.capacity - required
+    return 1.0 / (1.0 + difference)
+
+
+def find_best_target(required, candidates):
+    """Return the highest-priority candidate for *required*, or None.
+
+    Ties keep the first candidate, so callers can put the selected object
+    first to make it win against equivalent objects.
+    """
+    best = None
+    best_priority = -1.0
+
+    for candidate in candidates:
+        value = target_priority(required, candidate)
+        if value is not None and value > best_priority:
+            best = candidate
+            best_priority = value
+
+    return best
+
+
+def assign_targets(items, candidates):
+    """Assign ``(key, required)`` items to their best candidates.
+
+    ``candidates`` can be collected once and reused for a whole batch; this is
+    the entry point for a future multi-file import that distributes animations
+    across meshes automatically.
+    """
+    return [
+        (key, find_best_target(required, candidates))
+        for key, required in items
+    ]
 
 
 def export_model_objects(context, use_selection=True):
