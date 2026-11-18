@@ -192,6 +192,8 @@ pixels).
 * Material tab -> *J3D (BMD) Material*: **Render Mode** (Auto keeps imported values; Opaque / Cutout /
   Translucent), Alpha Reference, Backface Culling. The **Textures** box lists the material's texture
   slots and lets you change, add or remove textures from the model's BMD texture list.
+* The first texture slot is treated as the main texture and connected to Base Color; additional
+  slots (highlights, eye masks, effect textures) are kept as separate image nodes.
 * Alpha test and blending are detected from the material's `alphaComp` / `blend` data and wired into
   the shader (alpha test via "Greater Than", blending as *Blended*).
 * GX wraps per axis (Clamp / Repeat / Mirror). If the two axes differ, the importer builds a

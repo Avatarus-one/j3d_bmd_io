@@ -380,13 +380,17 @@ def _build_nodes(mat, m, images):
         node.interpolation = bc.image_interpolation(int(img.bmd.mag_filter))
         slot_nodes[slot] = node
 
-    # which slot does TEV stage 0 sample?
+    # The first texture slot is the material's main texture.  TEV stages may
+    # sample extra textures (highlights, eye masks, ...), but the Blender
+    # shader should use the first one for the base color.
     main_slot, main_coord = None, 0
-    order = m.get("tevOrder", [None])[0]
-    if order and order[1] < 8 and order[1] in slot_nodes:
-        main_slot, main_coord = order[1], order[0]
-    elif slot_nodes:
+    if slot_nodes:
         main_slot = min(slot_nodes)
+        for order in m.get("tevOrder", []):
+            if (order and order[1] == main_slot
+                    and 0 <= order[0] < 8):
+                main_coord = order[0]
+                break
 
     if main_slot is not None:
         node = slot_nodes[main_slot]
