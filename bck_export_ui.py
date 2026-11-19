@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 
@@ -26,6 +27,7 @@ from .j3d.common import J3DError
 _TARGET_MISSING = object()
 MAX_TREE_ROWS = 10
 _SYNCING = False
+_ACTION_SELECTION_PROP = "bmd_bck_export_actions"
 
 
 def _get_settings(context=None):
@@ -113,6 +115,42 @@ def open_export_dialog():
     return None
 
 
+def _stored_action_selection(arm):
+    """Return the per-armature action selection stored on *arm*."""
+    if arm is None:
+        return {}
+
+    raw = arm.get(_ACTION_SELECTION_PROP)
+
+    if not raw:
+        return {}
+
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    return {str(name): bool(value) for name, value in data.items()}
+
+
+def _store_action_selection(settings, arm=None):
+    """Store the current action selection on *arm* (per armature)."""
+    arm = arm if arm is not None else _armature(settings.target)
+
+    if arm is None:
+        return
+
+    data = {item.name: bool(item.include) for item in settings.actions}
+
+    try:
+        arm[_ACTION_SELECTION_PROP] = json.dumps(data, separators=(",", ":"))
+    except Exception:
+        pass
+
+
 def _armature_include_changed(self, context):
     global _SYNCING
 
@@ -131,6 +169,8 @@ def _armature_include_changed(self, context):
             action_item.include = self.armature_include
     finally:
         _SYNCING = False
+
+    _store_action_selection(settings)
 
 
 def _action_include_changed(self, context):
@@ -151,6 +191,8 @@ def _action_include_changed(self, context):
             action_item.include for action_item in settings.actions)
     finally:
         _SYNCING = False
+
+    _store_action_selection(settings)
 
 
 def _action_frame_range(action):
@@ -184,6 +226,15 @@ def _rebuild_tree(settings):
 def _populate_actions(settings, arm):
     global _SYNCING
 
+    old_arm = None
+    old_name = settings.populated_armature
+
+    if old_name:
+        old_arm = bpy.data.objects.get(old_name)
+
+        if old_arm is not None and old_arm is not arm:
+            _store_action_selection(settings, old_arm)
+
     if arm is None:
         _SYNCING = True
 
@@ -191,6 +242,7 @@ def _populate_actions(settings, arm):
             settings.actions.clear()
             settings.tree_rows.clear()
             settings.armature_include = True
+            settings.populated_armature = ""
         finally:
             _SYNCING = False
 
@@ -208,8 +260,8 @@ def _populate_actions(settings, arm):
         for item in settings.actions
     ]
 
-    if current != items:
-        previous = {item.name: item.include for item in settings.actions}
+    if settings.populated_armature != arm.name or current != items:
+        stored = _stored_action_selection(arm)
         _SYNCING = True
 
         try:
@@ -220,12 +272,15 @@ def _populate_actions(settings, arm):
                 item.name = name
                 item.frame_start = start
                 item.frame_end = end
-                item.include = previous.get(name, True)
+                item.include = stored.get(name, True)
 
             settings.armature_include = any(
                 item.include for item in settings.actions)
+            settings.populated_armature = arm.name
         finally:
             _SYNCING = False
+
+        _store_action_selection(settings, arm)
 
     _rebuild_tree(settings)
 
@@ -328,6 +383,7 @@ class BMD_ANIM_BCKExportSettings(PropertyGroup):
     armature_include: BoolProperty(
         name="Export armature", default=True,
         update=_armature_include_changed)
+    populated_armature: StringProperty()
 
 
 class BMD_ANIM_OT_bck_export_settings(Operator):

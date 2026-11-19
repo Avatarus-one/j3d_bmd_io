@@ -2012,8 +2012,6 @@ def register():
         type=blk_import_ui.BMD_SK_BlkImportSettings)
     bpy.types.Scene.bmd_blk_export_settings = PointerProperty(
         type=blk_export_ui.BMD_SK_BlkExportSettings)
-    bpy.types.Scene.bmd_shape_keys_last_info = StringProperty(
-        name="Last BLS import", default="")
 
     _file_handlers = _make_file_handlers()
     for fh in _file_handlers:
@@ -2045,8 +2043,6 @@ def unregister():
 
     from . import (bck_export_ui, bck_import_ui, blk_export_ui,
                    blk_import_ui, bls_import_ui, bls_export_ui)
-    if hasattr(bpy.types.Scene, "bmd_shape_keys_last_info"):
-        del bpy.types.Scene.bmd_shape_keys_last_info
     if hasattr(bpy.types.Scene, "bmd_blk_import_settings"):
         del bpy.types.Scene.bmd_blk_import_settings
     if hasattr(bpy.types.Scene, "bmd_blk_export_settings"):

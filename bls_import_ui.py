@@ -260,8 +260,21 @@ def _prepare_draw_collisions(settings):
 
 def _target_changed(self, context):
     """The target mesh changed: re-run duplicate/conflict detection."""
+    global _SYNCING
+
     if _SYNCING:
         return
+
+    settings = _get_settings(context)
+
+    if settings is not None:
+        _SYNCING = True
+
+        try:
+            settings.convert_units = bc.saved_convert_units(
+                context, settings.target)
+        finally:
+            _SYNCING = False
 
     _reanalyse_session(context)
 
@@ -680,7 +693,6 @@ def _begin_import(context, paths, operator):
 
     _SESSION = session
     _populate_settings(context, settings, session)
-    scene.bmd_shape_keys_last_info = ''
 
     # Defer the popup: opening it directly from inside the file-browser
     # operator can close it together with the file browser.
@@ -1044,7 +1056,6 @@ class BMD_SK_OT_settings(Operator):
         global _SESSION
 
         settings = context.scene.bmd_shape_keys_settings
-        scene = context.scene
 
         if _SESSION is None:
             self.report({'ERROR'}, 'Import data is not loaded')
@@ -1121,7 +1132,6 @@ class BMD_SK_OT_settings(Operator):
             parts.append(f'out-of-range vertices: {stats["out_of_range"]}')
 
         info = 'BLS import - ' + ', '.join(parts)
-        scene.bmd_shape_keys_last_info = info
 
         if duplicate_names:
             self.report(

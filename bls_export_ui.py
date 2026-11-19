@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import bpy
 from bpy.props import (
     BoolProperty,
@@ -16,6 +18,10 @@ from bpy_extras.io_utils import ExportHelper
 from . import blender_common as bc
 from . import bls_export
 from . import bmd_metadata
+
+
+_KEY_SELECTION_PROP = "bmd_bls_export_keys"
+_SYNCING = False
 
 
 MAX_EXPORT_ROWS = 10
@@ -83,25 +89,87 @@ def _rebuild_export_tree(settings):
     settings.active_tree_row = 0
 
 
+def _stored_key_selection(target):
+    """Return the per-mesh key selection stored on *target*."""
+    if target is None:
+        return {}
+
+    raw = target.get(_KEY_SELECTION_PROP)
+
+    if not raw:
+        return {}
+
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    return {str(name): bool(value) for name, value in data.items()}
+
+
+def _store_key_selection(settings, target=None):
+    """Store the current key selection on *target* (per mesh)."""
+    target = target if target is not None else settings.target
+
+    if target is None:
+        return
+
+    data = {item.name: bool(item.include) for item in settings.keys}
+
+    try:
+        target[_KEY_SELECTION_PROP] = json.dumps(data, separators=(",", ":"))
+    except Exception:
+        pass
+
+
+def _key_include_changed(self, context):
+    if _SYNCING:
+        return
+
+    settings = _get_export_settings(context)
+
+    if settings is not None:
+        _store_key_selection(settings)
+
+
 def _populate_export_keys(settings, target=None):
     """Fill the export key list from the target mesh's shape keys."""
+    global _SYNCING
+
     if settings is None:
         return
 
-    previous = {item.name: item.include for item in settings.keys}
-    settings.keys.clear()
-    settings.base_include = True
     target = target if target is not None else settings.target
 
-    if target is not None and target.type == 'MESH' and target.data is not None:
-        shape_keys = target.data.shape_keys
-        if shape_keys is not None:
-            for block in shape_keys.key_blocks[1:]:
-                item = settings.keys.add()
-                item.name = block.name
-                item.include = previous.get(block.name, True)
+    if settings.target is not None and settings.target is not target:
+        _store_key_selection(settings, settings.target)
 
-    _rebuild_export_tree(settings)
+    stored = _stored_key_selection(target)
+    _SYNCING = True
+
+    try:
+        settings.keys.clear()
+        settings.base_include = True
+
+        if (target is not None and target.type == 'MESH'
+                and target.data is not None):
+            shape_keys = target.data.shape_keys
+
+            if shape_keys is not None:
+                for block in shape_keys.key_blocks[1:]:
+                    item = settings.keys.add()
+                    item.name = block.name
+                    item.include = stored.get(block.name, True)
+
+        _rebuild_export_tree(settings)
+    finally:
+        _SYNCING = False
+
+    if target is not None:
+        _store_key_selection(settings, target)
 
 
 def _default_base_name(target):
@@ -138,6 +206,7 @@ def _export_target_changed(self, context):
     _populate_export_keys(settings, self.target)
 
     if settings is not None:
+        settings.convert_units = bc.saved_convert_units(context, self.target)
         settings.base_name = _default_base_name(self.target)
 
     for callback in list(_target_changed_hooks):
@@ -153,6 +222,7 @@ class BMD_SK_ExportKeyItem(PropertyGroup):
         name='Export key',
         description='Include this shape key in the BLS file',
         default=True,
+        update=_key_include_changed,
     )
 
 
@@ -364,7 +434,6 @@ def _perform_export(settings, operator, context):
         f'vertices: {stats["vertices"]}, '
         f'file: {stats["bytes"]} bytes'
     )
-    context.scene.bmd_shape_keys_last_info = info
     operator.report({'INFO'}, info)
     return {'FINISHED'}
 
