@@ -18,16 +18,43 @@ class BlkImportError(Exception):
     pass
 
 
+def _mesh_for_armature(context, arm):
+    """Return a mesh deformed by *arm*, preferring one with shape keys."""
+    candidates = [obj for obj in context.scene.objects
+                  if obj.type == "MESH" and bc.target_armature(obj) is arm]
+
+    for obj in candidates:
+        keys = obj.data.shape_keys if obj.data else None
+
+        if keys is not None and len(keys.key_blocks) >= 2:
+            return obj
+
+    return candidates[0] if candidates else None
+
+
 def _selected_mesh(context):
-    """Return the active mesh, the first selected mesh, or None."""
+    """Return the active mesh, a mesh of the active armature, or None."""
     obj = context.active_object
 
-    if obj is not None and obj.type == "MESH":
-        return obj
+    if obj is not None:
+        if obj.type == "MESH":
+            return obj
+
+        if obj.type == "ARMATURE":
+            mesh = _mesh_for_armature(context, obj)
+
+            if mesh is not None:
+                return mesh
 
     for candidate in context.selected_objects:
         if candidate.type == "MESH":
             return candidate
+
+        if candidate.type == "ARMATURE":
+            mesh = _mesh_for_armature(context, candidate)
+
+            if mesh is not None:
+                return mesh
 
     return None
 
@@ -308,10 +335,6 @@ def apply_blk_animation(context, obj, animation, mapping, filepath="",
     blocks = {block.name: block for block in keys.key_blocks[1:]}
     frames = np.arange(0, animation.duration + 1)
     name = os.path.splitext(os.path.basename(filepath))[0] or "blk"
-
-    # BLK playback is authored at the game's 30 fps.
-    context.scene.render.fps = 30
-    context.scene.render.fps_base = 1.0
 
     # Drop slider ranges left over from a previous animation; only the new
     # track values may expand them below.

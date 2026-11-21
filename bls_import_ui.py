@@ -284,6 +284,7 @@ def _convert_units_changed(self, context):
     if _SYNCING:
         return
 
+    bc.remember_convert_units(context, self.convert_units, self.target)
     _reanalyse_session(context)
 
 
@@ -671,8 +672,8 @@ def _begin_import(context, paths, operator):
         matched = None
 
     if matched is not None:
-        mesh, match_scale = matched
-        convert_units = match_scale == 0.01
+        mesh, _match_scale = matched
+        convert_units = bc.saved_convert_units(context, mesh)
 
         if (mesh is not settings.target or
                 convert_units != settings.convert_units):
@@ -705,7 +706,7 @@ class BMD_SK_OT_import_files(Operator, ImportHelper):
     bl_idname = 'bmd_shape_keys.import_files'
     bl_label = 'Import BLS'
     bl_description = 'Import J3D Shape Keys from .bls files'
-    bl_options = {'REGISTER'}
+    bl_options = set()
 
     filename_ext = '.bls'
     filter_glob: StringProperty(default='*.bls', options={'HIDDEN'})
@@ -737,7 +738,7 @@ class BMD_SK_OT_import_folder(Operator):
     bl_idname = 'bmd_shape_keys.import_folder'
     bl_label = 'Import BLS Folder'
     bl_description = ('Import J3D Shape Keys (.bls) from folder and all subfolders')
-    bl_options = {'REGISTER'}
+    bl_options = set()
 
     directory: StringProperty(subtype='DIR_PATH')
     filter_folder: BoolProperty(default=True, options={'HIDDEN'})
@@ -1019,7 +1020,7 @@ class BMD_SK_OT_settings(Operator):
     bl_idname = 'bmd_shape_keys.settings'
     bl_label = 'Import J3D Shape Keys'
     bl_description = 'Review imported files, then create the shape keys'
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = {'UNDO'}
 
     def invoke(self, context, _event):
         if _SESSION is None:
@@ -1147,6 +1148,8 @@ class BMD_SK_OT_settings(Operator):
 
         _SESSION = None
 
+        bc.remember_convert_units(
+            context, settings.convert_units, settings.target)
         return {'FINISHED'}
 
 

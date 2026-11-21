@@ -24,6 +24,53 @@ class KclExportError(Exception):
     pass
 
 
+KCL_NO_MESH_ERROR = (
+    "No mesh objects to export (select the collision mesh or untick "
+    "'Selected Only'). Initialize custom meshes as KCL first.")
+
+
+def initialize_as_kcl(obj):
+    """Mark a custom mesh as a KCL collision mesh."""
+    if obj is None or obj.type != "MESH":
+        return None
+
+    if "kcl_thickness" not in obj:
+        obj["kcl_thickness"] = 1.0
+    return obj
+
+
+def kcl_export_objects(context, use_selection=True):
+    """Return ``(meshes, valid)`` for a KCL export."""
+    if use_selection:
+        selected = list(getattr(context, "selected_objects", ()) or ())
+
+        if not selected:
+            return [], False
+
+        meshes = []
+        valid = True
+
+        for obj in selected:
+            if obj.type == "MESH" and bc.is_kcl_object(obj):
+                meshes.append(obj)
+            else:
+                valid = False
+
+        return meshes, bool(valid and meshes)
+
+    scene = getattr(context, "scene", None)
+    meshes = []
+
+    if scene is not None:
+        meshes = [
+            obj for obj in scene.objects
+            if obj.type == "MESH" and obj.visible_get()
+            and bc.is_kcl_object(obj)
+        ]
+
+    return meshes, bool(meshes)
+
+
 def _colour(index):
     r, g, b = colorsys.hsv_to_rgb((index * 0.61803398875) % 1.0, 0.55, 0.85)
     return r, g, b, 1.0
@@ -143,15 +190,10 @@ def _attribute_of(obj, mesh, poly_materials, default_attr):
 
 def export_kcl(context, filepath, scale=100.0, use_selection=True, apply_modifiers=True,
                default_attr=0, keep_area=True, report=None):
-    objs = [o for o in (context.selected_objects if use_selection else context.scene.objects)
-            if o.type == "MESH"]
-    if use_selection and not objs:
-        armatures = [o for o in context.selected_objects if o.type == "ARMATURE"]
-        if len(armatures) == 1:
-            objs = [o for o in context.scene.objects
-                    if o.type == "MESH" and bc.target_armature(o) == armatures[0]]
-    if not objs:
-        raise KclExportError("No mesh objects to export (select the collision mesh or untick 'Selected Only')")
+    objs, valid = kcl_export_objects(context, use_selection)
+
+    if not valid:
+        raise KclExportError(KCL_NO_MESH_ERROR)
     depsgraph = context.evaluated_depsgraph_get()
     tris, attrs = [], []
     template = None

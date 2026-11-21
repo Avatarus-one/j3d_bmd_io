@@ -25,19 +25,22 @@ def _continuous_euler(eul):
     """
     out = eul.copy()
 
-    for j in range(out.shape[0]):
+    if out.shape[2] > 1:
+        two_pi = 2.0 * math.pi
+
         for f in range(1, out.shape[2]):
-            prev = out[j, :, f - 1]
-            a = out[j, :, f]
-            alt = np.array([a[0] + math.pi, math.pi - a[1], a[2] + math.pi])
+            prev = out[:, :, f - 1]
+            current = out[:, :, f]
+            alt = np.stack((current[:, 0] + math.pi,
+                            math.pi - current[:, 1],
+                            current[:, 2] + math.pi), axis=1)
+            d_current = (current - prev + math.pi) % two_pi - math.pi
+            d_alt = (alt - prev + math.pi) % two_pi - math.pi
+            choose_alt = (np.abs(d_alt).sum(axis=1) <
+                          np.abs(d_current).sum(axis=1))
+            out[choose_alt, :, f] = alt[choose_alt]
 
-            def dist(v):
-                d = (v - prev + math.pi) % (2 * math.pi) - math.pi
-                return float(np.abs(d).sum())
-
-            out[j, :, f] = alt if dist(alt) < dist(a) else a
-
-        out[j] = np.unwrap(out[j], axis=1)
+        out = np.unwrap(out, axis=2)
 
     return out
 
@@ -144,6 +147,11 @@ def export_bck(context, filepath, scale=100.0, loop_mode="ONCE",
     smp = np.zeros((nj, 9, len(frames)))
     smp[:, [0, 3, 6]] = 1.0  # unit scale for joints without a bone
 
+    count = len(ordered)
+    corrections_arr = np.stack(corrections) if corrections else np.empty((0, 4, 4))
+    is_root = np.array([b.parent is None for b in ordered], dtype=bool)
+    bone_index = {b.name: i for i, b in enumerate(ordered)}
+
     scene = context.scene
     current = scene.frame_current
     current_subframe = scene.frame_subframe
@@ -153,27 +161,45 @@ def export_bck(context, filepath, scale=100.0, loop_mode="ONCE",
         for fi, f in enumerate(frames):
             scene.frame_set(f)
 
+            pose_mats = np.empty((count, 4, 4), dtype=np.float64)
+
             for j, bone in enumerate(ordered):
-                pb = arm_obj.pose.bones[bone.name]
-                pose = bc.to_np(pb.matrix)
+                pose_mats[j] = bc.to_np(arm_obj.pose.bones[bone.name].matrix)
 
-                if pb.parent is not None:
-                    parent_pose = bc.to_np(pb.parent.matrix)
-                    local_pose = np.linalg.inv(parent_pose) @ pose
-                else:
-                    local_pose = pose
+            local_pose = np.empty_like(pose_mats)
+            parent_inv = {}
 
-                Lb = corrections[j] @ local_pose
-                L = bc.blender_local_to_j3d(Lb, s, fix, bone.parent is None)
-                R, sc, shear_l = bc.split_trs(L[:3, :3])
+            for j, bone in enumerate(ordered):
+                if bone.parent is None:
+                    local_pose[j] = pose_mats[j]
+                    continue
 
-                if shear_l > 1e-4:
-                    sheared.add(bone.name)
+                parent_name = bone.parent.name
+                inverse = parent_inv.get(parent_name)
 
-                eul = matrix_to_euler(R)
-                smp[j, [0, 3, 6], fi] = sc
-                smp[j, [1, 4, 7], fi] = eul
-                smp[j, [2, 5, 8], fi] = L[:3, 3]
+                if inverse is None:
+                    inverse = np.linalg.inv(pose_mats[bone_index[parent_name]])
+                    parent_inv[parent_name] = inverse
+
+                local_pose[j] = inverse @ pose_mats[j]
+
+            Lb = corrections_arr @ local_pose
+            L = bc.blender_local_to_j3d_batch(Lb, s, fix, is_root)
+            R, sc, shear_values = bc.split_trs_batch(L[:, :3, :3])
+            eul = bc.matrix_to_euler_batch(R)
+
+            smp[:count, 0, fi] = sc[:, 0]
+            smp[:count, 3, fi] = sc[:, 1]
+            smp[:count, 6, fi] = sc[:, 2]
+            smp[:count, 1, fi] = eul[:, 0]
+            smp[:count, 4, fi] = eul[:, 1]
+            smp[:count, 7, fi] = eul[:, 2]
+            smp[:count, 2, fi] = L[:, 0, 3]
+            smp[:count, 5, fi] = L[:, 1, 3]
+            smp[:count, 8, fi] = L[:, 2, 3]
+
+            for j in np.nonzero(shear_values > 1e-4)[0]:
+                sheared.add(ordered[int(j)].name)
     finally:
         scene.frame_set(current, subframe=current_subframe)
 
@@ -224,8 +250,6 @@ def export_bck(context, filepath, scale=100.0, loop_mode="ONCE",
         action["bmd_loop_mode"] = mode
     except Exception:
         pass
-
-    bc.remember_export(action, "bck", filepath)
 
     if report:
         keys = sum(len(t.keys) for jt in bck.tracks for t in jt)

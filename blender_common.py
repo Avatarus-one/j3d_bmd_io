@@ -7,8 +7,9 @@ from dataclasses import dataclass
 
 import numpy as np
 import bpy
-from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, IntProperty,
-                       PointerProperty, StringProperty)
+from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
+                       FloatProperty, IntProperty, PointerProperty,
+                       StringProperty)
 from bpy.types import PropertyGroup
 
 from .j3d import gx_texture as gx
@@ -29,14 +30,257 @@ def context_model_object(context):
     return None
 
 
+# Keys written by the BMD importer/exporter.  ``bmd_vtx`` and
+# ``j3d_animations`` are intentionally absent: older builds created those
+# empty groups on every object, so they are not proof that an object is BMD.
+BMD_ARMATURE_KEYS = frozenset({
+    "bmd_bone_names", "bmd_source", "bmd_vtx_formats", "bmd_inf_flags",
+    "bmd_sub_version", "bmd_scale", "bmd_bone_axis", "bmd_textures",
+    "bmd_texture_keys",
+})
+BMD_MESH_KEYS = frozenset({
+    "bmd_shape_nodes", "bmd_joint", "bmd_order", "bmd_shape_index",
+    "bmd_bls_source", "bmd_source", "bmd_vtx_formats", "bmd_scale",
+    "bmd_textures", "bmd_texture_keys",
+})
+
+
+def bmd_scale_value(obj):
+    """Return the stored BMD scale, or None for a custom object."""
+    if obj is None:
+        return None
+
+    raw = obj.get("bmd_scale")
+    if raw is not None:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+
+    return None
+
+
+def bmd_convert_units_value(obj):
+    """Return a custom object's remembered Convert Units value, or None."""
+    if obj is None:
+        return None
+
+    raw = obj.get("bmd_convert_units")
+    if raw is not None:
+        return bool(raw)
+
+    return None
+
+
+def _bmd_scale_get(self):
+    try:
+        return float(self.get("bmd_scale", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _bmd_convert_units_get(self):
+    raw = self.get("bmd_convert_units")
+    return True if raw is None else bool(raw)
+
+
+def _bmd_string_get(name):
+    def getter(self):
+        value = self.get(name)
+        return "" if value is None else str(value)
+
+    return getter
+
+
+def _bmd_int_get(name):
+    def getter(self):
+        try:
+            return int(self.get(name, 0))
+        except (TypeError, ValueError):
+            return 0
+
+    return getter
+
+
+def _has_bmd_texture_list(obj):
+    if "bmd_texture_list" not in obj:
+        return False
+
+    try:
+        return len(obj.bmd_texture_list) > 0
+    except Exception:
+        return False
+
+
+def _has_loaded_vertex_formats(obj):
+    if "bmd_vtx" not in obj:
+        return False
+
+    try:
+        return bool(obj.bmd_vtx.loaded)
+    except Exception:
+        return False
+
+
+def is_bmd_armature(obj):
+    """True for armatures that carry BMD data written by this add-on."""
+    if obj is None or obj.type != "ARMATURE":
+        return False
+
+    if bmd_scale_value(obj) is not None:
+        return True
+
+    if any(key in obj for key in BMD_ARMATURE_KEYS):
+        return True
+
+    if _has_loaded_vertex_formats(obj):
+        return True
+
+    return _has_bmd_texture_list(obj)
+
+
+def is_bmd_mesh(obj):
+    """True for meshes that are part of a BMD model.
+
+    A mesh is BMD when it carries BMD metadata itself or is deformed by a BMD
+    armature.  An empty ``bmd_vtx``/``j3d_animations`` group left by an older
+    build is not enough; a ``bmd_vtx`` group that was actually initialized is.
+    """
+    if obj is None or obj.type != "MESH":
+        return False
+
+    if bmd_scale_value(obj) is not None:
+        return True
+
+    if any(key in obj for key in BMD_MESH_KEYS):
+        return True
+
+    if _has_loaded_vertex_formats(obj):
+        return True
+
+    mesh = obj.data
+
+    if mesh is not None:
+        if "bmd_normal_meta" in mesh:
+            return True
+
+        if mesh.attributes.get("bmd_node") is not None:
+            return True
+
+    arm = target_armature(obj)
+    return arm is not None and is_bmd_armature(arm)
+
+
+def is_bmd_object(obj):
+    """True when *obj* is an imported or explicitly initialized BMD model."""
+    if obj is None:
+        return False
+
+    if obj.type == "ARMATURE":
+        return is_bmd_armature(obj)
+
+    if obj.type == "MESH":
+        return is_bmd_mesh(obj)
+
+    return False
+
+
+def is_kcl_object(obj):
+    """True when *obj* is an imported or explicitly initialized KCL mesh."""
+    if obj is None or obj.type != "MESH":
+        return False
+
+    return ("kcl_source" in obj or "kcl_thickness" in obj
+            or "kcl_area_min" in obj)
+
+
+def is_bmd_material(mat):
+    """True when a material belongs to a BMD model (metadata or BMD nodes)."""
+    if mat is None:
+        return False
+
+    if "bmd_material" in mat or "bmd_name" in mat:
+        return True
+
+    tree = mat.node_tree
+
+    if tree is not None:
+        for node in tree.nodes:
+            if (node.type == "TEX_IMAGE"
+                    and node.name.startswith("bmd_tex")):
+                return True
+
+    return False
+
+
+def is_bmd_image(image):
+    """True when an image carries BMD metadata or is in a BMD texture list."""
+    if image is None:
+        return False
+
+    for key in image.keys():
+        if str(key).startswith("bmd_"):
+            return True
+
+    for obj in bpy.data.objects:
+        if obj.type not in {"MESH", "ARMATURE"} or not is_bmd_object(obj):
+            continue
+
+        try:
+            for slot in obj.bmd_texture_list:
+                if slot.image == image:
+                    return True
+        except Exception:
+            pass
+
+    return False
+
+
+def _store_convert_units(obj, value):
+    if obj is None:
+        return
+
+    if is_kcl_object(obj) and "kcl_source" in obj:
+        return
+
+    if bmd_scale_value(obj) is not None:
+        return
+
+    obj["bmd_convert_units"] = bool(value)
+
+
+def remember_convert_units(context, value, obj=None):
+    """Store the last Convert Units choice on a custom mesh/armature.
+
+    Imported models use ``bmd_scale`` and are left untouched.  A BMD model
+    keeps one value on its armature; standalone custom meshes keep it on the
+    mesh.  ``context`` is kept for call-site symmetry; nothing is stored on the
+    scene.
+    """
+    if obj is None:
+        return
+
+    if obj.type == "MESH":
+        if is_kcl_object(obj):
+            _store_convert_units(obj, value)
+            return
+
+        arm = target_armature(obj)
+
+        if arm is not None:
+            _store_convert_units(arm, value)
+        else:
+            _store_convert_units(obj, value)
+    elif obj.type == "ARMATURE":
+        _store_convert_units(obj, value)
+
+
 def saved_convert_units(context, obj=_AUTO_ARM):
     """Convert Units default for a model.
 
-    A model stores the scale it was imported with in ``bmd_scale`` (on the
-    armature, or on a static mesh).  Animations, shape keys and collision
-    should use the same units as the model; without a model the default is
-    converted units.  Pass ``None`` explicitly to disable the active/selected
-    object lookup.
+    A mesh/armature with ``bmd_scale`` uses that imported value.  For a custom
+    model, BLK/BLS read the armature's stored ``bmd_convert_units``; a
+    standalone mesh uses its own value.  Default is True.
     """
     if obj is _AUTO_ARM:
         obj = context_model_object(context)
@@ -47,14 +291,26 @@ def saved_convert_units(context, obj=_AUTO_ARM):
             arm = target_armature(obj)
             if arm is not None and arm is not obj:
                 candidates.append(arm)
+    stored = None
     for candidate in candidates:
-        scale = candidate.get("bmd_scale")
+        if is_kcl_object(candidate) and "kcl_source" in candidate:
+            kcl_scale = candidate.get("kcl_scale")
+
+            if kcl_scale is not None:
+                try:
+                    return abs(float(kcl_scale) - 1.0) > 1e-6
+                except (TypeError, ValueError):
+                    pass
+
+        scale = bmd_scale_value(candidate)
         if scale is not None:
-            try:
-                return abs(float(scale) - 1.0) > 1e-6
-            except (TypeError, ValueError):
-                pass
-    return True
+            return abs(float(scale) - 1.0) > 1e-6
+
+        if stored is None:
+            value = bmd_convert_units_value(candidate)
+            if value is not None:
+                stored = value
+    return True if stored is None else stored
 
 
 VERTEX_FORMAT_ITEMS = [
@@ -63,25 +319,30 @@ VERTEX_FORMAT_ITEMS = [
 ]
 
 
+# These are export settings shown in the J3D sidebar, not animatable scene
+# parameters: options=set() removes "Insert Keyframe" from their context menu.
 class BMD_VertexFormatSettings(PropertyGroup):
     """Per-model vertex formats shown in the 3D View BMD panel."""
 
-    loaded: BoolProperty(default=False)
+    loaded: BoolProperty(default=False, options=set())
     position_format: EnumProperty(
-        name="Positions", items=VERTEX_FORMAT_ITEMS, default="F32")
+        name="Positions", items=VERTEX_FORMAT_ITEMS, default="F32",
+        options=set())
     position_frac: IntProperty(
         name="Fraction", default=6, min=0, max=15,
-        description="Fraction bits for 16-bit positions")
+        description="Fraction bits for 16-bit positions", options=set())
     normal_format: EnumProperty(
-        name="Normals", items=VERTEX_FORMAT_ITEMS, default="F32")
+        name="Normals", items=VERTEX_FORMAT_ITEMS, default="F32",
+        options=set())
     normal_frac: IntProperty(
         name="Fraction", default=14, min=0, max=15,
-        description="Fraction bits for 16-bit normals")
+        description="Fraction bits for 16-bit normals", options=set())
     uv_format: EnumProperty(
-        name="UVs", items=VERTEX_FORMAT_ITEMS, default="F32")
+        name="UVs", items=VERTEX_FORMAT_ITEMS, default="F32",
+        options=set())
     uv_frac: IntProperty(
         name="Fraction", default=14, min=0, max=15,
-        description="Fraction bits for 16-bit UVs")
+        description="Fraction bits for 16-bit UVs", options=set())
 
 
 def vertex_format_choice(fmt, default_frac):
@@ -116,8 +377,12 @@ def ensure_vertex_formats(obj, read_only=False):
     """Return the object's format settings, initializing them from the import.
 
     During a panel draw Blender forbids writing ID properties, so ``read_only``
-    returns the current values (defaults) without initializing ``loaded``.
+    returns the current values (defaults) without initializing ``loaded`` and
+    without creating the group on an object that does not have it yet.
     """
+    if read_only and "bmd_vtx" not in obj:
+        return None
+
     settings = getattr(obj, "bmd_vtx", None)
     if settings is None:
         return None
@@ -138,24 +403,40 @@ def ensure_vertex_formats(obj, read_only=False):
 
 
 def initialize_vertex_formats():
-    """Initialize ``bmd_vtx`` for models imported before the panel existed."""
+    """Initialize ``bmd_vtx`` on BMD objects imported by an older build.
+
+    Objects without BMD metadata are left untouched; this function must not
+    turn every mesh/armature in the file into a J3D object.
+    """
     for obj in bpy.data.objects:
         if obj.type not in {"MESH", "ARMATURE"}:
             continue
         if obj.library is not None or obj.override_library is not None:
             continue
+        if not is_bmd_object(obj):
+            continue
+
+        # A skinned mesh uses the armature's vertex-format settings; only a
+        # standalone mesh needs its own bmd_vtx group.
+        if obj.type == "MESH":
+            arm = target_armature(obj)
+
+            if arm is not None and is_bmd_object(arm):
+                continue
+
         settings = getattr(obj, "bmd_vtx", None)
         if settings is None or settings.loaded:
             continue
         raw = obj.get("bmd_vtx_formats")
         if not raw:
+            settings.loaded = True
             continue
         try:
             table = json.loads(raw) if isinstance(raw, str) else raw
             formats = [(int(attr), *value) for attr, value in table.items()]
             apply_vertex_formats(obj, formats)
         except Exception:
-            pass
+            settings.loaded = True
 
 
 def export_stem(path, fallback=""):
@@ -165,25 +446,63 @@ def export_stem(path, fallback=""):
     return fallback
 
 
+_SHARED_EXPORT_KINDS = {"bmd", "kcl"}
+
+
+def _export_prop(kind, prefix="bmd_last_export"):
+    """Property name for the last export path of *kind*.
+
+    BMD and KCL share one field (a model and its collision mesh are exported
+    to the same place); BLS keeps its own field.  Animation export remembers
+    only its Export Folder, not per-file paths.
+    """
+    if kind in _SHARED_EXPORT_KINDS:
+        return prefix
+    return f"{prefix}_{kind}"
+
+
 def last_export_path(obj, kind):
     if obj is None:
         return ""
-    return str(obj.get(f"bmd_last_export_{kind}", ""))
+    return str(obj.get(_export_prop(kind), "") or "")
 
 
 def last_export_stem(obj, kind):
     return export_stem(last_export_path(obj, kind), "")
 
 
+def animation_label(action):
+    """User-facing animation name for an action."""
+    if action is None:
+        return ""
+
+    name = action.get("j3d_animation_name")
+
+    if name:
+        return str(name)
+
+    source = action.get("bmd_source")
+
+    if source:
+        return export_stem(source, action.name)
+
+    return action.name
+
+
+def animation_label_by_name(action_name):
+    action = bpy.data.actions.get(action_name) if action_name else None
+    return animation_label(action) if action is not None else str(action_name or "")
+
+
 def remember_export(obj, kind, filepath):
     if obj is None or not filepath:
         return
     try:
-        obj[f"bmd_last_export_{kind}"] = os.path.abspath(filepath)
+        obj[_export_prop(kind)] = os.path.abspath(filepath)
         if getattr(obj, "type", None) == "MESH":
             scene = getattr(bpy.context, "scene", None)
             if scene is not None:
-                scene[f"bmd_last_export_mesh_{kind}"] = obj.name
+                scene[_export_prop(kind, "bmd_last_export_mesh")] = obj.name
     except Exception:
         pass
 
@@ -192,13 +511,14 @@ def last_export_mesh(kind):
     """The mesh used by the last export of *kind*, if it still exists."""
     scene = getattr(bpy.context, "scene", None)
     if scene is not None:
-        name = scene.get(f"bmd_last_export_mesh_{kind}")
+        name = scene.get(_export_prop(kind, "bmd_last_export_mesh"))
         if name:
             obj = bpy.data.objects.get(str(name))
             if obj is not None and obj.type == "MESH":
                 return obj
+    key = _export_prop(kind)
     for obj in bpy.data.objects:
-        if obj.type == "MESH" and obj.get(f"bmd_last_export_{kind}"):
+        if obj.type == "MESH" and obj.get(key):
             return obj
     return None
 
@@ -309,6 +629,97 @@ def export_model_objects(context, use_selection=True):
     return arm, meshes
 
 
+BMD_NO_MESH_ERROR = (
+    "No mesh objects to export (select the meshes, or disable "
+    "'Selected Only'). Initialize custom meshes as BMD first.")
+
+
+def bmd_export_objects(context, use_selection=True):
+    """Return ``(armatures, meshes, valid)`` for a BMD export.
+
+    Only BMD armatures and meshes deformed by them are accepted.  With
+    ``use_selection`` every selected object must belong to that model; an
+    unrelated selection makes the export invalid.  Without it, all BMD models
+    in the scene are collected and unrelated meshes are skipped.
+    """
+    scene = getattr(context, "scene", None)
+    selected = list(getattr(context, "selected_objects", ()) or ())
+
+    if use_selection:
+        if not selected:
+            return [], [], False
+
+        meshes = []
+        selected_meshes = set()
+        selected_armatures = []
+        valid = True
+
+        for obj in selected:
+            if obj.type == "ARMATURE":
+                if is_bmd_object(obj):
+                    if obj not in selected_armatures:
+                        selected_armatures.append(obj)
+                else:
+                    valid = False
+            elif obj.type == "MESH":
+                arm = target_armature(obj)
+
+                if (is_bmd_object(obj) and arm is not None
+                        and is_bmd_object(arm)):
+                    if obj not in selected_meshes:
+                        meshes.append(obj)
+                        selected_meshes.add(obj)
+                else:
+                    valid = False
+            else:
+                valid = False
+
+        if scene is not None:
+            for arm in selected_armatures:
+                for obj in scene.objects:
+                    if (obj.type == "MESH" and obj not in selected_meshes
+                            and target_armature(obj) is arm
+                            and is_bmd_object(obj)):
+                        meshes.append(obj)
+                        selected_meshes.add(obj)
+    else:
+        valid = True
+        meshes = []
+        selected_meshes = set()
+
+        if scene is not None:
+            for obj in scene.objects:
+                if (obj.type != "MESH" or not obj.visible_get()
+                        or not is_bmd_object(obj)):
+                    continue
+
+                arm = target_armature(obj)
+
+                if arm is not None and is_bmd_object(arm):
+                    meshes.append(obj)
+                    selected_meshes.add(obj)
+
+    armatures = []
+
+    for mesh in meshes:
+        arm = target_armature(mesh)
+
+        if arm is not None and arm not in armatures:
+            armatures.append(arm)
+
+    if use_selection:
+        for arm in selected_armatures:
+            if arm not in armatures:
+                armatures.append(arm)
+
+    if not valid or not meshes or not armatures:
+        return [], [], False
+
+    meshes.sort(key=lambda o: (o.get("bmd_shape_index", 1e9),
+                               o.get("bmd_order", 1e9), o.name))
+    return armatures, meshes, True
+
+
 def model_mesh(context, owner=None):
     """Selected mesh, or the first mesh deformed by *owner* (an armature)."""
     obj = getattr(context, "active_object", None)
@@ -344,11 +755,46 @@ BONE_AXIS_ITEMS = [
     ("NONE", "Joint axes (exact)", "Bone axes are identical to the J3D joint axes"),
 ]
 
-IMAGE_FORMAT_ITEMS = [
-    (n, n, "") for n in ("CMPR", "RGB5A3", "RGBA32", "RGB565", "IA8", "IA4", "I8", "I4")
+# Formats the exporter can encode.
+EXPORT_FORMAT_ITEMS = [
+    ("CMPR", "CMPR",
+     "4-bit block compression (DXT1-like); 1-bit transparency. Smallest files."),
+    ("RGB5A3", "RGB5A3",
+     "16-bit: RGB555 opaque, or RGB444 + 3-bit alpha."),
+    ("RGBA32", "RGBA32",
+     "32-bit RGBA8888; 8-bit alpha. Largest."),
+    ("RGB565", "RGB565",
+     "16-bit RGB565, no alpha."),
+    ("IA8", "IA8",
+     "16-bit grayscale + 8-bit alpha."),
+    ("IA4", "IA4",
+     "8-bit grayscale + 4-bit alpha."),
+    ("I8", "I8",
+     "8-bit grayscale, no alpha."),
+    ("I4", "I4",
+     "4-bit grayscale, no alpha."),
 ]
 
+# Indexed formats: readable, and selectable again only for a texture that was
+# imported in that exact format.  Re-encoding requires a palette quantizer.
+PALETTE_FORMAT_ITEMS = [
+    ("C4", "C4", "4-bit indexed, 16 colors; needs a palette quantizer."),
+    ("C8", "C8", "8-bit indexed, 256 colors; needs a palette quantizer."),
+    ("C14X2", "C14X2", "14-bit indexed, 16,384 colors; needs a palette quantizer."),
+]
+
+IMAGE_FORMAT_ITEMS = list(EXPORT_FORMAT_ITEMS + PALETTE_FORMAT_ITEMS)
+EXPORT_FORMAT_NAMES = {item[0] for item in EXPORT_FORMAT_ITEMS}
+PALETTE_FORMAT_NAMES = {item[0] for item in PALETTE_FORMAT_ITEMS}
+
 FORMAT_ITEMS = list(IMAGE_FORMAT_ITEMS)
+
+
+def image_format_allowed(image, fmt):
+    """Palette formats stay selectable only on their original texture."""
+    if fmt not in PALETTE_FORMAT_NAMES:
+        return True
+    return str(image.get("bmd_orig_format", "")) == fmt
 
 WRAP_EXT = {0: "EXTEND", 1: "REPEAT", 2: "MIRROR"}
 WRAP_ITEMS = [
@@ -379,9 +825,24 @@ RENDER_ITEMS = [
 
 class BMDMaterialProps(PropertyGroup):
     render_mode: EnumProperty(name="Render Mode", items=RENDER_ITEMS, default="AUTO",
-                              description="How the game renders this material")
+                              description="How the game renders this material",
+                              options=set())
     alpha_ref: IntProperty(name="Alpha Reference", default=128, min=0, max=255,
-                           description="Alpha test threshold for the Cutout mode")
+                           description="Alpha test threshold for the Cutout mode",
+                           options=set())
+
+
+def _image_format_changed(self, context):
+    image = self.id_data
+    if image is None:
+        return
+
+    if not image_format_allowed(image, self.format):
+        orig = str(image.get("bmd_orig_format", ""))
+        self.format = orig if orig in {i[0] for i in IMAGE_FORMAT_ITEMS} else "CMPR"
+        return
+
+    image.pop("bmd_format_auto", None)
 
 
 def _image_key_changed(self, context):
@@ -423,7 +884,10 @@ def _apply_wrap_to_node(node, wrap_s, wrap_t):
     if not chain:
         uv = None
         if node.inputs["Vector"].is_linked:
-            source = node.inputs["Vector"].links[0].from_socket
+            link = node.inputs["Vector"].links[0]
+            source = link.from_socket
+            if link.from_node.type == "UVMAP":
+                uv = link.from_node
         else:
             uv = tree.nodes.new("ShaderNodeUVMap")
             uv.uv_map = "UV0"
@@ -532,6 +996,13 @@ def image_by_key(key):
     for image in bpy.data.images:
         if texture_key(image) == key:
             return image
+        raw = image.get("bmd_keys")
+        if raw:
+            try:
+                if key in json.loads(raw):
+                    return image
+            except Exception:
+                pass
     return None
 
 
@@ -539,7 +1010,7 @@ def sync_texture_legacy(arm_obj):
     """Keep the old bmd_textures / bmd_texture_keys arrays in sync."""
     names, keys = [], []
     for slot in arm_obj.bmd_texture_list:
-        key = texture_slot_key(slot)
+        key = str(slot.key or "") or texture_slot_key(slot)
         name = slot.name
         if slot.image is not None:
             # Legacy arrays stored image datablock names, not BMD names.
@@ -548,6 +1019,13 @@ def sync_texture_legacy(arm_obj):
         keys.append(key)
     arm_obj["bmd_textures"] = names
     arm_obj["bmd_texture_keys"] = keys
+
+
+def texture_list(arm_obj):
+    """Read-only texture list: never migrates legacy data (safe in draw)."""
+    if arm_obj is None:
+        return ()
+    return arm_obj.bmd_texture_list
 
 
 def ensure_texture_list(arm_obj):
@@ -585,9 +1063,8 @@ def texture_slot(arm_obj, image):
     """(index, slot) of *image* in the BMD texture list, or (-1, None)."""
     if arm_obj is None or image is None:
         return -1, None
-    ensure_texture_list(arm_obj)
     key = texture_key(image)
-    for i, slot in enumerate(arm_obj.bmd_texture_list):
+    for i, slot in enumerate(texture_list(arm_obj)):
         if slot.image == image or texture_slot_key(slot) == key:
             return i, slot
     return -1, None
@@ -614,8 +1091,11 @@ def material_texture_slots(mat, owner=None, store=True):
         if owner is None:
             return [None] * 8
         slots = [None] * 8
-        key_to_index = {texture_slot_key(s): i
-                        for i, s in enumerate(owner.bmd_texture_list)}
+        key_to_index = {}
+        for i, s in enumerate(owner.bmd_texture_list):
+            key = str(s.key or "") or texture_slot_key(s)
+            if key:
+                key_to_index.setdefault(key, i)
         stored = mat.get("bmd_material")
         names = []
         if stored:
@@ -648,6 +1128,8 @@ def set_material_texture_slots(mat, slots):
 
 def remap_material_texture_slots(owner, mapping):
     for material in bpy.data.materials:
+        if not is_bmd_material(material):
+            continue
         slots = material_texture_slots(material, owner)
         new = [mapping.get(s, s) if s is not None else None for s in slots]
         if new != slots:
@@ -656,6 +1138,8 @@ def remap_material_texture_slots(owner, mapping):
 
 def remove_material_texture_slot(owner, index):
     for material in bpy.data.materials:
+        if not is_bmd_material(material):
+            continue
         slots = material_texture_slots(material, owner)
         changed = False
         for n, s in enumerate(slots):
@@ -710,6 +1194,8 @@ def clear_material_textures(old_key, slot_index=None, owner=None):
     if not old_key:
         return
     for material in bpy.data.materials:
+        if not is_bmd_material(material):
+            continue
         tree = material.node_tree
         slots = (material_texture_slots(material, owner)
                  if slot_index is not None and owner is not None else None)
@@ -753,6 +1239,8 @@ def retarget_material_textures(old_key, new_key, new_image, slot_index=None,
     if not old_key:
         return
     for material in bpy.data.materials:
+        if not is_bmd_material(material):
+            continue
         tree = material.node_tree
         slots = (material_texture_slots(material, owner)
                  if slot_index is not None and owner is not None else None)
@@ -866,44 +1354,52 @@ def _texture_slot_name_changed(self, context):
 
 class BMDTextureSlot(PropertyGroup):
     image: PointerProperty(type=bpy.types.Image, name="Image",
-                           update=_texture_slot_image_changed)
-    name: StringProperty(name="BMD Name", update=_texture_slot_name_changed)
+                           update=_texture_slot_image_changed, options=set())
+    name: StringProperty(name="BMD Name", update=_texture_slot_name_changed,
+                         options=set())
     key: StringProperty(options={"HIDDEN"})
 
 
 class BMDImageProps(PropertyGroup):
-    format: EnumProperty(name="GX Format", items=IMAGE_FORMAT_ITEMS, default="CMPR",
-                         description="Texture format used when exporting this image")
+    format: EnumProperty(
+        name="GX Format", items=IMAGE_FORMAT_ITEMS, default="CMPR",
+        description="Texture format used when exporting this image",
+        update=_image_format_changed, options=set())
     key: StringProperty(
         name="BMD Key",
         description="Unique key used by materials to reference this texture. "
                     "Empty = use the image datablock name",
         update=_image_key_changed,
+        options=set(),
     )
     key_custom: BoolProperty(default=False, options={"HIDDEN"})
     wrap_s: EnumProperty(name="Wrap S", items=WRAP_ITEMS, default="1",
-                         update=_image_wrap_changed)
+                         update=_image_wrap_changed, options=set())
     wrap_t: EnumProperty(name="Wrap T", items=WRAP_ITEMS, default="1",
-                         update=_image_wrap_changed)
-    min_filter: EnumProperty(name="Min Filter", items=MIN_FILTER_ITEMS, default="1")
+                         update=_image_wrap_changed, options=set())
+    min_filter: EnumProperty(name="Min Filter", items=MIN_FILTER_ITEMS,
+                             default="1", options=set())
     mag_filter: EnumProperty(name="Mag Filter", items=MAG_FILTER_ITEMS, default="1",
-                             update=_image_filter_changed)
+                             update=_image_filter_changed, options=set())
     min_lod: IntProperty(name="Min LOD", default=0, min=-128, max=127,
-                         description="Raw GX LOD value (1/8 units)")
+                         description="Raw GX LOD value (1/8 units)",
+                         options=set())
     max_lod: IntProperty(name="Max LOD", default=0, min=-128, max=127,
                          description="Raw GX LOD value (1/8 units)",
-                         update=_image_max_lod_changed)
+                         update=_image_max_lod_changed, options=set())
     max_lod_custom: BoolProperty(default=False, options={"HIDDEN"})
     lod_bias: IntProperty(name="LOD Bias", default=0, min=-32768, max=32767,
-                          description="Raw GX LOD bias (1/100 units)")
-    mip_count: IntProperty(name="Mip Levels", default=0, min=0, max=12,
-                           description="Number of mip levels (0 = automatic / keep imported)",
-                           update=_image_mip_count_changed)
+                          description="Raw GX LOD bias (1/100 units)",
+                          options=set())
+    mip_count: IntProperty(name="Mip Levels", default=1, min=1, max=12,
+                           description="Number of mip levels",
+                           update=_image_mip_count_changed, options=set())
     external: BoolProperty(name="External Texture", default=False,
                            description="Store this texture outside the BMD (header-only TEX1 "
                                        "entry). Use File > Export > J3D Textures (.bti) to write "
                                        "external textures to a folder. Tick this for any BMD, "
-                                       "disk or scene texture to make it external")
+                                       "disk or scene texture to make it external",
+                           options=set())
 
 
 def axis_fix(arm_obj):
@@ -914,6 +1410,11 @@ def axis_fix(arm_obj):
 def mesh_object_poll(_self, obj):
     """PointerProperty poll for mesh objects."""
     return obj is not None and obj.type == "MESH"
+
+
+def bmd_mesh_poll(_self, obj):
+    """PointerProperty poll for meshes initialized/imported as BMD."""
+    return obj is not None and obj.type == "MESH" and is_bmd_object(obj)
 
 
 def target_armature(obj):
@@ -931,6 +1432,199 @@ def target_armature(obj):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Explicitly initialize a custom mesh as a BMD model
+# ---------------------------------------------------------------------------
+
+def default_vertex_formats():
+    """F32 position/normal/UV formats used for a newly initialized model."""
+    return ([(9, 0, 4, 0), (10, 0, 4, 0)]
+            + [(13 + index, 1, 4, 0) for index in range(8)])
+
+
+def _format_table_json(formats):
+    return json.dumps({str(int(attr)): [int(components), int(typ), int(frac)]
+                       for attr, components, typ, frac in formats},
+                      separators=(",", ":"))
+
+
+def _read_vertex_formats(obj):
+    raw = obj.get("bmd_vtx_formats")
+
+    if raw:
+        try:
+            table = json.loads(raw) if isinstance(raw, str) else raw
+            return [(int(attr), *value) for attr, value in table.items()]
+        except (TypeError, ValueError, AttributeError):
+            pass
+
+    return None
+
+
+def _store_vertex_formats(obj, formats):
+    obj["bmd_vtx_formats"] = _format_table_json(formats)
+    apply_vertex_formats(obj, formats)
+
+
+def _initialize_armature_data(arm):
+    """Give an arbitrary armature the BMD fields needed by the panels.
+
+    Deliberately does not write bone indices or ``bmd_bone_names``: a custom
+    armature must keep using its *current* bone count and hierarchy for BCK
+    compatibility, even after bones are added or removed.
+    """
+    if arm is None or arm.type != "ARMATURE":
+        return
+
+    formats = _read_vertex_formats(arm) or default_vertex_formats()
+    _store_vertex_formats(arm, formats)
+
+    if "bmd_bone_axis" not in arm:
+        arm["bmd_bone_axis"] = "X"
+    if "bmd_inf_flags" not in arm:
+        arm["bmd_inf_flags"] = 0
+    if "bmd_textures" not in arm:
+        arm["bmd_textures"] = []
+    if "bmd_texture_keys" not in arm:
+        arm["bmd_texture_keys"] = []
+
+
+def _new_bmd_armature(context, mesh):
+    """Create a single-root BMD armature for a mesh without one."""
+    base = mesh.name
+    data = bpy.data.armatures.new(f"{base}_armature")
+    arm = bpy.data.objects.new(f"{base}_armature", data)
+    collections = list(getattr(mesh, "users_collection", ()) or ())
+
+    if collections:
+        collections[0].objects.link(arm)
+    else:
+        context.collection.objects.link(arm)
+
+    arm.show_in_front = True
+    arm.matrix_world = mesh.matrix_world.copy()
+
+    view_layer = context.view_layer
+    previous_active = view_layer.objects.active
+    previous_selected = [obj for obj in view_layer.objects
+                         if obj.select_get()]
+
+    if previous_active is not None and previous_active.mode != "OBJECT":
+        try:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except Exception:
+            pass
+
+    for obj in view_layer.objects:
+        obj.select_set(False)
+
+    view_layer.objects.active = arm
+    arm.select_set(True)
+
+    try:
+        bpy.ops.object.mode_set(mode="EDIT")
+        bone = data.edit_bones.new("root")
+        bone.head = (0.0, 0.0, 0.0)
+        size = max(mesh.dimensions) * 0.1
+        bone.tail = (0.0, max(0.1, size), 0.0)
+        bpy.ops.object.mode_set(mode="OBJECT")
+    finally:
+        if arm.mode != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception:
+                pass
+
+    _initialize_armature_data(arm)
+
+    # Keep the mesh world transform and bind it to the new armature.
+    world = mesh.matrix_world.copy()
+
+    if mesh.parent is None:
+        mesh.parent = arm
+        mesh.parent_type = "OBJECT"
+        mesh.matrix_parent_inverse = arm.matrix_world.inverted()
+        mesh.matrix_world = world
+
+    if not any(mod.type == "ARMATURE" and mod.object == arm
+               for mod in mesh.modifiers):
+        modifier = mesh.modifiers.new("Armature", "ARMATURE")
+        modifier.object = arm
+
+    if not any(group.name == "root" for group in mesh.vertex_groups):
+        group = mesh.vertex_groups.new(name="root")
+        group.add(list(range(len(mesh.data.vertices))), 1.0, "REPLACE")
+
+    for obj in view_layer.objects:
+        obj.select_set(obj is mesh or obj is arm or obj in previous_selected)
+
+    view_layer.objects.active = mesh
+    return arm
+
+
+def _selected_armature(context):
+    """The armature selected for binding a custom mesh, if any."""
+    active = getattr(context, "active_object", None)
+
+    if active is not None and active.type == "ARMATURE":
+        return active
+
+    selected = [obj for obj in (getattr(context, "selected_objects", ()) or ())
+                if obj.type == "ARMATURE"]
+
+    if not selected:
+        return None
+
+    for arm in selected:
+        if is_bmd_object(arm):
+            return arm
+
+    return selected[0]
+
+
+def _bind_mesh_to_armature(mesh, arm):
+    """Bind *mesh* to *arm* without changing its world transform."""
+    world = mesh.matrix_world.copy()
+
+    if mesh.parent is None:
+        mesh.parent = arm
+        mesh.parent_type = "OBJECT"
+        mesh.matrix_parent_inverse = arm.matrix_world.inverted()
+        mesh.matrix_world = world
+
+    if not any(mod.type == "ARMATURE" and mod.object == arm
+               for mod in mesh.modifiers):
+        modifier = mesh.modifiers.new("Armature", "ARMATURE")
+        modifier.object = arm
+
+
+def initialize_as_bmd(context, mesh):
+    """Add the BMD metadata and (if needed) armature to a custom mesh.
+
+    Called only from the explicit Utility > Initialize as BMD operator.
+    """
+    if mesh is None or mesh.type != "MESH":
+        return None
+
+    arm = target_armature(mesh)
+
+    if arm is None:
+        arm = _selected_armature(context)
+
+    if arm is None:
+        arm = _new_bmd_armature(context, mesh)
+    else:
+        _initialize_armature_data(arm)
+        _bind_mesh_to_armature(mesh, arm)
+
+    try:
+        context.view_layer.update()
+    except Exception:
+        pass
+
+    return arm
+
+
 def model_label(arm):
     """Human-readable label for an imported BMD model/armature."""
     source = str(arm.get("bmd_source", ""))
@@ -942,6 +1636,38 @@ def model_label(arm):
         return arm.users_collection[0].name
 
     return arm.name
+
+
+def euler_to_matrices(euler):
+    """Vectorised version of :func:`j3d.model.euler_to_matrix`."""
+    euler = np.asarray(euler, dtype=np.float64)
+    rx, ry, rz = euler[:, 0], euler[:, 1], euler[:, 2]
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    out = np.empty((len(euler), 3, 3), dtype=np.float64)
+    out[:, 0, 0] = cz * cy
+    out[:, 0, 1] = cz * sy * sx - sz * cx
+    out[:, 0, 2] = cz * sy * cx + sz * sx
+    out[:, 1, 0] = sz * cy
+    out[:, 1, 1] = sz * sy * sx + cz * cx
+    out[:, 1, 2] = sz * sy * cx - cz * sx
+    out[:, 2, 0] = -sy
+    out[:, 2, 1] = cy * sx
+    out[:, 2, 2] = cy * cx
+    return out
+
+
+def trs_matrices(scale, euler, trans):
+    """Vectorised version of :func:`trs_matrix` for a stack of samples."""
+    scale = np.asarray(scale, dtype=np.float64)
+    trans = np.asarray(trans, dtype=np.float64)
+    n = len(scale)
+    out = np.zeros((n, 4, 4), dtype=np.float64)
+    out[:, 3, 3] = 1.0
+    out[:, :3, :3] = euler_to_matrices(euler) * scale[:, None, :]
+    out[:, :3, 3] = trans
+    return out
 
 
 def j3d_local_to_blender(L, s, fix, is_root=False):
@@ -958,11 +1684,37 @@ def j3d_local_to_blender(L, s, fix, is_root=False):
     return M
 
 
+def j3d_local_to_blender_batch(L, s, fix, is_root=False):
+    """Vectorised :func:`j3d_local_to_blender` for ``(n, 4, 4)`` matrices."""
+    M = C @ L @ C_INV @ fix
+    if np.ndim(is_root):
+        child = ~np.asarray(is_root, dtype=bool)
+        if child.any():
+            M[child] = fix.T @ M[child]
+    elif not is_root:
+        M = fix.T @ M
+    M[:, :3, 3] *= s
+    return M
+
+
 def blender_local_to_j3d(M, s, fix, is_root=False):
     """Inverse of :func:`j3d_local_to_blender`."""
     M = M.copy()
     M[:3, 3] /= s
     if not is_root:
+        M = fix @ M
+    return C_INV @ M @ fix.T @ C
+
+
+def blender_local_to_j3d_batch(M, s, fix, is_root=False):
+    """Vectorised :func:`blender_local_to_j3d` for ``(n, 4, 4)`` matrices."""
+    M = M.copy()
+    M[:, :3, 3] /= s
+    if np.ndim(is_root):
+        child = ~np.asarray(is_root, dtype=bool)
+        if child.any():
+            M[child] = fix @ M[child]
+    elif not is_root:
         M = fix @ M
     return C_INV @ M @ fix.T @ C
 
@@ -1025,6 +1777,90 @@ def split_trs(A):
     return Rp, scale, shear
 
 
+def split_trs_batch(A):
+    """Vectorised :func:`split_trs` for a stack of 3x3 matrices."""
+    A = np.asarray(A, dtype=np.float64)
+    n = len(A)
+    if n == 0:
+        return A.copy(), np.empty((0, 3)), np.empty(0)
+
+    scale = np.linalg.norm(A, axis=1)
+    scale[scale == 0] = 1.0
+    R = A / scale[:, None, :]
+
+    neg = np.linalg.det(R) < 0.0
+    if neg.any():
+        indices = np.nonzero(neg)[0]
+        axes = np.argmin(np.abs(scale[indices]), axis=1)
+        for i, axis in zip(indices, axes):
+            scale[i, axis] = -scale[i, axis]
+            R[i, :, axis] = -R[i, :, axis]
+
+    U, _S, Vt = np.linalg.svd(R)
+    Rp = U @ Vt
+    neg = np.linalg.det(Rp) < 0.0
+    if neg.any():
+        U[neg, :, -1] *= -1.0
+        Rp = U @ Vt
+
+    shear = np.abs(R - Rp).reshape(n, -1).max(axis=1)
+    return Rp, scale, shear
+
+
+def matrix_to_quat_batch(R):
+    """Vectorised :func:`matrix_to_quat` for a stack of 3x3 rotations."""
+    R = np.asarray(R, dtype=np.float64)
+    n = len(R)
+    if n == 0:
+        return np.empty((0, 4))
+
+    r00, r01, r02 = R[:, 0, 0], R[:, 0, 1], R[:, 0, 2]
+    r10, r11, r12 = R[:, 1, 0], R[:, 1, 1], R[:, 1, 2]
+    r20, r21, r22 = R[:, 2, 0], R[:, 2, 1], R[:, 2, 2]
+    trace = r00 + r11 + r22
+
+    b0 = trace > 0.0
+    b1 = (~b0) & (r00 > r11) & (r00 > r22)
+    b2 = (~b0) & (~b1) & (r11 > r22)
+    b3 = ~(b0 | b1 | b2)
+
+    k0 = np.maximum(np.sqrt(np.maximum(trace + 1.0, 0.0)) * 2.0, 1e-12)
+    k1 = np.maximum(np.sqrt(np.maximum(1.0 + r00 - r11 - r22, 0.0)) * 2.0,
+                    1e-12)
+    k2 = np.maximum(np.sqrt(np.maximum(1.0 + r11 - r00 - r22, 0.0)) * 2.0,
+                    1e-12)
+    k3 = np.maximum(np.sqrt(np.maximum(1.0 + r22 - r00 - r11, 0.0)) * 2.0,
+                    1e-12)
+
+    q0 = np.stack([0.25 * k0, (r21 - r12) / k0, (r02 - r20) / k0,
+                   (r10 - r01) / k0], axis=1)
+    q1 = np.stack([(r21 - r12) / k1, 0.25 * k1, (r01 + r10) / k1,
+                   (r02 + r20) / k1], axis=1)
+    q2 = np.stack([(r02 - r20) / k2, (r01 + r10) / k2, 0.25 * k2,
+                   (r12 + r21) / k2], axis=1)
+    q3 = np.stack([(r10 - r01) / k3, (r02 + r20) / k3, (r12 + r21) / k3,
+                   0.25 * k3], axis=1)
+
+    q = np.where(b0[:, None], q0,
+                 np.where(b1[:, None], q1,
+                          np.where(b2[:, None], q2, q3)))
+    norm = np.linalg.norm(q, axis=1)
+    norm[norm == 0.0] = 1.0
+    return q / norm[:, None]
+
+
+def matrix_to_euler_batch(R):
+    """Vectorised :func:`j3d.model.matrix_to_euler`."""
+    R = np.asarray(R, dtype=np.float64)
+    sy = np.clip(-R[:, 2, 0], -1.0, 1.0)
+    y = np.arcsin(sy)
+    normal = np.abs(sy) < 0.999999
+    x = np.where(normal, np.arctan2(R[:, 2, 1], R[:, 2, 2]),
+                 np.arctan2(-R[:, 1, 2], R[:, 1, 1]))
+    z = np.where(normal, np.arctan2(R[:, 1, 0], R[:, 0, 0]), 0.0)
+    return np.stack([x, y, z], axis=1)
+
+
 def decompose(M):
     """4x4 matrix -> (location, quaternion wxyz, signed scale)."""
     loc = M[:3, 3].copy()
@@ -1063,7 +1899,7 @@ def vec_from_blender(v):
 
 def texture_key(image):
     """Unique key of an image inside the exported file."""
-    bmd = getattr(image, "bmd", None)
+    bmd = image.bmd if "bmd" in image else None
     if bmd is not None and bool(getattr(bmd, "key_custom", False)):
         key = str(bmd.key or "")
         return key or f"__image__{image.name}"
@@ -1097,25 +1933,74 @@ def clean_texture_name(image):
     return name
 
 
+def _register_type_property(owner, name, prop):
+    try:
+        setattr(owner, name, prop)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+
 def register_classes():
-    bpy.utils.register_class(BMDMaterialProps)
-    bpy.utils.register_class(BMDImageProps)
-    bpy.utils.register_class(BMDTextureSlot)
-    bpy.utils.register_class(BMD_VertexFormatSettings)
-    bpy.types.Material.bmd = PointerProperty(type=BMDMaterialProps)
-    bpy.types.Image.bmd = PointerProperty(type=BMDImageProps)
-    bpy.types.Object.bmd_texture_list = CollectionProperty(type=BMDTextureSlot)
-    bpy.types.Object.bmd_texture_index = IntProperty(default=0, min=0)
-    bpy.types.Object.bmd_vtx = PointerProperty(type=BMD_VertexFormatSettings)
+    for cls in (BMDMaterialProps, BMDImageProps, BMDTextureSlot,
+                BMD_VertexFormatSettings):
+        try:
+            bpy.utils.register_class(cls)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    _register_type_property(
+        bpy.types.Object, "bmd_scale",
+        FloatProperty(name="BMD Scale", get=_bmd_scale_get))
+    _register_type_property(
+        bpy.types.Object, "bmd_convert_units",
+        BoolProperty(name="Convert Units", get=_bmd_convert_units_get))
+    for name in ("bmd_bone_axis", "bmd_vtx_formats", "bmd_sub_version",
+                 "bmd_shape_nodes"):
+        _register_type_property(
+            bpy.types.Object, name,
+            StringProperty(name=name, get=_bmd_string_get(name)))
+    _register_type_property(
+        bpy.types.Object, "bmd_inf_flags",
+        IntProperty(name="BMD INF Flags", get=_bmd_int_get("bmd_inf_flags")))
+    _register_type_property(
+        bpy.types.Material, "bmd", PointerProperty(type=BMDMaterialProps))
+    _register_type_property(
+        bpy.types.Image, "bmd", PointerProperty(type=BMDImageProps))
+    _register_type_property(
+        bpy.types.Object, "bmd_texture_list",
+        CollectionProperty(type=BMDTextureSlot))
+    _register_type_property(
+        bpy.types.Object, "bmd_texture_index",
+        IntProperty(default=0, min=0, options=set()))
+    _register_type_property(
+        bpy.types.Object, "bmd_vtx",
+        PointerProperty(type=BMD_VertexFormatSettings))
+
+
+def _remove_type_property(owner, name):
+    if not hasattr(owner, name):
+        return
+
+    try:
+        delattr(owner, name)
+    except Exception:
+        pass
 
 
 def unregister_classes():
-    del bpy.types.Object.bmd_vtx
-    del bpy.types.Object.bmd_texture_index
-    del bpy.types.Object.bmd_texture_list
-    del bpy.types.Image.bmd
-    del bpy.types.Material.bmd
-    bpy.utils.unregister_class(BMD_VertexFormatSettings)
-    bpy.utils.unregister_class(BMDTextureSlot)
-    bpy.utils.unregister_class(BMDImageProps)
-    bpy.utils.unregister_class(BMDMaterialProps)
+    for name in ("bmd_vtx", "bmd_texture_index", "bmd_texture_list",
+                 "bmd_convert_units", "bmd_scale", "bmd_bone_axis",
+                 "bmd_vtx_formats", "bmd_inf_flags", "bmd_shape_nodes",
+                 "bmd_sub_version"):
+        _remove_type_property(bpy.types.Object, name)
+    _remove_type_property(bpy.types.Image, "bmd")
+    _remove_type_property(bpy.types.Material, "bmd")
+
+    for cls in (BMD_VertexFormatSettings, BMDTextureSlot,
+                BMDImageProps, BMDMaterialProps):
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass

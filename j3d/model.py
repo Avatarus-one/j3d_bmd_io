@@ -68,6 +68,8 @@ class Texture:
         self.external = False
         self.external_path = None
         self.external_size = None  # original BMD header size (w, h)
+        self.data_block = None     # absolute offset of the pixel data (shared by indices)
+        self.data_group = None     # export hint: textures sharing one image share one data block
         self.pal_enabled = 0
         self.pal_format = 0
         self.pal_count = 0
@@ -373,6 +375,7 @@ def _parse_tex1(d, off, load_data=True):
     o_names = u32(d, off + 0x10)
     names = read_string_table(d, off + o_names) if o_names else [f"texture{i}" for i in range(n)]
     textures = []
+    shared_blocks = {}
     for i in range(n):
         e = off + o_hdr + 0x20 * i
         t = Texture(names[i] if i < len(names) else f"texture{i}")
@@ -398,6 +401,18 @@ def _parse_tex1(d, off, load_data=True):
                 t.rgba = np.full((h, w, 4), 128, np.uint8)
             textures.append(t)
             continue
+        t.data_block = e + header.data_offset
+        first = shared_blocks.get(t.data_block)
+        if first is not None:
+            # Several TEX1 entries may point at the same pixel block.  They are
+            # the same texture under different indices: share the decoded data
+            # instead of copying it, while keeping separate names/keys/settings.
+            t.rgba = first.rgba
+            t.raw_data = first.raw_data
+            t.raw_palette = first.raw_palette
+            textures.append(t)
+            continue
+        shared_blocks[t.data_block] = t
         if not load_data:
             textures.append(t)
             continue

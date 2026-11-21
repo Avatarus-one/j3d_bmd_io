@@ -28,14 +28,15 @@ def _armature_joint_count(arm):
     """Joint count used for BCK compatibility.
 
     Imported BMD armatures keep the original joint list in ``bmd_bone_names``;
-    bones added or removed later must not change compatibility.  A from-scratch
-    armature has no such list, so its current bone count is used.
+    bones added or removed later must not change compatibility.  A custom
+    armature (no ``bmd_source``) always uses its current bone count, even if an
+    export has since written ``bmd_bone_names``.
     """
     if arm is None:
         return 0
 
     names = arm.get("bmd_bone_names", [])
-    if names:
+    if names and arm.get("bmd_source"):
         return len(names)
 
     return len(arm.data.bones)
@@ -102,18 +103,21 @@ def assign_targets(animations, candidates):
 def _bone_joint_map(arm_obj, njoints, report=None):
     """Map BCK joint indices to bones, tolerating duplicates and stale indices.
 
-    Duplicated bones copy ``bmd_index`` from the original.  The bone whose name
-    is still listed in ``bmd_bone_names`` keeps the track; the duplicate is left
-    at rest and reported.  This keeps a BCK import working after any skeleton
-    edit instead of silently animating the wrong bone.
+    Imported bones use their original ``bmd_index``/``bmd_bone_names`` mapping.
+    A custom armature ignores that metadata and uses the current bone hierarchy.
     """
-    names = [str(n) for n in arm_obj.get("bmd_bone_names", [])]
-    bones, duplicates = joint_index_owners(arm_obj.data, names)
+    if arm_obj.get("bmd_source"):
+        names = [str(n) for n in arm_obj.get("bmd_bone_names", [])]
+        bones, duplicates = joint_index_owners(arm_obj.data, names)
 
-    if not bones and not names:
-        # A from-scratch armature has no J3D indices: map the tracks to the
-        # bones in hierarchy order (parents first), like a fresh export would.
-        ordered = ordered_bones(arm_obj.data, [])
+        if not bones and not names:
+            ordered = ordered_bones(arm_obj.data, [])
+            bones = {index: bone for index, bone in enumerate(ordered)}
+            duplicates = []
+    else:
+        # Custom armature: ignore any stale bmd_index values written by an
+        # earlier export and map to the current hierarchy.
+        ordered = ordered_bones(arm_obj.data, [], use_indices=False)
         bones = {index: bone for index, bone in enumerate(ordered)}
         duplicates = []
 
@@ -206,23 +210,29 @@ def _key_joint(arm_obj, bone, smp, frames, s, fix, cyclic=False):
     pb = arm_obj.pose.bones[bone.name]
     rest_inv = np.linalg.inv(rest_local(bone, fix, s))
     n = len(frames)
-    loc, quat, scl = np.zeros((n, 3)), np.zeros((n, 4)), np.zeros((n, 3))
     shear = 0.0
 
-    for i in range(n):
-        L = bc.trs_matrix(smp[[0, 3, 6], i], smp[[1, 4, 7], i],
-                          smp[[2, 5, 8], i])
-        basis = rest_inv @ bc.j3d_local_to_blender(
+    if n:
+        L = bc.trs_matrices(smp[[0, 3, 6], :].T,
+                            smp[[1, 4, 7], :].T,
+                            smp[[2, 5, 8], :].T)
+        basis = rest_inv @ bc.j3d_local_to_blender_batch(
             L, s, fix, bone.parent is None)
-        R, sc, sh = bc.split_trs(basis[:3, :3])
-        loc[i] = basis[:3, 3]
-        quat[i] = bc.matrix_to_quat(R)
-        scl[i] = sc
-        shear = max(shear, sh)
+        R, scl, shear_values = bc.split_trs_batch(basis[:, :3, :3])
+        loc = basis[:, :3, 3]
+        quat = bc.matrix_to_quat_batch(R)
+        shear = float(shear_values.max())
 
-        if i and np.dot(quat[i], quat[i - 1]) < 0:
-            # Keep the quaternion on the same hemisphere.
-            quat[i] = -quat[i]
+        # Keep the quaternions on the same hemisphere.  Flip signs propagate
+        # cumulatively, matching the previous per-frame loop.
+        if n > 1:
+            dots = (quat[1:] * quat[:-1]).sum(axis=1)
+            signs = np.cumprod(np.where(dots < 0.0, -1.0, 1.0))
+            quat[1:] *= signs[:, None]
+    else:
+        loc = np.zeros((0, 3))
+        quat = np.zeros((0, 4))
+        scl = np.zeros((0, 3))
 
     pb.rotation_mode = "QUATERNION"
     action = arm_obj.animation_data.action
@@ -249,9 +259,10 @@ def _key_joint(arm_obj, bone, smp, frames, s, fix, cyclic=False):
 
 
 def import_bck(context, filepath, scale=0.01, set_scene_range=True, report=None,
-               set_fps=True, target=None):
-    with open(filepath, "rb") as f:
-        bck = anim.parse_bck(f.read())
+               target=None, bck=None):
+    if bck is None:
+        with open(filepath, "rb") as f:
+            bck = anim.parse_bck(f.read())
 
     if target is not None:
         arm_obj = (target if target.type == "ARMATURE"
@@ -263,10 +274,6 @@ def import_bck(context, filepath, scale=0.01, set_scene_range=True, report=None,
 
     s = float(scale)
     fix = bc.axis_fix(arm_obj)
-
-    if set_fps:
-        context.scene.render.fps = 30
-        context.scene.render.fps_base = 1.0
 
     njoints = len(bck.tracks)
     bones = _bone_joint_map(arm_obj, njoints, report)

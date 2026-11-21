@@ -24,6 +24,10 @@ I4, I8, IA4, IA8, RGB565, RGB5A3, RGBA32 = 0, 1, 2, 3, 4, 5, 6
 C4, C8, C14X2 = 8, 9, 10
 CMPR = 14
 
+# Indexed formats: decoded on import, but not encodable without palette
+# quantisation.  Unchanged bytes are still written back as-is.
+PALETTE_FORMATS = (C4, C8, C14X2)
+
 FORMAT_NAMES = {
     I4: "I4", I8: "I8", IA4: "IA4", IA8: "IA8", RGB565: "RGB565",
     RGB5A3: "RGB5A3", RGBA32: "RGBA32", C4: "C4", C8: "C8",
@@ -384,7 +388,7 @@ def _encode_cmpr(rgba):
 
 def encode(fmt, rgba):
     """Encode one mip level (h, w, 4 uint8) to GX bytes."""
-    if fmt not in BLOCK or fmt in (C4, C8, C14X2):
+    if fmt not in BLOCK or fmt in PALETTE_FORMATS:
         raise J3DError(f"Cannot encode texture format {FORMAT_NAMES.get(fmt, fmt)}")
     if fmt == CMPR:
         return _encode_cmpr(rgba)

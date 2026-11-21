@@ -203,6 +203,13 @@ def remove_target_changed_hook(callback):
 def _export_target_changed(self, context):
     """Repopulate the export list when the target mesh changes."""
     settings = _get_export_settings(context)
+
+    if self.target is not None and not bc.is_bmd_object(self.target):
+        if settings is not None:
+            settings.keys.clear()
+            settings.tree_rows.clear()
+        return
+
     _populate_export_keys(settings, self.target)
 
     if settings is not None:
@@ -214,6 +221,14 @@ def _export_target_changed(self, context):
             callback(context, self.target)
         except Exception:
             pass
+
+
+def _convert_units_changed(self, context):
+    """Remember the user's Convert Units choice across dialogs."""
+    if _SYNCING:
+        return
+
+    bc.remember_convert_units(context, self.convert_units, self.target)
 
 
 class BMD_SK_ExportKeyItem(PropertyGroup):
@@ -236,7 +251,7 @@ class BMD_SK_ExportSettings(PropertyGroup):
         name='Target Mesh',
         description='Mesh whose shape keys will be exported',
         type=bpy.types.Object,
-        poll=bc.mesh_object_poll,
+        poll=bc.bmd_mesh_poll,
         update=_export_target_changed,
     )
     filepath: StringProperty(subtype='FILE_PATH')
@@ -247,6 +262,7 @@ class BMD_SK_ExportSettings(PropertyGroup):
         description='Convert shape key positions to J3D units '
                     '(100 scale). Disable for model-unit meshes',
         default=True,
+        update=_convert_units_changed,
     )
     base_name: StringProperty(
         name='Base Key Name',
@@ -341,7 +357,7 @@ class BMD_SK_OT_export_files(Operator, ExportHelper):
     bl_idname = 'bmd_shape_keys.export_files'
     bl_label = 'Export BLS'
     bl_description = 'Export Blender shape keys to a J3D .bls file'
-    bl_options = {'REGISTER'}
+    bl_options = set()
 
     filename_ext = '.bls'
     filter_glob: StringProperty(default='*.bls', options={'HIDDEN'})
@@ -395,6 +411,10 @@ def _perform_export(settings, operator, context):
         operator.report({'ERROR'}, 'Select a target mesh')
         return {'CANCELLED'}
 
+    if not bc.is_bmd_object(settings.target):
+        operator.report({'ERROR'}, 'Incorrect target')
+        return {'CANCELLED'}
+
     if not settings.filepath:
         operator.report({'ERROR'}, 'Select an export file')
         return {'CANCELLED'}
@@ -435,6 +455,8 @@ def _perform_export(settings, operator, context):
         f'file: {stats["bytes"]} bytes'
     )
     operator.report({'INFO'}, info)
+    bc.remember_convert_units(
+        context, settings.convert_units, settings.target)
     return {'FINISHED'}
 
 
@@ -450,6 +472,11 @@ def _draw_export_dialog(layout, settings):
     target_row.alert = settings.target is None
     target_row.prop(settings, 'target')
     box.prop(settings, 'convert_units')
+
+    if (settings.target is not None
+            and not bc.is_bmd_object(settings.target)):
+        layout.label(text='Incorrect target', icon='ERROR')
+        return
 
     if settings.target is None:
         layout.label(text='Select a target mesh to see its shape keys',
@@ -488,7 +515,7 @@ class BMD_SK_OT_export_settings(Operator):
     bl_idname = 'bmd_shape_keys.export_settings'
     bl_label = 'Export BLS'
     bl_description = 'Choose which shape keys to write'
-    bl_options = {'REGISTER'}
+    bl_options = set()
 
     def invoke(self, context, _event):
         settings = _get_export_settings(context)
@@ -523,7 +550,7 @@ class BMD_SK_OT_export_confirm(Operator):
     bl_idname = 'bmd_shape_keys.export_confirm'
     bl_label = 'Export'
     bl_description = 'Write the selected shape keys to the BLS file'
-    bl_options = {'REGISTER'}
+    bl_options = set()
 
     def execute(self, context):
         return _perform_export(_get_export_settings(context), self, context)

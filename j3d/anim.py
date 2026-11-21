@@ -136,16 +136,30 @@ def sample(bck, frames):
 # curve fitting (used when exporting)
 # --------------------------------------------------------------------------
 
+_SEGMENT_BASIS = {}
+
+
 def _segment_error(v, tg, a, b):
     """Largest Hermite error inside ``[a, b]`` and the frame that should be split."""
     if b - a < 2:
         return 0.0, -1
-    f = np.arange(a + 1, b)
-    s = (f - a) / (b - a)
+
     dt = b - a
-    h = ((2 * s**3 - 3 * s**2 + 1) * v[a] + (-2 * s**3 + 3 * s**2) * v[b]
-         + (s**3 - 2 * s**2 + s) * dt * tg[a] + (s**3 - s**2) * dt * tg[b])
-    err = np.abs(h - v[f])
+    basis = _SEGMENT_BASIS.get(dt)
+
+    if basis is None:
+        s = np.arange(1, dt, dtype=np.float64) / dt
+        basis = (s, s**2, s**3)
+
+        # Very long clips have few segments; avoid caching huge arrays for
+        # every possible segment length.
+        if dt <= 1024:
+            _SEGMENT_BASIS[dt] = basis
+
+    s, s2, s3 = basis
+    h = ((2 * s3 - 3 * s2 + 1) * v[a] + (-2 * s3 + 3 * s2) * v[b]
+         + (s3 - 2 * s2 + s) * dt * tg[a] + (s3 - s2) * dt * tg[b])
+    err = np.abs(h - v[a + 1:b])
     i = int(err.argmax())
     return float(err[i]), a + 1 + i
 

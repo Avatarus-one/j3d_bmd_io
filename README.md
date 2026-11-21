@@ -25,12 +25,21 @@ In Blender:
 
 Edit -> Preferences -> Get Extensions -> drop-down (top right) -> *Install from Disk...* and pick
 the ZIP. The operators appear under File -> Import / Export:
-*J3D Model (.bmd)*, *J3D Animation (.bck)*, *TP Collision (.kcl)*,
-*J3D Shape Keys (.bls)* and *J3D Shape Key Animation (.blk)*. Files can also be
+*J3D Model (.bmd)*, *J3D Animations (.bck/.blk)*, *J3D Textures (.bti)*,
+*TP Collision (.kcl)* and *J3D Shape Keys (.bls)*. Files can also be
 dragged into the viewport.
 
-All import/export commands are also available in `3D View > Sidebar > J3D >
-Import / Export`.
+All import/export commands are also available in `3D View > Sidebar > J3D`.
+Texture import/export is in `Textures`; animation import and export are in
+`Animations`.
+
+### BMD detection and custom meshes
+
+Only objects that carry BMD data (or are deformed by a BMD armature) are treated
+as J3D models. For a new mesh, select it and press **Initialize as BMD** in the
+**Utility** section. The operator adds the BMD metadata and armature, when it
+has none. For a collision mesh, select a custom mesh and press **Initialize as
+KCL**.
 
 ## Models
 1. **Import** with **Convert Units** enabled (default): the model is scaled to
@@ -136,6 +145,21 @@ decoded on import and re-encoded as CMPR / RGB5A3 only if you change the image. 
 the GX transparency flag and the mipmap flag; an automatically kept format is switched to CMPR /
 RGB5A3 when the edited pixels now contain alpha.
 
+### Texture formats (GX)
+| Format | Bits/px | Colors | Alpha | Notes |
+| --- | --- | --- | --- | --- |
+| **CMPR** | 4 | 4×4 blocks, two RGB565 endpoints + two mixed colors | 1-bit transparency | DXT1-like block compression; smallest files, slight banding |
+| **RGB5A3** | 16 | RGB555 (32,768) or RGB444 (4,096) | 3-bit (8 levels) or fully opaque | Per-texel choice between RGB555 opaque and RGB444 + alpha |
+| **RGBA32** (RGBA8) | 32 | 16.7M (8 bits per channel) | 8-bit (256 levels) | Largest format, no quality loss |
+| **RGB565** | 16 | 65,536 (5/6/5 bits) | None | Good for opaque textures |
+| **IA8** | 16 | 256 grayscale levels | 8-bit (256 levels) | Intensity + alpha |
+| **IA4** | 8 | 16 grayscale levels | 4-bit (16 levels) | Intensity + alpha |
+| **I8** | 8 | 256 grayscale levels | None | Intensity only |
+| **I4** | 4 | 16 grayscale levels | None | Smallest uncompressed format |
+| **C4** | 4 | 16 palette entries | From palette | No encoding support yet |
+| **C8** | 8 | 256 palette entries | From palette | No encoding support yet |
+| **C14X2** | 16 | 16,384 palette entries | From palette | 14-bit index + 2 unused bits; no encoding support yet |
+
 ### External stage textures (`STG_00/texc`)
 Some stage models keep their texture pixels outside the BMD. In `TEX1`, such an entry has
 `imageOffset = 0`; the game loads the picture at runtime from the stage's `texc` folder
@@ -162,14 +186,14 @@ textures keep the original `.bti` bytes, so an unchanged texture exports exactly
 was imported.
 
 Any image can be converted into an external texture: select it in the Image Editor and
-tick **External Texture** in the *J3D (BMD) Texture* panel. Use *File > Export > J3D
-Textures (.bti)* to write the external textures to a folder.
-Checkboxes of textures that do not need writing (`Up to date`) or cannot be written
-(`Conflict`, `Error`) are disabled. Different textures that would use the same `.bti`
-file name are shown as `conflict` and are not overwritten. The exporter uses the
-texture name as a lowercase `.bti` file name and only overwrites files whose contents
-changed. The BTI keeps the image format, mip count, wrap/filter settings and palette
-data when they can be reused.
+tick **External Texture** in the *J3D (BMD) Texture* panel. Use the
+**Export Textures** button in the sidebar *Textures* section (or *File > Export >
+J3D Textures (.bti)*) to write the external textures to a folder.
+Textures that didn't change or cannot be written are disabled. Different textures that
+would use the same `.bti` file name are shown as `conflict` and are not overwritten.
+The exporter uses the texture name as a lowercase `.bti` file name and only overwrites
+files whose contents changed. The BTI keeps the image format, mip count, wrap/filter
+settings and palette data when they can be reused.
 
 ### Dusklight warning
 
@@ -200,10 +224,9 @@ pixels).
   the shader (alpha test via "Greater Than", blending as *Blended*).
 * GX wraps per axis (Clamp / Repeat / Mirror). If the two axes differ, the importer builds a
   Separate XYZ -> Math -> Combine XYZ chain in front of the image node.
-* **BMD Textures** (3D View sidebar -> *J3D*) is the shared texture list of the model. It shows every
-  texture in export order with its index and BMD name.
-  Materials keep their textures when the list is re-ordered. To assign a texture to a material, use the
-  **Textures** box in *J3D (BMD) Material*.
+* **Textures** (3D View sidebar -> *J3D*) is the shared texture list of the model. It shows every
+  texture in export order with its index and BMD name. Materials keep their textures when the list is
+  re-ordered. To assign a texture to a material, use the **Textures** box in *J3D (BMD) Material*.
   Clearing the image with the **X** button removes it from the material nodes but keeps the slot
   link, so assigning a new image to the same slot restores the material texture. The selected
   texture's GX format, mip levels, external flag and sampling (wrap, filters, LOD) are shown below
@@ -218,14 +241,11 @@ pixels).
 **Import**
 1. Import the BMD first.
 2. Select the target mesh, then `File > Import > J3D Shape Keys (.bls)` or
-   `J3D Shape Keys from Folder (.bls)`. The same commands are in the `J3D`
-   sidebar, **Import / Export** panel, under **Shape Keys (.bls)**.
+   `J3D Shape Keys from Folder (.bls)`.
 3. In the dialog choose the target mesh, review the keys and press OK.
 
 Keys are imported as BLS position deltas relative to the BLS base key, rotated
 from J3D Y-up to Blender Z-up and added to the target mesh's Basis coordinates.
-**Convert Units** defaults to the model's `bmd_scale` (stored on the armature
-or static mesh).
 
 BLS files contain a key named `<cluster>__orig` with zero displacement. Its BLK
 track holds the remainder of the normalized weights (so it can be negative) and
@@ -275,47 +295,60 @@ Requirements and limits:
 * A modified BLS can still target the original BMD when the mesh was imported
   with this add-on.
 
-## Shape key animations (.blk)
+## Animation import (.bck / .blk)
 
-**Import**: select the mesh with shape keys and use `File > Import > J3D Shape
-Key Animation (.blk)` or the **Shape Key Animation (.blk)** box in the `J3D`
-sidebar. The dialog shows the animation, the target mesh, and a BLS file field.
-The BLS path is stored per mesh. Tracks are named from the BLS keys; without a
-usable BLS they are assigned in shape-key order. Missing BLS keys are imported
-on confirm (duplicate and conflicting keys are skipped).
+Animations can be imported by pressing **Import J3D Animations** button in
+the **Animations** panel. The file browser accepts `.bck` and `.blk` together
+and opens an import dialog:
 
-**Export**: select the mesh with the shape-key action, then
-`File > Export > J3D Shape Key Animation (.blk)`.
-After choosing the file, the dialog shows the target mesh and the animation that
-will be exported above the shape-key list. The key selection is shared by all
-animations of the same mesh. Only checked keys are exported, in the current
-shape-key order, so the tracks match the keys written by the BLS export dialog.
-An `orig` track is always prepended; its weights are recalculated as
-`1 - sum(other selected weights)`.
+* The list shows the animation type (`BCK` / `BLK`) and the status;
+* **BCK: Allow fewer joints** allows import of BCK animations that have fewer
+  amount of animation joints than the targeted BMD model.
+* `Already imported` is evaluated per target. Such files can be checked again
+  to re-import them; only that file's BCK or BLK track is replaced, while the
+  other format in the same clip is kept;
+* The **BLS File** field is shown only when a BLK file is present in the list.
+  Tracks are named from the BLS keys; without a usable BLS they are assigned
+  in shape key order of the mesh. Missing BLS keys are imported on confirm
+  (duplicate and conflicting keys are skipped).
+
+## Animation export (.bck / .blk)
+
+Press **Export J3D Animations** button in the **Animations** panel. `File >
+Export > J3D Animations (.bck/.blk)` opens the same dialog.
+
+* **Create .arc hierarchy**: when enabled, BCK files go to `bck` and  BLK files
+  to `blk` subfolders, which are created automatically.
+* The list shows every mesh of the scene with its animations.
+* **Shape Keys** list is shown when the selected mesh has BLK data in it's 
+  exported animation. Shape key selection is shared by all animations of the
+  mesh; hidden `orig` track is recalculated automatically.
+* Each file is sampled over the action's keyframe range with the loop mode
+  stored in the animation entry. The evaluated pose is sampled, so constraints,
+  IK and drivers are baked; LOOP clips use cyclic tangents across the loop seam.
 
 ## Animations (.bck)
-**Import**: select the imported armature (or its mesh), then File -> Import -> *J3D Animation (.bck)*.
-The dialog shows the target and a list of animations; a compatible armature in the scene is selected
-automatically. Compatibility uses the original joint count stored at BMD import, so bones added or
-removed later do not make the model incompatible; a custom armature uses its current bone count.
+Imported BMDs use their original joint, so bones added or removed later do not make the model
+incompatible; a custom armature uses its current bone count.
 An animation may contain fewer joints than the model — the remaining joints stay at rest — while an
 animation with more joints than the model is rejected. Each animation creates a new action (named
 after the file, with a fake user). The BCK curves are fitted with sparse Bezier keys. Frame `n` of the
-file is Blender frame `n`; the scene range is always set to the animation length and the scene rate to
-the game's 30 fps. The loop mode and clip duration are stored on the action (`bmd_loop_mode`,
-`bmd_duration`).
+file is Blender frame `n`; the scene range is set to the animation length. The loop mode and clip
+duration are stored on the action (`bmd_loop_mode`, `bmd_duration`).
 
-**Export**: select the armature with its action, then File -> Export -> *J3D Animation (.bck)*.
-After choosing the file, the dialog shows the armature and its animations, together with Loop Mode,
-Action / Scene / Custom frame range, and the **Convert Units** setting. Every frame is sampled,
-converted back to joint-local scale / rotation / translation, and fitted with cubic Hermite curves
-using as few keys as the tolerances allow (rotation 2e-4 rad, translation 0.01 units, scale 1e-4).
-The evaluated pose is sampled, so constraints, IK and drivers are baked. LOOP (repeat) clips use
+Exported animations are sampled over its action range, converted back to joint-local scale / rotation /
+translation, and fitted with cubic Hermite curves using as few keys as the tolerances allow (rotation
+2e-4 rad, translation 0.01 units, scale 1e-4). The evaluated pose is sampled, so constraints, IK and
+drivers are baked. The loop mode stored in the animation entry is written; LOOP (repeat) clips use
 cyclic tangents across the loop seam.
 
-**Frame range**: *Action Range* uses the action's keyframe range (a completely static imported clip
-keeps its stored `bmd_duration` instead of collapsing to one frame). *Scene Range* samples the scene
-start/end frames. *Custom Range* uses the Start Frame / End Frame fields.
+**Animation list**: the **Animations** section in the J3D sidebar lists the clips of the active
+mesh/armature. A clip stores only metadata (name, scene range, loop mode) and a list of tracks; each
+track is a `(format, target, action)` tuple (BCK on the armature, BLK on a mesh). Actions are created
+when keys are first added or imported, and empty actions are removed automatically. BCK and BLK files
+with the same base name are combined into one clip. Selecting a clip applies its range, assigns its
+armature and shape-key actions, so new keyframes are written to the selected clip. Switching to another
+mesh/armature also applies that target's active clip range.
 
 Notes
 * Tracks are mapped to bones by `bmd_index`. Duplicated bones (which copy the index) are detected:

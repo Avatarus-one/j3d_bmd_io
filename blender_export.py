@@ -71,27 +71,18 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
                optimize_bmd=False, bls_compatible=False,
                position_format="AUTO", normal_format="AUTO", uv_format="AUTO",
                position_frac=6, normal_frac=14, uv_frac=14):
-    scene_objs = context.selected_objects if use_selection else [
-        o for o in context.scene.objects if o.visible_get()]
-    mesh_objs = [o for o in scene_objs if o.type == "MESH"]
-    armatures = {o for o in scene_objs if o.type == "ARMATURE"}
-    for obj in mesh_objs:
-        target = bc.target_armature(obj)
-        if target is not None:
-            armatures.add(target)
-    if use_selection and not mesh_objs and len(armatures) == 1:
-        # The user selected only the armature: export the meshes it deforms.
-        arm = next(iter(armatures))
-        mesh_objs = [o for o in context.scene.objects
-                     if o.type == "MESH" and bc.target_armature(o) == arm]
+    armatures, mesh_objs, valid = bc.bmd_export_objects(
+        context, use_selection)
+
+    if not valid or not mesh_objs:
+        raise ExportError(bc.BMD_NO_MESH_ERROR)
+
     if len(armatures) > 1:
         raise ExportError(
             "The export contains meshes from multiple armatures. "
             "Select one armature and its meshes, or hide the other models.")
-    arm_obj = next(iter(armatures), None)
-    if not mesh_objs:
-        raise ExportError("No mesh objects to export (select the meshes, or disable 'Selected Only')")
 
+    arm_obj = armatures[0] if armatures else None
     mesh_objs.sort(key=lambda o: (o.get("bmd_shape_index", 1e9), o.get("bmd_order", 1e9), o.name))
     model = writer.ExportModel()
 
@@ -268,7 +259,7 @@ def joint_index_owners(arm, imported_names=None):
     return owners, duplicates
 
 
-def ordered_bones(arm, imported_names=None):
+def ordered_bones(arm, imported_names=None, use_indices=True):
     """Bones in J3D joint order.
 
     Parents always precede their children, so the result is safe for both BMD
@@ -277,13 +268,19 @@ def ordered_bones(arm, imported_names=None):
     (added or duplicated by the user) follow.  When several bones share one
     ``bmd_index``, the bone named in ``imported_names`` keeps it, and the
     others are treated as new bones.
+
+    ``use_indices=False`` ignores stale ``bmd_index`` values and orders the
+    current hierarchy, which is what a custom armature needs.
     """
     bones = list(arm.bones)
     if not bones:
         return []
 
-    owners, _duplicates = joint_index_owners(arm, imported_names)
-    preferred = {b.name: idx for idx, b in owners.items()}
+    if use_indices:
+        owners, _duplicates = joint_index_owners(arm, imported_names)
+        preferred = {b.name: idx for idx, b in owners.items()}
+    else:
+        preferred = {}
 
     # Imported indices first, then new bones in armature order.  The keys only
     # decide between bones that are ready at the same time; the topological
@@ -793,7 +790,9 @@ def _reuse_raw(image, t, w, h, warn=None):
     props = image.bmd
     orig = image.get("bmd_orig_format")
     mips0 = int(image.get("bmd_raw_mips", 0))
-    if props.format not in ("AUTO", orig) or props.mip_count not in (0, mips0):
+    auto_format = bool(image.get("bmd_format_auto"))
+    if ((not auto_format and props.format not in ("AUTO", orig))
+            or props.mip_count not in (0, mips0)):
         return False
     try:
         data = zlib.decompress(base64.b64decode(raw))
@@ -843,6 +842,31 @@ def _reuse_raw(image, t, w, h, warn=None):
     return True
 
 
+class _DefaultImageSettings:
+    """Fallback for images that have no BMD settings yet."""
+
+    format = "AUTO"
+    external = False
+    mip_count = 1
+    wrap_s = "1"
+    wrap_t = "1"
+    min_filter = "1"
+    mag_filter = "1"
+    min_lod = 0
+    max_lod = 0
+    max_lod_custom = False
+    lod_bias = 0
+
+
+def _image_settings(image):
+    """Return BMD settings without adding a ``bmd`` group to a plain image."""
+    if "bmd" in image or any(str(key).startswith("bmd_")
+                             for key in image.keys()):
+        return image.bmd
+
+    return _DefaultImageSettings()
+
+
 def texture_from_image(image, warn=None):
     """Build an export :class:`j3d.Texture` from a Blender image."""
     name = bc.clean_texture_name(image)
@@ -858,7 +882,7 @@ def texture_from_image(image, warn=None):
     np.rint(pixels, out=pixels)
     np.clip(pixels, 0, 255, out=pixels)
     t.rgba = pixels.astype(np.uint8)
-    props = image.bmd
+    props = _image_settings(image)
     orig = image.get("bmd_orig_format")
     external = bool(props.external)
     reused = _reuse_raw(image, t, w, h, warn)
@@ -867,8 +891,14 @@ def texture_from_image(image, warn=None):
 
     def choose_format(want, auto):
         fmt = gx.NAME_TO_FORMAT.get(want) if want else None
-        if fmt is None or fmt in (gx.C4, gx.C8, gx.C14X2):
+        if fmt is None:
             return gx.RGB5A3 if partial else gx.CMPR
+        if fmt in gx.PALETTE_FORMATS:
+            fallback = gx.RGB5A3 if partial else gx.CMPR
+            _warn(warn, f"Image '{name}': {gx.FORMAT_NAMES.get(fmt, fmt)} export "
+                        "needs a palette quantizer; using "
+                        f"{gx.FORMAT_NAMES[fallback]}")
+            return fallback
         # An automatically kept format must not silently discard alpha that
         # the edited image now has.  An explicit user choice is respected.
         if auto and has_a and fmt in (gx.I4, gx.I8, gx.RGB565):
@@ -879,6 +909,7 @@ def texture_from_image(image, warn=None):
     # (and "AUTO") as automatic so an edited image can switch to an
     # alpha-capable format; a different explicit choice is respected.
     auto_format = (props.format == "AUTO"
+                   or bool(image.get("bmd_format_auto"))
                    or (bool(orig) and props.format == orig))
     if external:
         # Header-only TEX1 entry; the pixels live in a .bti file.
@@ -907,11 +938,7 @@ def texture_from_image(image, warn=None):
     else:
         # Edited pixels: derive the alpha flag from the actual image.
         t.transparency = 2 if has_a else 0
-        mips = props.mip_count
-        if mips <= 0:
-            mips = 1
-            if "bmd_min_filter" not in image and min(w, h) >= 16:
-                mips = min(gx.max_mip_count(w, h), 4)
+        mips = max(1, int(props.mip_count))
         t.mip_count = mips
 
     t.wrap_s = int(props.wrap_s)
@@ -989,9 +1016,8 @@ class _MaterialCollector:
         slots = bc.ensure_texture_list(arm_obj)
         source = source_file or arm_obj.get("bmd_source", "")
         missing, restored, empty = [], [], 0
-        seen = {}  # texture key -> number of slots already using it
         dup_index = 0
-        duplicate_slots = 0
+        seen_keys = {}
 
         def duplicate_key(key):
             nonlocal dup_index
@@ -1004,55 +1030,59 @@ class _MaterialCollector:
 
         for slot in slots:
             image = slot.image
+
             if image is not None:
-                key = bc.texture_key(image)
-                if key in seen:
-                    # The same texture is used by several slots.  Keep the list
-                    # length/order by writing a separate TEX1 entry; materials
-                    # reference the first occurrence.
-                    tex = texture_from_image(image, self.warn)
-                    tex.key = duplicate_key(key)
-                    if slot.name:
-                        tex.name = slot.name
-                    self.images[tex.key] = tex
-                    self.model.textures.append(tex)
-                    seen[key] += 1
-                    duplicate_slots += 1
-                    continue
-                key = self._texture_for(image)
+                image_key = bc.texture_key(image)
+                slot_key = str(slot.key or "") or image_key
+                count = seen_keys.get(slot_key, 0)
+
+                tex = texture_from_image(image, self.warn)
+                tex.data_group = str(image.as_pointer())
+
+                if count == 0 and slot_key not in self.images:
+                    tex.key = slot_key
+                else:
+                    tex.key = duplicate_key(slot_key)
+
                 if slot.name:
-                    self.images[key].name = slot.name
-                if slot.key != key:
-                    slot.key = key
-                seen[key] = 1
+                    tex.name = slot.name
+
+                self.images[tex.key] = tex
+                self.images.setdefault(image_key, tex)
+                self.model.textures.append(tex)
+                seen_keys[slot_key] = count + 1
+                slot.key = tex.key
                 continue
             key = str(slot.key or "")
             if not key:
                 empty += 1
                 continue
-            if key in seen:
-                tex = self._source_textures(source).get(key)
-                if tex is not None:
-                    tex = copy.deepcopy(tex)
-                    tex.key = duplicate_key(key)
-                    if slot.name:
-                        tex.name = slot.name
-                    self.images[tex.key] = tex
-                    self.model.textures.append(tex)
-                    restored.append(key)
-                    seen[key] += 1
-                    duplicate_slots += 1
-                else:
-                    missing.append(key)
-                continue
-            tex = self._source_textures(source).get(key)
-            if tex is not None:
+
+            source_tex = self._source_textures(source).get(key)
+
+            if key in self.images:
+                tex = copy.deepcopy(source_tex if source_tex is not None
+                                     else self.images[key])
+                tex.key = duplicate_key(key)
+
                 if slot.name:
                     tex.name = slot.name
+
+                self.images[tex.key] = tex
+                self.model.textures.append(tex)
+                restored.append(key)
+                continue
+
+            if source_tex is not None:
+                tex = copy.deepcopy(source_tex)
+                tex.key = key
+
+                if slot.name:
+                    tex.name = slot.name
+
                 self.images[key] = tex
                 self.model.textures.append(tex)
                 restored.append(key)
-                seen[key] = 1
             else:
                 missing.append(key)
         if restored:
@@ -1060,10 +1090,6 @@ class _MaterialCollector:
                              f"from the original model: {', '.join(restored)}")
         if empty:
             _warn(self.warn, f"Skipped {empty} BMD texture slot(s) without an image")
-        if duplicate_slots:
-            _warn(self.warn,
-                  f"{duplicate_slots} duplicate texture slot(s) were exported as separate TEX1 "
-                  "entries; materials use the first slot with each texture")
         if missing and not allow_missing:
             raise ExportError(
                 f"{len(missing)} textures of the imported model no longer exist in Blender "
@@ -1074,10 +1100,7 @@ class _MaterialCollector:
 
     def _image_for_key(self, key):
         """Find the image that currently owns *key* (the BMD Key is editable)."""
-        for image in bpy.data.images:
-            if bc.texture_key(image) == key:
-                return image
-        return None
+        return bc.image_by_key(key)
 
     def _texture_for(self, image):
         key = bc.texture_key(image)
@@ -1108,8 +1131,9 @@ class _MaterialCollector:
     def _build(self, bl_mat, mesh):
         nodes = self._image_nodes(bl_mat)
         stored = bl_mat.get("bmd_material") if bl_mat else None
-        mode = bl_mat.bmd.render_mode if bl_mat else "AUTO"
-        alpha_ref = bl_mat.bmd.alpha_ref if bl_mat else 128
+        is_bmd = bool(bl_mat is not None and bc.is_bmd_material(bl_mat))
+        mode = bl_mat.bmd.render_mode if is_bmd else "AUTO"
+        alpha_ref = bl_mat.bmd.alpha_ref if is_bmd else 128
         cull_back = bool(bl_mat.use_backface_culling) if bl_mat else True
         name = ((bl_mat.get("bmd_name")
                  or strip_blender_suffix(bl_mat.name)) if bl_mat else "default")
@@ -1124,7 +1148,21 @@ class _MaterialCollector:
         if d is not None:
             tex_names = list(d.get("texNames", [None] * 8))
             for slot, (img, _ext) in nodes.items():
-                tex_names[slot] = self._texture_for(img) if img else None
+                if img is None:
+                    tex_names[slot] = None
+                    continue
+
+                base = (tex_names[slot]
+                        if 0 <= slot < len(tex_names) else None)
+
+                if (base and base in self.images
+                        and bc.image_by_key(base) is img):
+                    # Keep the slot-specific key.  Several TEX1 indices may
+                    # share one image; collapsing them would change material
+                    # texture indices (and texture animations).
+                    continue
+
+                tex_names[slot] = self._texture_for(img)
             # slots that previously had a texture but now have no node keep their name only
             # if the texture still exists in the scene
             for slot in range(8):

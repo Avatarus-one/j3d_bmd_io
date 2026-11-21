@@ -50,6 +50,21 @@ def _disambiguate_labels(groups):
         used.add(label)
 
 
+def _image_external(image):
+    """Whether *image* is an external BMD texture, without creating ``bmd``."""
+    if image is None:
+        return False
+
+    if "bmd" not in image and not any(
+            str(key).startswith("bmd_") for key in image.keys()):
+        return False
+
+    try:
+        return bool(image.bmd.external)
+    except Exception:
+        return False
+
+
 def scene_bti_groups():
     """Group every external image in the scene by imported BMD/model."""
     models = [obj for obj in bpy.data.objects
@@ -73,7 +88,7 @@ def scene_bti_groups():
             image = slot.image
             if image is None and slot.key:
                 image = bc.image_by_key(slot.key)
-            if image is not None and image.bmd.external and image.name not in seen:
+            if _image_external(image) and image.name not in seen:
                 seen.add(image.name)
                 group["images"].append(image)
 
@@ -94,13 +109,13 @@ def scene_bti_groups():
                 if node.type != "TEX_IMAGE":
                     continue
                 image = node.image
-                if image is not None and image.bmd.external and image.name not in seen:
+                if _image_external(image) and image.name not in seen:
                     seen.add(image.name)
                     group["images"].append(image)
 
     assigned = {image.name for group in groups for image in group["images"]}
     orphans = [image for image in bpy.data.images
-               if image.bmd.external and image.name not in assigned]
+               if image.name not in assigned and _image_external(image)]
     if orphans:
         groups.append({
             "label": "Scene",

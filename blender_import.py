@@ -60,8 +60,9 @@ def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=Tru
     merged = j3d.merge_meshes(bmd, meshes)
 
     if merged is not None:
-        _create_mesh_object(coll, arm_obj, bone_names, bmd, merged, materials,
-                            base, scale, warn)
+        _create_mesh_object(
+            coll, arm_obj, bone_names, bmd, merged, materials,
+            base, scale, warn)
         mesh_count = 1
     else:
         mesh_count = 0
@@ -116,7 +117,23 @@ def _texture_signature(t):
     )
     digest = hashlib.sha1()
     digest.update(repr(header).encode("utf-8", "surrogatepass"))
-    if t.raw_data is not None:
+
+    if t.external:
+        # External pixels live in a .bti file.  Identity is the BMD header
+        # (name/format/size/sampling), not the currently resolved pixels:
+        # the same external texture may be loaded from a .bti or still be a
+        # placeholder when another model is imported.
+        digest.update(b"placeholder")
+
+        if t.external_size:
+            width, height = t.external_size
+        elif t.rgba is not None:
+            height, width = t.rgba.shape[:2]
+        else:
+            width = height = 0
+
+        digest.update(f"{width}x{height}".encode("ascii"))
+    elif t.raw_data is not None:
         # Hash the original encoded payload instead of the decoded RGBA.  This
         # is exact and much faster for large (e.g. 4K CMPR) textures.
         digest.update(t.raw_data)
@@ -124,6 +141,7 @@ def _texture_signature(t):
         digest.update(b"placeholder")
         if t.rgba is not None:
             digest.update(f"{t.rgba.shape[1]}x{t.rgba.shape[0]}".encode("ascii"))
+
     return digest.hexdigest()
 
 
@@ -177,6 +195,27 @@ def _image_texture_signature(image):
     return digest.hexdigest()
 
 
+def _add_image_key(image, key):
+    """Remember every TEX1 key that shares this image's pixel block."""
+    if image is None or not key:
+        return
+
+    raw = image.get("bmd_keys")
+    keys = []
+
+    if raw:
+        try:
+            keys = list(json.loads(raw))
+        except Exception:
+            keys = []
+
+    key = str(key)
+
+    if key not in keys:
+        keys.append(key)
+        image["bmd_keys"] = json.dumps(keys, separators=(",", ":"))
+
+
 def apply_texture_metadata(image, texture, path=None):
     """Copy parsed J3D texture metadata to a Blender image."""
     h, w = texture.rgba.shape[:2]
@@ -221,7 +260,11 @@ def apply_texture_metadata(image, texture, path=None):
     fmt_name = gx.FORMAT_NAMES.get(texture.format, "CMPR")
     try:
         image.bmd.format = (
-            fmt_name if fmt_name in {i[0] for i in bc.IMAGE_FORMAT_ITEMS} else "CMPR")
+            fmt_name if fmt_name in {i[0] for i in bc.IMAGE_FORMAT_ITEMS}
+            else "CMPR")
+        # Older files may still carry this import hint; the real format is now
+        # stored in the enum itself.
+        image.pop("bmd_format_auto", None)
         image.bmd.key = texture.key
         image.bmd.wrap_s = str(int(texture.wrap_s))
         image.bmd.wrap_t = str(int(texture.wrap_t))
@@ -236,6 +279,8 @@ def apply_texture_metadata(image, texture, path=None):
         image.bmd.external = bool(texture.external)
     except Exception:
         pass
+
+    _add_image_key(image, texture.key)
 
 
 def create_texture_image(texture, name=None, path=None):
@@ -271,7 +316,6 @@ def _create_images(bmd, base, import_id):
             continue
         candidates.setdefault(str(name), []).append(image)
     candidate_signatures = {}
-    current_keys = {t.key for t in bmd.textures}
 
     def reusable(t):
         same_name = candidates.get(t.name)
@@ -279,9 +323,6 @@ def _create_images(bmd, base, import_id):
             return None
         signature = _texture_signature(t)
         for image in same_name:
-            image_key = image.get("bmd_key")
-            if image_key != t.key and image_key in current_keys:
-                continue
             key = image.name
             if key not in candidate_signatures:
                 candidate_signatures[key] = _image_texture_signature(image)
@@ -289,15 +330,34 @@ def _create_images(bmd, base, import_id):
                 return image
         return None
 
+    shared_images = {}
+
     for t in bmd.textures:
+        block = getattr(t, "data_block", None) if not t.external else None
+
+        if block is not None and block in shared_images:
+            # Same pixel block under another TEX1 index: reuse the image.
+            image = shared_images[block]
+            images[t.key] = image
+            _add_image_key(image, t.key)
+            continue
+
         existing = reusable(t)
         if existing is not None:
             apply_texture_metadata(existing, t)
             images[t.key] = existing
+
+            if block is not None:
+                shared_images[block] = existing
             continue
+
         img = create_texture_image(t, name=t.key)
         img["bmd_import_id"] = import_id
         images[t.key] = img
+
+        if block is not None:
+            shared_images[block] = img
+
     return images
 
 
@@ -375,7 +435,7 @@ def _build_nodes(mat, m, images):
         node.name = f"bmd_tex{slot}"
         node.label = f"BMD tex{slot}: {tname}"
         node.image = images[tname]
-        node.location = (-100, 300 - 280 * slot)
+        node.location = (-100, bsdf.location.y - 320 * slot)
         img = node.image
         node.interpolation = bc.image_interpolation(int(img.bmd.mag_filter))
         slot_nodes[slot] = node
@@ -409,6 +469,7 @@ def _build_nodes(mat, m, images):
             except Exception:
                 use_chain = True
         if not use_chain:
+            uvn.location = (node.location.x - 200, node.location.y - 160)
             links.new(uvn.outputs["UV"], node.inputs["Vector"])
         else:
             # the image node has a single extension mode, GX has one per axis
@@ -447,7 +508,7 @@ def _build_nodes(mat, m, images):
     if mat3.uses_vertex_colors(m):
         vc = nodes.new("ShaderNodeVertexColor")
         vc.layer_name = "Col0"
-        vc.location = (-100, -450)
+        vc.location = (bsdf.location.x - 580, bsdf.location.y - 240)
         if color_out is None:
             color_out = vc.outputs["Color"]
         else:
@@ -456,7 +517,7 @@ def _build_nodes(mat, m, images):
                 mix.data_type = "RGBA"
                 mix.blend_type = "MULTIPLY"
                 mix.inputs[0].default_value = 1.0
-                mix.location = (300, 100)
+                mix.location = (bsdf.location.x - 200, bsdf.location.y)
                 links.new(color_out, mix.inputs[6])
                 links.new(vc.outputs["Color"], mix.inputs[7])
                 color_out = mix.outputs[2]
@@ -482,7 +543,8 @@ def _build_nodes(mat, m, images):
             for extra in sources[1:]:
                 mul = nodes.new("ShaderNodeMath")
                 mul.operation = "MULTIPLY"
-                mul.location = (450, -300)
+                mul.location = (bsdf.location.x - 380,
+                                bsdf.location.y - 240)
                 links.new(a, mul.inputs[0])
                 links.new(extra, mul.inputs[1])
                 a = mul.outputs[0]
@@ -490,7 +552,8 @@ def _build_nodes(mat, m, images):
                 gt = nodes.new("ShaderNodeMath")
                 gt.operation = "GREATER_THAN"
                 gt.inputs[1].default_value = max(0.0, (float(ref) - 0.5) / 255.0)
-                gt.location = (600, -300)
+                gt.location = (bsdf.location.x - 200,
+                               bsdf.location.y - 240)
                 links.new(a, gt.inputs[0])
                 a = gt.outputs[0]
             links.new(a, bsdf.inputs["Alpha"])

@@ -701,48 +701,67 @@ def _build_tex1(textures):
     blobs = []
     headers = bytearray()
     pos = data_start
+    group_positions = {}
     for i, t in enumerate(textures):
         hpos = hdr_off + 0x20 * i
         pal_enabled, pal_fmt, pal_cnt, pal_pos = 0, 0, 0, 0
         external = bool(getattr(t, "external", False))
+        group = None if external else getattr(t, "data_group", None)
+        shared = group is not None and group in group_positions
+
         if external:                       # placeholder: header only, data offset stays 0
             fmt = t.format
             h, w = t.rgba.shape[:2]
             data, mips = b"", max(1, t.mip_count)
             pal_enabled, pal_fmt, pal_cnt = t.pal_enabled, t.pal_format, t.pal_count
-        elif t.raw_data is not None:
-            fmt = t.format
-            h, w = t.rgba.shape[:2]
-            data, mips = t.raw_data, t.mip_count
-            pal_enabled, pal_fmt, pal_cnt = t.pal_enabled, t.pal_format, t.pal_count
         else:
-            if t.rgba is None:
-                raise J3DError(f"Texture '{t.name}' has no pixel data")
             fmt = t.format
             h, w = t.rgba.shape[:2]
-            data, mips = gx.encode_with_mips(fmt, t.rgba, t.mip_count)
+            mips = t.mip_count
+            pal_enabled, pal_fmt, pal_cnt = t.pal_enabled, t.pal_format, t.pal_count
+
+            if shared:
+                # Another TEX1 index already wrote this image's pixels.
+                data = b""
+            elif t.raw_data is not None:
+                data = t.raw_data
+            else:
+                if t.rgba is None:
+                    raise J3DError(f"Texture '{t.name}' has no pixel data")
+                data, mips = gx.encode_with_mips(fmt, t.rgba, t.mip_count)
+
         if (getattr(t, "max_lod_custom", False)
                 or t.raw_data is not None or external):
             max_lod = t.max_lod
         else:
             max_lod = (mips - 1) * 8
-        if t.raw_data is not None and t.raw_palette:
-            pal_pos = align(pos + len(data), 32)
+
+        if shared:
+            data_pos, pal_pos = group_positions[group]
+        else:
+            data_pos = pos
+            if not external and t.raw_data is not None and t.raw_palette:
+                pal_pos = align(pos + len(data), 32)
+
         headers += gx.pack_texture_header(gx.TextureHeader(
             fmt, t.transparency, w, h, t.wrap_s, t.wrap_t,
             pal_enabled, pal_fmt, pal_cnt,
             (pal_pos - hpos) if pal_pos else 0, t.flags10, t.min_filter,
             t.mag_filter, min(max(t.min_lod, -128), 127),
             min(max(max_lod, -128), 127),
-            mips, 0, t.lod_bias, 0 if external else pos - hpos))
+            mips, 0, t.lod_bias, 0 if external else data_pos - hpos))
         if external:
             continue
-        blobs.append((pos, data))
-        end = pos + len(data)
+        if shared:
+            continue
+        blobs.append((data_pos, data))
+        end = data_pos + len(data)
         if pal_pos:
             blobs.append((pal_pos, t.raw_palette))
             end = pal_pos + len(t.raw_palette)
         pos = align(end, 32)
+        if group is not None:
+            group_positions[group] = (data_pos, pal_pos)
     body = bytearray(b"TEX1") + struct.pack(">IHHII", 0, n, 0xFFFF, hdr_off, name_off)
     body += b"\0" * (hdr_off - len(body))
     body += headers

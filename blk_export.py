@@ -6,7 +6,6 @@ import math
 
 import bpy
 
-from . import blender_common as bc
 from .j3d import anim, blk
 
 
@@ -270,9 +269,6 @@ def export_blk(context, filepath, key_names=None, loop_mode="ONCE",
             action["bmd_loop_mode"] = mode
         except Exception:
             pass
-    bc.remember_export(action or obj, "blk", filepath)
-    if obj is not None and obj is not action:
-        bc.remember_export(obj, "blk", filepath)
 
     if report:
         parts = [

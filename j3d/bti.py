@@ -5,7 +5,7 @@ from __future__ import annotations
 from . import gx_texture as gx
 from .common import J3DError, align
 
-_PALETTE_FORMATS = (gx.C4, gx.C8, gx.C14X2)
+_PALETTE_FORMATS = gx.PALETTE_FORMATS
 
 
 def parse_bti(data, name="texture"):
