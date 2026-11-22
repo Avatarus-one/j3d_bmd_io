@@ -108,6 +108,8 @@ def scene_bti_groups():
             for node in material.node_tree.nodes:
                 if node.type != "TEX_IMAGE":
                     continue
+                if node.name.startswith("bmd_btp"):
+                    continue
                 image = node.image
                 if _image_external(image) and image.name not in seen:
                     seen.add(image.name)

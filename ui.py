@@ -31,18 +31,25 @@ class MATERIAL_PT_bmd(Panel):
     def draw(self, context):
         layout = self.layout
         mat = context.material
+        owner = _texture_owner(context)
 
         if not bc.is_bmd_material(mat):
             layout.label(text="Not a BMD material", icon="INFO")
+            column = layout.column()
+            column.enabled = owner is not None
+            column.operator_context = "INVOKE_DEFAULT"
+            column.operator("bmd.material_create_menu",
+                            text="Create BMD Material", icon="MATERIAL")
             return
 
         layout.prop(mat.bmd, "render_mode")
         if mat.bmd.render_mode in {"AUTO", "CUTOUT"}:
             layout.prop(mat.bmd, "alpha_ref")
+        layout.prop(mat.bmd, "use_vertex_color")
         layout.prop(mat, "use_backface_culling")
         if "bmd_material" in mat:
             layout.label(text="Imported TEV data kept in 'bmd_material'", icon="INFO")
-        owner = _texture_owner(context)
+
         box = layout.box()
         box.label(text="Textures", icon="IMAGE_DATA")
         slots = _material_texture_slots(mat, owner)
@@ -68,21 +75,46 @@ class MATERIAL_PT_bmd(Panel):
                                   text="", icon="X")
                 op.slot = slot
         else:
-            box.label(text="No textures", icon="INFO")
+            if owner is not None and not items:
+                box.label(text="Add textures in the J3D → Textures first", icon="INFO")
+            else:
+                box.label(text="No textures", icon="INFO")
         if owner is None:
             box.label(text="No BMD texture list for this material", icon="INFO")
         elif items:
-            if len(slots) >= 8:
-                box.label(text="All 8 texture slots are used", icon="INFO")
-            else:
-                add = box.operator(BMD_OT_material_texture_menu.bl_idname,
-                                   text="Add Texture", icon="ADD")
+            if len(slots) < 8:
+                add = box.operator(BMD_OT_material_texture_menu.bl_idname, text="Add Texture", icon="ADD")
                 add.owner_name = owner.name
                 add.add = True
 
-        if owner is not None and not items:
-            layout.label(text="Add textures in the J3D → Textures first",
-                         icon="INFO")
+        _draw_btp_box(layout, mat, owner)
+
+
+def _draw_btp_box(layout, mat, owner):
+    box = layout.box()
+    box.label(text="Material Animation", icon="ANIM")
+    tracks = mat.bmd.tracks
+    for index, track in enumerate(tracks):
+        row = box.row(align=True)
+        if track.type == "BTP":
+            row.label(text="Texture Index")
+            row.prop(mat.bmd, "btp_texture_index", text="")
+        else:
+            row.label(text=track.type)
+        refresh = row.operator("bmd.material_track_refresh", text="",
+                               icon="FILE_REFRESH")
+        refresh.index = index
+        refresh.material_name = mat.name
+        refresh.owner_name = owner.name if owner is not None else ""
+        op = row.operator("bmd.material_track_remove", text="", icon="X")
+        op.index = index
+        op.material_name = mat.name
+    if len(tracks) < len(bc.MATERIAL_TRACK_ITEMS):
+        box.operator_context = "INVOKE_DEFAULT"
+        add = box.operator("bmd.material_track_menu", text="Add Track",
+                           icon="ADD")
+        add.material_name = mat.name
+        add.owner_name = owner.name if owner is not None else ""
 
 
 def _draw_bmd_prop(layout, data, prop, label, factor=0.42, alert=False):
@@ -261,6 +293,15 @@ class BMD_OT_set_30_fps(Operator):
     bl_label = "Set 30 FPS"
     bl_description = "Set the scene frame rate to 30 FPS"
     bl_options = {"UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        scene = getattr(context, "scene", None)
+        if scene is None:
+            return False
+        render = scene.render
+        return not (int(render.fps) == 30
+                    and abs(float(render.fps_base) - 1.0) < 1e-6)
 
     def execute(self, context):
         context.scene.render.fps = 30
@@ -514,36 +555,10 @@ def _set_material_texname(mat, slot, key):
     mat["bmd_material"] = json.dumps(data, separators=(",", ":"))
 
 
-def _ensure_texture_node(mat, slot):
-    if mat.node_tree is None:
-        mat.use_nodes = True
-    tree = mat.node_tree
-    node = tree.nodes.get(f"bmd_tex{slot}")
-    if node is not None and node.type != "TEX_IMAGE":
-        tree.nodes.remove(node)
-        node = None
-    if node is None:
-        bsdf = next((n for n in tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
-
-        if bsdf is not None:
-            location = (bsdf.location.x - 300,
-                        bsdf.location.y - 320 * slot)
-        else:
-            location = (-300, 300 - 320 * slot)
-
-        node = tree.nodes.new("ShaderNodeTexImage")
-        node.name = f"bmd_tex{slot}"
-        node.label = f"bmd_tex{slot}"
-        node.location = location
-
-        if bsdf is not None and not bsdf.inputs["Base Color"].is_linked:
-            tree.links.new(node.outputs["Color"], bsdf.inputs["Base Color"])
-    return node
-
-
 def _set_material_texture(mat, slot, image, texture_index, owner=None):
-    node = _ensure_texture_node(mat, slot)
-    node.image = image
+    from . import blender_mat
+    node = blender_mat.ensure_texture_node(mat, slot, image, attach_uv=True,
+                                           link_base=True)
     key = bc.texture_key(image)
 
     if owner is not None and 0 <= texture_index < len(owner.bmd_texture_list):
@@ -1022,7 +1037,7 @@ class BMD_PT_textures(Panel):
 def menu_import(self, context):
     self.layout.operator("import_scene.bmd", text="J3D Model (.bmd/.bdl)")
     self.layout.operator("import_image.bti", text="J3D Textures (.bti)")
-    self.layout.operator("import_anim.j3d", text="J3D Animations (.bck/.blk)")
+    self.layout.operator("import_anim.j3d", text="J3D Animations (.bck/.blk/.btp)")
     self.layout.operator("import_scene.kcl", text="TP Collision (.kcl)")
     self.layout.operator("bmd_shape_keys.import_files", text="J3D Shape Keys (.bls)")
     self.layout.operator("bmd_shape_keys.import_folder", text="J3D Shape Keys from Folder (.bls)")
@@ -1035,9 +1050,284 @@ def menu_image_import_bti(self, context):
 def menu_export(self, context):
     self.layout.operator("export_scene.bmd", text="J3D Model (.bmd)")
     self.layout.operator("export_scene.bti", text="J3D Textures (.bti)")
-    self.layout.operator("export_anim.j3d", text="J3D Animations (.bck/.blk)")
+    self.layout.operator("export_anim.j3d", text="J3D Animations (.bck/.blk/.btp)")
     self.layout.operator("export_scene.kcl", text="TP Collision (.kcl)")
     self.layout.operator("bmd_shape_keys.export_files", text="J3D Shape Keys (.bls)")
+
+
+CREATE_MODE_ITEMS = tuple(item for item in bc.RENDER_ITEMS
+                           if item[0] != "AUTO")
+
+
+def _run_material_create(operator, context, mode):
+    from . import blender_mat
+    material = (bpy.data.materials.get(operator.material_name)
+                if operator.material_name else context.material)
+    owner = (bpy.data.objects.get(operator.owner_name)
+             if operator.owner_name else _texture_owner(context))
+    if material is None or owner is None:
+        operator.report({"ERROR"}, "Select a BMD model first")
+        return {"CANCELLED"}
+    blender_mat.create_material(material, owner, mode)
+    return {"FINISHED"}
+
+
+def _make_create_operator(mode, label, description):
+    """One operator per render mode so the menu item gets its own tooltip."""
+    class_name = f"BMD_OT_material_create_{mode.lower()}"
+
+    class _CreateOperator(Operator):
+        bl_idname = f"bmd.material_create_{mode.lower()}"
+        bl_label = label
+        bl_description = description
+        bl_options = {"REGISTER", "UNDO"}
+
+        material_name: StringProperty(options={"HIDDEN"})
+        owner_name: StringProperty(options={"HIDDEN"})
+
+        def execute(self, context):
+            return _run_material_create(self, context, mode)
+
+    _CreateOperator.__name__ = class_name
+    _CreateOperator.__qualname__ = class_name
+    return _CreateOperator
+
+
+CREATE_OPERATORS = tuple(_make_create_operator(*item)
+                         for item in CREATE_MODE_ITEMS)
+
+
+class BMD_OT_material_create(Operator):
+    bl_idname = "bmd.material_create"
+    bl_label = "Create BMD Material"
+    bl_description = ("Create the BMD preview nodes for this material using "
+                      "the selected render mode")
+    # The operator edits the node tree and material properties; its own undo
+    # step keeps Ctrl+Z from reverting the texture that was just added (which
+    # would free the image while the material preview is still rendering it).
+    bl_options = {"REGISTER", "UNDO"}
+
+    mode: EnumProperty(name="Render Mode", items=CREATE_MODE_ITEMS,
+                       default="OPAQUE")
+    material_name: StringProperty(options={"HIDDEN"})
+    owner_name: StringProperty(options={"HIDDEN"})
+
+    def execute(self, context):
+        return _run_material_create(self, context, self.mode)
+
+
+class BMD_OT_material_create_menu(Operator):
+    bl_idname = "bmd.material_create_menu"
+    bl_label = "Create BMD Material"
+    bl_description = "Create the BMD preview nodes for this material"
+    bl_options = {"INTERNAL"}
+
+    def invoke(self, context, event):
+        material = context.material
+        owner = _texture_owner(context)
+        if material is None or owner is None:
+            self.report({"ERROR"}, "Select a BMD model first")
+            return {"CANCELLED"}
+
+        def draw(menu, _context):
+            for operator, (_mode, label, _description) in zip(
+                    CREATE_OPERATORS, CREATE_MODE_ITEMS):
+                item = menu.layout.operator(operator.bl_idname, text=label)
+                item.material_name = material.name
+                item.owner_name = owner.name
+
+        context.window_manager.popup_menu(
+            draw, title="Create BMD Material", icon="MATERIAL")
+        return {"FINISHED"}
+
+
+def _run_material_track_add(operator, context, track_type):
+    from . import btp_preview
+    material = (bpy.data.materials.get(operator.material_name)
+                if operator.material_name else context.material)
+    if material is None:
+        return {"CANCELLED"}
+    bc.ensure_material_track(material, track_type)
+    owner = (bpy.data.objects.get(operator.owner_name)
+             if operator.owner_name else _texture_owner(context))
+    if track_type == "BTP" and owner is not None:
+        # Build the BTP texture mapping as soon as the field is added.
+        btp_preview.prepare_preview(material, owner)
+    return {"FINISHED"}
+
+
+def _make_track_operator(track_type, label, description):
+    """One operator per track type so the menu item gets its own tooltip."""
+    class_name = f"BMD_OT_material_track_add_{track_type.lower()}"
+
+    class _AddOperator(Operator):
+        bl_idname = f"bmd.material_track_add_{track_type.lower()}"
+        bl_label = label
+        bl_description = description
+        bl_options = {"REGISTER", "UNDO"}
+
+        material_name: StringProperty(options={"HIDDEN"})
+        owner_name: StringProperty(options={"HIDDEN"})
+
+        def execute(self, context):
+            return _run_material_track_add(self, context, track_type)
+
+    _AddOperator.__name__ = class_name
+    _AddOperator.__qualname__ = class_name
+    return _AddOperator
+
+
+TRACK_ADD_OPERATORS = tuple(_make_track_operator(*item)
+                            for item in bc.MATERIAL_TRACK_ITEMS)
+
+
+class BMD_OT_material_track_add(Operator):
+    bl_idname = "bmd.material_track_add"
+    bl_label = "Add Material Track"
+    bl_description = "Add an animatable field to Material Animation"
+    bl_options = {"REGISTER", "UNDO"}
+
+    track_type: EnumProperty(name="Track", items=bc.MATERIAL_TRACK_ITEMS,
+                             default="BTP")
+    material_name: StringProperty(options={"HIDDEN"})
+    owner_name: StringProperty(options={"HIDDEN"})
+
+    def execute(self, context):
+        return _run_material_track_add(self, context, self.track_type)
+
+
+class BMD_OT_material_track_menu(Operator):
+    bl_idname = "bmd.material_track_menu"
+    bl_label = "Add Material Track"
+    bl_description = "Add an animatable field to the Material Animation list"
+    bl_options = {"INTERNAL"}
+
+    material_name: StringProperty(options={"HIDDEN"})
+    owner_name: StringProperty(options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        material = (bpy.data.materials.get(self.material_name)
+                    if self.material_name else context.material)
+        if material is None:
+            return {"CANCELLED"}
+        existing = set(bc.material_track_types(material))
+        items = [(operator, item) for operator, item
+                 in zip(TRACK_ADD_OPERATORS, bc.MATERIAL_TRACK_ITEMS)
+                 if item[0] not in existing]
+        if not items:
+            self.report({"INFO"}, "All material tracks are already added")
+            return {"CANCELLED"}
+        owner = (bpy.data.objects.get(self.owner_name)
+                 if self.owner_name else _texture_owner(context))
+
+        def draw(menu, _context):
+            for operator, (_track_type, label, _description) in items:
+                item = menu.layout.operator(operator.bl_idname, text=label)
+                item.material_name = material.name
+                item.owner_name = owner.name if owner is not None else ""
+
+        context.window_manager.popup_menu(draw, title="Add Track", icon="ADD")
+        return {"FINISHED"}
+
+
+class BMD_OT_material_track_refresh(Operator):
+    bl_idname = "bmd.material_track_refresh"
+    bl_label = "Rebuild Material Mapping"
+    bl_description = ("Rebuild this field's BMD mapping from the model's "
+                      "texture list and material nodes")
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: IntProperty(default=-1)
+    material_name: StringProperty(options={"HIDDEN"})
+    owner_name: StringProperty(options={"HIDDEN"})
+
+    def execute(self, context):
+        from . import btp_preview
+        material = (bpy.data.materials.get(self.material_name)
+                    if self.material_name else context.material)
+        owner = (bpy.data.objects.get(self.owner_name)
+                 if self.owner_name else _texture_owner(context))
+        if material is None:
+            return {"CANCELLED"}
+        tracks = material.bmd.tracks
+        track_type = "BTP"
+        if 0 <= self.index < len(tracks):
+            track_type = tracks[self.index].type
+        if track_type == "BTP" and owner is not None:
+            btp_preview.prepare_preview(material, owner)
+        return {"FINISHED"}
+
+
+class BMD_OT_material_track_remove(Operator):
+    bl_idname = "bmd.material_track_remove"
+    bl_label = "Remove Material Track"
+    bl_description = "Remove this field from the Material Animation list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: IntProperty(default=-1)
+    material_name: StringProperty(options={"HIDDEN"})
+
+    def execute(self, context):
+        material = (bpy.data.materials.get(self.material_name)
+                    if self.material_name else context.material)
+        if material is None:
+            return {"CANCELLED"}
+        tracks = material.bmd.tracks
+        if 0 <= self.index < len(tracks):
+            tracks.remove(self.index)
+        return {"FINISHED"}
+
+
+class BMD_OT_btp_insert_key(Operator):
+    bl_idname = "bmd.btp_insert_key"
+    bl_label = "Insert BTP Texture Key"
+    bl_description = ("Insert the current Texture Index into the active "
+                      "animation at the current frame")
+    bl_options = {"UNDO"}
+
+    material_name: StringProperty(options={"HIDDEN"})
+
+    def execute(self, context):
+        from . import animation_registry, btp_preview
+        material = (bpy.data.materials.get(self.material_name)
+                    if self.material_name else context.material)
+        owner = _texture_owner(context)
+        if owner is None and context.active_object is not None:
+            owner = animation_registry.owner_for(context.active_object)
+        if material is None:
+            self.report({"ERROR"}, "No active material")
+            return {"CANCELLED"}
+
+        try:
+            value = int(material.bmd.btp_texture_index)
+        except Exception:
+            value = 0
+
+        if owner is not None:
+            btp_preview.prepare_preview(material, owner)
+        animation_data = material.animation_data
+        if animation_data is not None and animation_data.action is not None:
+            btp_preview.migrate_action(animation_data.action)
+
+        btp_preview.set_field(material, value)
+        material.keyframe_insert(data_path="bmd.btp_texture_index",
+                                 frame=context.scene.frame_current)
+        animation_data = material.animation_data
+        if animation_data is not None:
+            btp_preview.set_step_interpolation(animation_data.action)
+
+        if owner is not None:
+            registry = animation_registry.registry_for(owner)
+            if registry is not None:
+                entry = animation_registry._active_entry(registry)
+                if entry is None:
+                    entry = animation_registry.ensure_default_animation(
+                        context, owner, select=False)
+                if entry is not None:
+                    animation_registry._attach_active_actions(
+                        entry, owner, registry)
+                animation_registry.sort_animations(registry)
+        return {"FINISHED"}
 
 
 CLASSES = (
@@ -1057,6 +1347,15 @@ CLASSES = (
     BMD_OT_initialize_bmd,
     BMD_OT_initialize_kcl,
     BMD_OT_set_30_fps,
+    BMD_OT_material_create,
+    BMD_OT_material_create_menu,
+    *CREATE_OPERATORS,
+    BMD_OT_material_track_menu,
+    BMD_OT_material_track_add,
+    *TRACK_ADD_OPERATORS,
+    BMD_OT_material_track_refresh,
+    BMD_OT_material_track_remove,
+    BMD_OT_btp_insert_key,
     BMD_PT_utility,
     BMD_PT_formats,
     BMD_PT_textures,

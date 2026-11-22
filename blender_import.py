@@ -12,6 +12,7 @@ import numpy as np
 from mathutils import Matrix
 
 from . import blender_common as bc
+from . import blender_mat
 from . import blender_bti
 from . import bmd_metadata
 from .j3d import gx_texture as gx
@@ -380,187 +381,37 @@ def _create_material(bmd, index, m, images, warn=None):
     alpha_ref = m["alphaComp"][1] if m.get("alphaComp") else 128
     mat.bmd.alpha_ref = int(alpha_ref)
     try:
-        _build_nodes(mat, m, images)
+        blender_mat.build_import_nodes(mat, m, images)
     except Exception as exc:  # node API differences must never break the import
         _warn(warn, f"Material '{name}': preview nodes could not be built: {exc}")
-    return mat
 
-
-_WRAP_EXT = {0: "EXTEND", 1: "REPEAT", 2: "MIRROR"}
-
-
-def _wrap_axis(nodes, links, src, mode, x, y, owner, axis):
-    """Per-axis UV wrapping: 0 clamp, 1 repeat, 2 mirror. Returns the output socket."""
-    n = nodes.new("ShaderNodeMath")
-    n.location = (x, y)
-    n["bmd_wrap_for"] = owner
-    n["bmd_wrap_axis"] = axis
-    if mode == 1:
-        n.operation = "FRACT"
-    elif mode == 2:
-        n.operation = "PINGPONG"
-        n.inputs[1].default_value = 1.0
-    else:
-        n.operation = "ADD"
-        n.inputs[1].default_value = 0.0
-        n.use_clamp = True
-    links.new(src, n.inputs[0])
-    return n.outputs[0]
-
-
-def _build_nodes(mat, m, images):
     try:
-        mat.use_nodes = True
+        blender_mat.begin_sync()
+        try:
+            mat.bmd.use_vertex_color = bool(mat3.uses_vertex_colors(m))
+        finally:
+            blender_mat.end_sync()
     except Exception:
         pass
-    nt = mat.node_tree
-    nt.nodes.clear()
-    nodes, links = nt.nodes, nt.links
-    out = nodes.new("ShaderNodeOutputMaterial")
-    out.location = (1100, 0)
-    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-    bsdf.location = (800, 0)
-    links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
-    for sock, val in (("Roughness", 1.0), ("Specular IOR Level", 0.0), ("Specular", 0.0)):
-        if sock in bsdf.inputs:
-            bsdf.inputs[sock].default_value = val
 
-    # texture slots -> image nodes
-    tex_names = m.get("texNames", [None] * 8)
-    slot_nodes = {}
-    for slot, tname in enumerate(tex_names):
-        if tname is None or tname not in images:
-            continue
-        node = nodes.new("ShaderNodeTexImage")
-        node.name = f"bmd_tex{slot}"
-        node.label = f"BMD tex{slot}: {tname}"
-        node.image = images[tname]
-        node.location = (-100, bsdf.location.y - 320 * slot)
-        img = node.image
-        node.interpolation = bc.image_interpolation(int(img.bmd.mag_filter))
-        slot_nodes[slot] = node
-
-    # The first texture slot is the material's main texture.  TEV stages may
-    # sample extra textures (highlights, eye masks, ...), but the Blender
-    # shader should use the first one for the base color.
-    main_slot, main_coord = None, 0
-    if slot_nodes:
-        main_slot = min(slot_nodes)
-        for order in m.get("tevOrder", []):
-            if (order and order[1] == main_slot
-                    and 0 <= order[0] < 8):
-                main_coord = order[0]
-                break
-
-    if main_slot is not None:
-        node = slot_nodes[main_slot]
-        img = node.image
-        ws, wt = int(img.bmd.wrap_s), int(img.bmd.wrap_t)
-        tc = m.get("texCoord", [None] * 8)
-        uv_name = "UV0"
-        if main_coord < 8 and tc[main_coord] and 4 <= tc[main_coord][1] <= 11:
-            uv_name = f"UV{tc[main_coord][1] - 4}"
-        uvn = nodes.new("ShaderNodeUVMap")
-        uvn.uv_map = uv_name
-        use_chain = ws != wt
-        if not use_chain:
-            try:
-                node.extension = _WRAP_EXT.get(ws, "REPEAT")
-            except Exception:
-                use_chain = True
-        if not use_chain:
-            uvn.location = (node.location.x - 200, node.location.y - 160)
-            links.new(uvn.outputs["UV"], node.inputs["Vector"])
-        else:
-            # the image node has a single extension mode, GX has one per axis
-            sep = nodes.new("ShaderNodeSeparateXYZ")
-            comb = nodes.new("ShaderNodeCombineXYZ")
-            links.new(uvn.outputs["UV"], sep.inputs["Vector"])
-            xs = _wrap_axis(nodes, links, sep.outputs["X"], ws, 0, 0,
-                            node.name, "S")
-            ys = _wrap_axis(nodes, links, sep.outputs["Y"], wt, 0, 0,
-                            node.name, "T")
-            s_node = next(n for n in nodes
-                          if n.get("bmd_wrap_for") == node.name
-                          and n.get("bmd_wrap_axis") == "S")
-            t_node = next(n for n in nodes
-                          if n.get("bmd_wrap_for") == node.name
-                          and n.get("bmd_wrap_axis") == "T")
-            bc._layout_wrap_chain(node, sep, comb, s_node, t_node, uvn)
-            links.new(xs, comb.inputs["X"])
-            links.new(ys, comb.inputs["Y"])
-            links.new(comb.outputs["Vector"], node.inputs["Vector"])
-            node.extension = "EXTEND"
-    # remaining slots: keep their own wrap mode (only the first axis is representable)
-    for slot, node in slot_nodes.items():
-        if slot != main_slot:
-            try:
-                node.extension = _WRAP_EXT.get(int(node.image.bmd.wrap_s), "REPEAT")
-            except Exception:
-                pass
-
-    color_out = alpha_out = None
-    if main_slot is not None:
-        color_out = slot_nodes[main_slot].outputs["Color"]
-        alpha_out = slot_nodes[main_slot].outputs["Alpha"]
-
-    vc = None
-    if mat3.uses_vertex_colors(m):
-        vc = nodes.new("ShaderNodeVertexColor")
-        vc.layer_name = "Col0"
-        vc.location = (bsdf.location.x - 580, bsdf.location.y - 240)
-        if color_out is None:
-            color_out = vc.outputs["Color"]
-        else:
-            try:
-                mix = nodes.new("ShaderNodeMix")
-                mix.data_type = "RGBA"
-                mix.blend_type = "MULTIPLY"
-                mix.inputs[0].default_value = 1.0
-                mix.location = (bsdf.location.x - 200, bsdf.location.y)
-                links.new(color_out, mix.inputs[6])
-                links.new(vc.outputs["Color"], mix.inputs[7])
-                color_out = mix.outputs[2]
-            except Exception:
-                pass
-    if color_out is not None:
-        links.new(color_out, bsdf.inputs["Base Color"])
-
-    # alpha: tex alpha (TEXA) and/or vertex alpha (RASA) of TEV stage 0, as the game draws it
-    kind, ref = mat3.classify_alpha(m)
-    if kind != mat3.RENDER_OPAQUE:
-        stage = (m.get("tevStage") or [None])[0]
-        a_in = stage["alphaIn"] if stage else []
-        sources = []
-        if alpha_out is not None and (4 in a_in or not a_in):
-            sources.append(alpha_out)
-        if vc is not None and 5 in a_in:
-            sources.append(vc.outputs["Alpha"])
-        if not sources and alpha_out is not None:
-            sources.append(alpha_out)
-        if sources:
-            a = sources[0]
-            for extra in sources[1:]:
-                mul = nodes.new("ShaderNodeMath")
-                mul.operation = "MULTIPLY"
-                mul.location = (bsdf.location.x - 380,
-                                bsdf.location.y - 240)
-                links.new(a, mul.inputs[0])
-                links.new(extra, mul.inputs[1])
-                a = mul.outputs[0]
-            if kind == mat3.RENDER_CUTOUT:
-                gt = nodes.new("ShaderNodeMath")
-                gt.operation = "GREATER_THAN"
-                gt.inputs[1].default_value = max(0.0, (float(ref) - 0.5) / 255.0)
-                gt.location = (bsdf.location.x - 200,
-                               bsdf.location.y - 240)
-                links.new(a, gt.inputs[0])
-                a = gt.outputs[0]
-            links.new(a, bsdf.inputs["Alpha"])
-            try:
-                mat.surface_render_method = "BLENDED" if kind == mat3.RENDER_TRANSLUCENT else "DITHERED"
-            except Exception:
-                pass
+    try:
+        mapping = {}
+        for texture_index, texture in enumerate(bmd.textures):
+            image = images.get(texture.key)
+            if image is not None:
+                mapping[str(texture_index)] = image.name
+        mat["bmd_btp_images"] = json.dumps(mapping, separators=(",", ":"))
+        slots = json.loads(mat["bmd_texture_slots"])
+        slot = next((i for i, value in enumerate(slots) if value is not None),
+                    None)
+        base = slots[slot] if slot is not None else 0
+        mat["bmd_btp_slot"] = int(slot) if slot is not None else -1
+        mat["bmd_btp_base"] = int(base)
+        from . import btp_preview
+        btp_preview.set_field(mat, base)
+    except Exception:
+        pass
+    return mat
 
 
 # --------------------------------------------------------------------------

@@ -1,8 +1,9 @@
-"""Unified export dialog for J3D animations (``.bck`` and ``.blk``).
+"""Unified export dialog for J3D animations (``.bck``, ``.blk`` and ``.btp``).
 
 The dialog lists every mesh of the scene with the animations stored in its
-:mod:`animation_registry` registry.  BCK and BLK can be exported in one batch,
-optionally into ``bck`` / ``blk`` sub-folders of an ``.arc`` hierarchy.
+:mod:`animation_registry` registry.  BCK, BLK and BTP can be exported in one
+batch, optionally into ``bck`` / ``blk`` / ``btp`` sub-folders of an ``.arc``
+hierarchy.
 """
 
 from __future__ import annotations
@@ -24,10 +25,12 @@ from . import bck_export
 from . import blk_export
 from . import blender_common as bc
 from . import bls_export_ui
+from . import btp_export
 
 
 FORMAT_BCK = registry_data.FORMAT_BCK
 FORMAT_BLK = registry_data.FORMAT_BLK
+FORMAT_BTP = registry_data.FORMAT_BTP
 MAX_TREE_ROWS = 12
 MAX_KEY_ROWS = 8
 _SYNCING = False
@@ -72,6 +75,13 @@ def _mesh_has_format(mesh_obj, entry, fmt):
                    and registry_data._track_has_keys(track)
                    for track in entry.tracks)
 
+    if fmt == FORMAT_BTP:
+        materials = {slot.material.name for slot in mesh_obj.material_slots
+                     if slot.material is not None}
+        return any(track.format == FORMAT_BTP and track.target in materials
+                   and registry_data._track_has_keys(track)
+                   for track in entry.tracks)
+
     return any(track.format == FORMAT_BLK and track.target == mesh_obj.name
                and registry_data._track_has_keys(track)
                for track in entry.tracks)
@@ -85,6 +95,9 @@ def _visible_formats(settings, mesh_obj, entry):
 
     if settings.export_blk and _mesh_has_format(mesh_obj, entry, FORMAT_BLK):
         formats.append(FORMAT_BLK)
+
+    if settings.export_btp and _mesh_has_format(mesh_obj, entry, FORMAT_BTP):
+        formats.append(FORMAT_BTP)
 
     return formats
 
@@ -326,7 +339,7 @@ def _convert_units_changed(self, context):
 class BMD_ANIM_ExportSettings(PropertyGroup):
     folder: StringProperty(
         name="Export Folder",
-        description="Folder that receives the exported .bck and .blk files",
+        description="Folder that receives the exported .bck, .blk and .btp files",
         subtype="DIR_PATH",
         default="",
         options=set(),
@@ -345,9 +358,16 @@ class BMD_ANIM_ExportSettings(PropertyGroup):
         update=_formats_changed,
         options=set(),
     )
+    export_btp: BoolProperty(
+        name="BTP",
+        description="Export texture-pattern animations",
+        default=True,
+        update=_formats_changed,
+        options=set(),
+    )
     arc_hierarchy: BoolProperty(
         name="Create .arc hierarchy",
-        description="Write animations into bck/ and blk/ sub-folders",
+        description="Write animations into bck/, blk/ and btp/ sub-folders",
         default=False,
         options=set(),
     )
@@ -360,6 +380,7 @@ class BMD_ANIM_ExportSettings(PropertyGroup):
     )
     bck_available: BoolProperty(default=True, options=set())
     blk_available: BoolProperty(default=True, options=set())
+    btp_available: BoolProperty(default=True, options=set())
     meshes: CollectionProperty(type=BMD_ANIM_ExportMeshItem)
     animations: CollectionProperty(type=BMD_ANIM_ExportAnimItem)
     tree_rows: CollectionProperty(type=BMD_ANIM_ExportTreeRow)
@@ -444,7 +465,7 @@ def scene_has_animations(context):
 
 
 def _populate(settings, context):
-    """Collect every mesh of the scene and its BCK/BLK animations."""
+    """Collect every mesh of the scene and its BCK/BLK/BTP animations."""
     global _SYNCING
 
     if settings is None:
@@ -463,6 +484,7 @@ def _populate(settings, context):
         settings.active_key = 0
         has_bck = False
         has_blk = False
+        has_btp = False
         meshes = sorted(
             (obj for obj in context.scene.objects if obj.type == "MESH"),
             key=lambda obj: obj.name.casefold())
@@ -481,11 +503,12 @@ def _populate(settings, context):
             for entry in reg.animations:
                 bck = _mesh_has_format(obj, entry, FORMAT_BCK)
                 blk = _mesh_has_format(obj, entry, FORMAT_BLK)
+                btp = _mesh_has_format(obj, entry, FORMAT_BTP)
 
-                if not (bck or blk):
+                if not (bck or blk or btp):
                     continue
 
-                rows.append((entry, bck, blk))
+                rows.append((entry, bck, blk, btp))
 
             if not rows:
                 continue
@@ -495,9 +518,10 @@ def _populate(settings, context):
             mesh_item.include = True
             mesh_item.expanded = True
 
-            for entry, bck, blk in rows:
+            for entry, bck, blk, btp in rows:
                 has_bck = has_bck or bck
                 has_blk = has_blk or blk
+                has_btp = has_btp or btp
                 item = settings.animations.add()
                 item.mesh_name = obj.name
                 item.name = entry.name
@@ -506,8 +530,10 @@ def _populate(settings, context):
 
         settings.bck_available = has_bck
         settings.blk_available = has_blk
+        settings.btp_available = has_btp
         settings.export_bck = has_bck
         settings.export_blk = has_blk
+        settings.export_btp = has_btp
         _refresh_formats(settings)
         _rebuild_tree(settings)
 
@@ -727,8 +753,8 @@ def _export_all(context, settings, operator):
         operator.report({"ERROR"}, "Select an export folder first")
         return {"CANCELLED"}
 
-    if not (settings.export_bck or settings.export_blk):
-        operator.report({"ERROR"}, "Select BCK, BLK or both")
+    if not (settings.export_bck or settings.export_blk or settings.export_btp):
+        operator.report({"ERROR"}, "Select BCK, BLK, BTP or any combination")
         return {"CANCELLED"}
 
     selected_meshes = {mesh_item.name for mesh_item in settings.meshes
@@ -756,7 +782,8 @@ def _export_all(context, settings, operator):
 
         if settings.arc_hierarchy:
             for fmt, enabled in ((FORMAT_BCK, settings.export_bck),
-                                 (FORMAT_BLK, settings.export_blk)):
+                                 (FORMAT_BLK, settings.export_blk),
+                                 (FORMAT_BTP, settings.export_btp)):
                 if enabled:
                     os.makedirs(
                         os.path.join(folder, fmt.lower()), exist_ok=True)
@@ -767,6 +794,7 @@ def _export_all(context, settings, operator):
     scale = 100.0 if settings.convert_units else 1.0
     used_paths = set()
     done_bck = set()
+    done_btp = set()
     written = 0
     errors = []
 
@@ -844,6 +872,46 @@ def _export_all(context, settings, operator):
 
                 break
 
+        if settings.export_btp:
+            btp_tracks = [
+                track for track in entry.tracks
+                if track.format == FORMAT_BTP
+                and registry_data._track_has_keys(track)
+            ]
+
+            if btp_tracks:
+                dedupe = (entry.name,
+                          tuple(sorted(track.target for track in btp_tracks)))
+
+                if dedupe not in done_btp:
+                    done_btp.add(dedupe)
+                    pairs = []
+                    for track in btp_tracks:
+                        action = registry_data._track_action(track)
+                        frames = btp_export.frames_from_action(action)
+                        if frames:
+                            pairs.append((track.target, frames))
+
+                    if pairs:
+                        path = _unique_path(
+                            _output_path(settings, entry.name, "btp"),
+                            used_paths)
+                        # Header fields are derived from the clip's keys and
+                        # loop mode (the BTP file's own range).
+                        frame_end = max(len(frames) for _target, frames in pairs) - 1
+                        length = btp_export.header_length(
+                            frame_end, entry.loop_mode)
+                        unknown = sum(len(frames) for _target, frames in pairs)
+                        try:
+                            btp_export.export_btp(
+                                path, pairs, entry.loop_mode,
+                                operator.report,
+                                length=length, unknown=unknown)
+                            written += 1
+                        except Exception as exc:
+                            errors.append(
+                                f"{os.path.basename(path)}: {exc}")
+
     if errors:
         operator.report({"ERROR"},
                         "Export failed: " + "; ".join(errors[:4]))
@@ -865,7 +933,7 @@ def _export_all(context, settings, operator):
 class BMD_ANIM_OT_export(Operator):
     bl_idname = "export_anim.j3d"
     bl_label = "Export J3D Animations"
-    bl_description = "Export the scene's BCK and BLK animations in one batch"
+    bl_description = "Export the scene's BCK, BLK and BTP animations in one batch"
     # REGISTER would leave an "Adjust Last Operation" popup with this dialog's
     # layout in the bottom-left corner after a successful export.
     bl_options = {"UNDO"}
@@ -928,6 +996,9 @@ class BMD_ANIM_OT_export(Operator):
         blk_box = row.row(align=True)
         blk_box.enabled = settings.blk_available
         blk_box.prop(settings, "export_blk", text="BLK")
+        btp_box = row.row(align=True)
+        btp_box.enabled = settings.btp_available
+        btp_box.prop(settings, "export_btp", text="BTP")
 
         layout.prop(settings, "arc_hierarchy")
 

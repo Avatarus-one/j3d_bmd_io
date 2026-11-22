@@ -573,6 +573,16 @@ def _make_file_handlers():
             def poll_drop(cls, context):
                 return poll_file_object_drop(context)
 
+        class BTP_FH_import(bpy.types.FileHandler):
+            bl_idname = "BTP_FH_import"
+            bl_label = "J3D BTP Texture Animation"
+            bl_import_operator = "import_anim.j3d"
+            bl_file_extensions = ".btp"
+
+            @classmethod
+            def poll_drop(cls, context):
+                return poll_file_object_drop(context)
+
         class KCL_FH_import(bpy.types.FileHandler):
             bl_idname = "KCL_FH_import"
             bl_label = "TP Collision KCL"
@@ -614,8 +624,8 @@ def _make_file_handlers():
 
                 return poll_file_object_drop(context)
 
-        return [BMD_FH_import, BCK_FH_import, BLK_FH_import, KCL_FH_import,
-                BLS_FH_import, BTI_FH_import]
+        return [BMD_FH_import, BCK_FH_import, BLK_FH_import, BTP_FH_import,
+                KCL_FH_import, BLS_FH_import, BTI_FH_import]
     except Exception:
         return []
 
@@ -644,6 +654,9 @@ def register():
     from . import ui
     ui.register()
 
+    from . import btp_preview
+    btp_preview.install()
+
     _file_handlers = _make_file_handlers()
     for fh in _file_handlers:
         try:
@@ -655,6 +668,11 @@ def register():
 
 def unregister():
     global _file_handlers
+    try:
+        from . import btp_preview
+        btp_preview.uninstall()
+    except Exception:
+        pass
     try:
         if bpy.app.timers.is_registered(_migrate_texture_lists):
             bpy.app.timers.unregister(_migrate_texture_lists)

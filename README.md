@@ -1,7 +1,8 @@
-# J3D BMD / BCK / BLS / BLK Import & Export for Blender (Zelda: Twilight Princess / Dusklight)
+# J3D BMD / BCK / BLS / BLK / BTP Import & Export for Blender (Zelda: Twilight Princess / Dusklight)
 
 Imports and exports Nintendo J3D models (`.bmd`, `.bdl` read-only), joint animations (`.bck`),
-collision (`.kcl`), shape keys (`.bls`) and shape-key animations (`.blk`).
+texture-pattern animations (`.btp`), collision (`.kcl`), shape keys (`.bls`) and shape-key
+animations (`.blk`).
 
 ## AI disclosure and disclaimer
 The original source code of this add-on was written with the help of an AI model (Claude by Anthropic),
@@ -25,7 +26,7 @@ In Blender:
 
 Edit -> Preferences -> Get Extensions -> drop-down (top right) -> *Install from Disk...* and pick
 the ZIP. The operators appear under File -> Import / Export:
-*J3D Model (.bmd)*, *J3D Animations (.bck/.blk)*, *J3D Textures (.bti)*,
+*J3D Model (.bmd)*, *J3D Animations (.bck/.blk/.btp)*, *J3D Textures (.bti)*,
 *TP Collision (.kcl)* and *J3D Shape Keys (.bls)*. Files can also be
 dragged into the viewport.
 
@@ -136,6 +137,10 @@ The UV choice applies to every UV set in the mesh. Colors are always written as 
 The exporter still uses triangle **strips** only, stores shape bounds in model space (radius measured
 from the origin) and puts a bounding box on the root joint only.
 
+The BMD exporter reads the **Textures list** (and each material's BMD texture slots), not the image
+textures connected inside the material node tree. Material nodes are a preview only, so changing or
+animating them cannot move TEX1 indices or swap exported textures.
+
 ## Textures and HD texture packs
 The importer stores the original encoded texture bytes (all mips, palettes) on each image. On export,
 images that still match the imported pixels are written back **byte-identically**, so texture packs
@@ -218,8 +223,16 @@ pixels).
 
 ### Materials
 * Material tab -> *J3D (BMD) Material*: **Render Mode** (Auto keeps imported values; Opaque / Cutout /
-  Translucent), Alpha Reference, Backface Culling. The **Textures** box lists the material's texture
-  slots and lets you change, add or remove textures from the model's BMD texture list.
+  Translucent), Alpha Reference, **Use Vertex Color** (preview only for now — export still derives
+  vertex colours from the mesh layer / imported TEV data), Backface Culling. The **Textures** box
+  lists the material's texture slots and lets you change, add or remove textures from the model's BMD
+  texture list.
+* **Create BMD Material** (Material Animation box) builds the preview nodes for a custom material
+  using the importer's layout. The button opens a menu with the render variants: *Opaque* (alpha not
+  connected), *Cutout* (alpha through "Greater Than", Alpha Reference / 255, 0.5 by default) and
+  *Translucent* (alpha connected directly, *Blended*). The action has its own undo step.
+* **Material Animation** box: **Add Track** allows adding material animation tracks (currently BTP
+  *Texture Index*).
 * The first texture slot is treated as the main texture and connected to Base Color; additional
   slots (highlights, eye masks, effect textures) are kept as separate image nodes.
 * Alpha test and blending are detected from the material's `alphaComp` / `blend` data and wired into
@@ -297,30 +310,32 @@ Requirements and limits:
 * A modified BLS can still target the original BMD when the mesh was imported
   with this add-on.
 
-## Animation import (.bck / .blk)
+## Animation import (.bck / .blk / .btp)
 
 Animations can be imported by pressing **Import J3D Animations** button in
-the **Animations** panel. The file browser accepts `.bck` and `.blk` together
+the **Animations** panel. The file browser accepts `.bck`, `.blk` and `.btp`
 and opens an import dialog:
 
-* The list shows the animation type (`BCK` / `BLK`) and the status;
+* The list shows the animation type and the status;
 * **BCK: Allow fewer joints** allows import of BCK animations that have fewer
   amount of animation joints than the targeted BMD model.
 * `Already imported` is evaluated per target. Such files can be checked again
-  to re-import them; only that file's BCK or BLK track is replaced, while the
-  other format in the same clip is kept;
+  to re-import them; only that file's BCK, BLK or BTP track is replaced, while
+  the other formats in the same clip are kept;
 * The **BLS File** field is shown only when a BLK file is present in the list.
   Tracks are named from the BLS keys; without a usable BLS they are assigned
   in shape key order of the mesh. Missing BLS keys are imported on confirm
   (duplicate and conflicting keys are skipped).
+* BTP files target material names and store global TEX1 indices. A file is
+  importable when all of its materials exist on the selected BMD model.
 
-## Animation export (.bck / .blk)
+## Animation export (.bck / .blk / .btp)
 
 Press **Export J3D Animations** button in the **Animations** panel. `File >
-Export > J3D Animations (.bck/.blk)` opens the same dialog.
+Export > J3D Animations (.bck/.blk/.btp)` opens the same dialog.
 
-* **Create .arc hierarchy**: when enabled, BCK files go to `bck` and  BLK files
-  to `blk` subfolders, which are created automatically.
+* **Create .arc hierarchy**: when enabled, BCK files go to `bck`, BLK files
+  to `blk` and BTP files to `btp` subfolders, which are created automatically.
 * The list shows every mesh of the scene with its animations.
 * **Shape Keys** list is shown when the selected mesh has BLK data in it's 
   exported animation. Shape key selection is shared by all animations of the
@@ -328,6 +343,8 @@ Export > J3D Animations (.bck/.blk)` opens the same dialog.
 * Each file is sampled over the action's keyframe range with the loop mode
   stored in the animation entry. The evaluated pose is sampled, so constraints,
   IK and drivers are baked; LOOP clips use cyclic tangents across the loop seam.
+* BTP is written from the stored material frame lists; each material entry
+  keeps its full texture-index sequence.
 
 ## Animations (.bck)
 Imported BMDs use their original joint, so bones added or removed later do not make the model
@@ -346,11 +363,16 @@ cyclic tangents across the loop seam.
 
 **Animation list**: the **Animations** section in the J3D sidebar lists the clips of the active
 mesh/armature. A clip stores only metadata (name, scene range, loop mode) and a list of tracks; each
-track is a `(format, target, action)` tuple (BCK on the armature, BLK on a mesh). Actions are created
-when keys are first added or imported, and empty actions are removed automatically. BCK and BLK files
-with the same base name are combined into one clip. Selecting a clip applies its range, assigns its
-armature and shape-key actions, so new keyframes are written to the selected clip. Switching to another
-mesh/armature also applies that target's active clip range.
+track is a `(format, target, action)` tuple (BCK on the armature, BLK on a mesh, BTP on a material).
+Actions are created when keys are first added or imported, and empty actions are removed automatically.
+BCK, BLK and BTP files with the same base name are combined into one clip. Selecting a clip applies its
+range and assigns its armature, shape-key and material actions, so new keyframes are written to the
+selected clip. Switching to another mesh/armature also applies that target's active clip range.
+
+**Material Animation preview (BTP)**: BTP swaps the image of the material's `bmd_tex<N>` Image Texture
+node. The animated value is **Material > J3D (BMD) Material > Material Animation > Texture Index**.
+The BMD exporter reads the J3D Textures list, so swapping a texture in the material doesn't affect
+exported data.
 
 Notes
 * Tracks are mapped to bones by `bmd_index`. Duplicated bones (which copy the index) are detected:
@@ -395,4 +417,3 @@ matching collision mesh.
 * All bone influences are preserved up to the BMD `EVP1` limit (255 per vertex). Shapes are written
   as triangle lists (no strips), so files are larger than the originals. MDL3 (BDL display lists) is
   not written.
-* Only `bck` (joint animations) is supported, not `btk` / `btp` / `bpk` / `brk` / `bca`.

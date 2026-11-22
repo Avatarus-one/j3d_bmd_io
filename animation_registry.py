@@ -32,13 +32,16 @@ LOOP_ENUM_ITEMS = [item for item in LOOP_ITEMS if item[0] != "AUTO"]
 
 FORMAT_BCK = "BCK"
 FORMAT_BLK = "BLK"
+FORMAT_BTP = "BTP"
 FORMAT_ICONS = {
     FORMAT_BCK: "ARMATURE_DATA",
     FORMAT_BLK: "SHAPEKEY_DATA",
+    FORMAT_BTP: "TEXTURE",
 }
 FORMAT_META_KEYS = {
     FORMAT_BCK: "j3d_owner",
     FORMAT_BLK: "j3d_mesh",
+    FORMAT_BTP: "j3d_material",
 }
 
 # Blender ID names are limited to 63 bytes. Uniqueness is inserted before the
@@ -411,6 +414,17 @@ def _track_has_keys(track):
     return _has_keys(_track_action(track))
 
 
+def _has_btp_action(action):
+    if action is None:
+        return False
+    try:
+        return any(curve.data_path in ("bmd.btp_texture_index",
+                                       '["bmd_btp_index"]')
+                   for curve in action.fcurves)
+    except Exception:
+        return False
+
+
 def entry_has_format(entry, fmt):
     if entry is None:
         return False
@@ -440,6 +454,9 @@ def _format_owner(fmt, target):
     if fmt == FORMAT_BLK:
         return _shape_keys(bpy.data.objects.get(target))
 
+    if fmt == FORMAT_BTP:
+        return bpy.data.materials.get(target)
+
     return None
 
 
@@ -459,6 +476,21 @@ def _format_owners(owner):
 
         if keys is not None:
             yield FORMAT_BLK, mesh.name, keys
+
+    seen_materials = set()
+    for mesh in _owner_meshes(owner):
+        for slot in mesh.material_slots:
+            material = slot.material
+            if material is None or material.name in seen_materials:
+                continue
+            animation_data = material.animation_data
+            action = animation_data.action if animation_data is not None else None
+            if action is not None and not _has_btp_action(action):
+                continue
+            if ("bmd_btp_images" in material
+                    or _has_btp_action(action)):
+                seen_materials.add(material.name)
+                yield FORMAT_BTP, material.name, material
 
 
 def _format_targets(owner):
@@ -492,6 +524,15 @@ def _clear_track(owner, track):
     if action_owner is not None:
         _clear_action(action_owner, action.name)
 
+    if track.format == FORMAT_BTP and action_owner is not None:
+        # The material keeps its last texture index when the action goes away;
+        # fall back to the material's default (the keys are gone).
+        try:
+            from . import btp_preview
+            btp_preview.reset_material(action_owner)
+        except Exception:
+            pass
+
 
 def _action_used_elsewhere(registry, action_name, exclude=None):
     if registry is None:
@@ -510,7 +551,7 @@ def _action_used_elsewhere(registry, action_name, exclude=None):
 
 
 def _unique_action_name(base, fmt, action):
-    """Return ``<animation>.<type>`` (or ``<animation>.001.<type>``)."""
+    """Return ``<base>.<type>`` (or ``<base>.001.<type>``)."""
     suffix = f".{fmt.lower()}"
     index = 0
 
@@ -531,7 +572,7 @@ def _unique_action_name(base, fmt, action):
 
 
 def _set_action_name(action, entry, registry, fmt, target):
-    """Name a track action ``<target>.<animation>.<type>`` unless shared."""
+    """Name a track action ``<animation>.<type>`` unless shared."""
     if action is None:
         return None
 
@@ -684,6 +725,18 @@ def reset_to_rest(context, owner):
         for block in keys.key_blocks[1:]:
             block.value = 0.0
 
+    for fmt, _target, action_owner in _format_owners(owner):
+        if fmt != FORMAT_BTP:
+            continue
+        animation_data = action_owner.animation_data
+        if animation_data is not None:
+            animation_data.action = None
+        try:
+            from . import btp_preview
+            btp_preview.reset_material(action_owner)
+        except Exception:
+            pass
+
 
 def activate_animation(context, owner, entry):
     global _LAST_SYNC
@@ -777,6 +830,49 @@ def register_shape_action(mesh, action, name, frame_start=0,
     _set_track(entry, FORMAT_BLK, mesh.name, action_name)
     action.use_fake_user = True
     _tag_action(action, FORMAT_BLK, mesh.name, entry.name)
+
+    if created:
+        _apply_loop_mode(entry)
+
+    entry_name = entry.name
+
+    if select:
+        _select_entry(registry, entry)
+
+    if sort:
+        sort_animations(registry)
+        return find_animation(registry, entry_name) or entry
+
+    return entry
+
+
+def register_btp_action(owner, material, action, name, frame_start=0,
+                        frame_end=0, loop_mode="ONCE", select=True,
+                        sort=True):
+    """Add or update a BTP track for *material* in *owner*'s list."""
+    migrate_registry(owner)
+    registry = registry_for(owner)
+
+    if (registry is None or action is None or material is None
+            or owner is None):
+        return None
+
+    entry = find_animation(registry, name)
+    created = entry is None
+
+    if created:
+        entry = _new_entry(registry, name, frame_start, frame_end, loop_mode)
+
+    action_name = _set_action_name(action, entry, registry, FORMAT_BTP,
+                                   material.name)
+    _set_track(entry, FORMAT_BTP, material.name, action_name)
+    action.use_fake_user = True
+    _tag_action(action, FORMAT_BTP, material.name, entry.name)
+    try:
+        from . import btp_preview
+        btp_preview.set_step_interpolation(action)
+    except Exception:
+        pass
 
     if created:
         _apply_loop_mode(entry)
@@ -1263,6 +1359,30 @@ def scan_actions(context, owner, select=True):
 
             count += 1
 
+    for fmt, target, _action_owner, action in _format_targets(owner):
+        if (fmt != FORMAT_BTP or action is None
+                or not _has_btp_action(action)
+                or not _has_keys(action)):
+            continue
+
+        name = _scan_entry_name(registry, action)
+        entry = find_animation(registry, name)
+
+        if entry is None:
+            start, end = _action_range(action)
+            entry = _new_entry(registry, name, start, end,
+                               loop_mode_name(action))
+
+        _set_track(entry, FORMAT_BTP, target, action.name)
+        action.use_fake_user = True
+        _tag_action(action, FORMAT_BTP, target, entry.name)
+        try:
+            from . import btp_preview
+            btp_preview.set_step_interpolation(action)
+        except Exception:
+            pass
+        count += 1
+
     sort_animations(registry)
 
     if count and not had_entries and registry.animations:
@@ -1355,6 +1475,13 @@ def _attach_active_actions(entry, owner, registry):
             elif track.action_name != action_name:
                 track.action_name = action_name
                 changed = True
+
+            if fmt == FORMAT_BTP:
+                try:
+                    from . import btp_preview
+                    btp_preview.set_step_interpolation(action)
+                except Exception:
+                    pass
 
     return changed
 

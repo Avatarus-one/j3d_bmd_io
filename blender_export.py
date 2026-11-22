@@ -967,6 +967,8 @@ class _MaterialCollector:
         self.pending = []  # (ExportMesh)
         self.sort_keys = {}  # material index -> original index
         self._source = None
+        self.owner = None
+        self.texture_keys = []  # sidebar texture index -> exported TEX1 key
 
     def register_material(self, bl_mat):
         """Add a material to the export without attaching it to a mesh."""
@@ -1014,6 +1016,8 @@ class _MaterialCollector:
         the original BMD if available.
         """
         slots = bc.ensure_texture_list(arm_obj)
+        self.owner = arm_obj
+        self.texture_keys = [None] * len(slots)
         source = source_file or arm_obj.get("bmd_source", "")
         missing, restored, empty = [], [], 0
         dup_index = 0
@@ -1028,7 +1032,7 @@ class _MaterialCollector:
                 out = f"__dup{dup_index}__{key}"
             return out
 
-        for slot in slots:
+        for index, slot in enumerate(slots):
             image = slot.image
 
             if image is not None:
@@ -1052,6 +1056,7 @@ class _MaterialCollector:
                 self.model.textures.append(tex)
                 seen_keys[slot_key] = count + 1
                 slot.key = tex.key
+                self.texture_keys[index] = tex.key
                 continue
             key = str(slot.key or "")
             if not key:
@@ -1071,6 +1076,7 @@ class _MaterialCollector:
                 self.images[tex.key] = tex
                 self.model.textures.append(tex)
                 restored.append(key)
+                self.texture_keys[index] = tex.key
                 continue
 
             if source_tex is not None:
@@ -1083,6 +1089,7 @@ class _MaterialCollector:
                 self.images[key] = tex
                 self.model.textures.append(tex)
                 restored.append(key)
+                self.texture_keys[index] = key
             else:
                 missing.append(key)
         if restored:
@@ -1129,7 +1136,6 @@ class _MaterialCollector:
         return out
 
     def _build(self, bl_mat, mesh):
-        nodes = self._image_nodes(bl_mat)
         stored = bl_mat.get("bmd_material") if bl_mat else None
         is_bmd = bool(bl_mat is not None and bc.is_bmd_material(bl_mat))
         mode = bl_mat.bmd.render_mode if is_bmd else "AUTO"
@@ -1137,6 +1143,22 @@ class _MaterialCollector:
         cull_back = bool(bl_mat.use_backface_culling) if bl_mat else True
         name = ((bl_mat.get("bmd_name")
                  or strip_blender_suffix(bl_mat.name)) if bl_mat else "default")
+
+        # The J3D Textures sidebar is authoritative.  Material node trees are
+        # only a preview and must not change the exported TEX1 indices.
+        slots = (bc.material_texture_slots(bl_mat, self.owner)
+                 if bl_mat is not None else [None] * 8)
+
+        def slot_key(slot):
+            if slot is None or slot < 0 or slot >= len(slots):
+                return None
+            index = slots[slot]
+            if index is None or not (0 <= index < len(self.texture_keys)):
+                return None
+            key = self.texture_keys[index]
+            return key if key in self.images else None
+
+        tex_names = [slot_key(slot) for slot in range(8)]
 
         d = None
         if stored:
@@ -1146,33 +1168,13 @@ class _MaterialCollector:
                 _warn(self.warn, f"Material '{name}': stored material data is invalid; "
                                  f"rebuilding it from its nodes: {exc}")
         if d is not None:
-            tex_names = list(d.get("texNames", [None] * 8))
-            for slot, (img, _ext) in nodes.items():
-                if img is None:
-                    tex_names[slot] = None
-                    continue
-
-                base = (tex_names[slot]
-                        if 0 <= slot < len(tex_names) else None)
-
-                if (base and base in self.images
-                        and bc.image_by_key(base) is img):
-                    # Keep the slot-specific key.  Several TEX1 indices may
-                    # share one image; collapsing them would change material
-                    # texture indices (and texture animations).
-                    continue
-
-                tex_names[slot] = self._texture_for(img)
-            # slots that previously had a texture but now have no node keep their name only
-            # if the texture still exists in the scene
-            for slot in range(8):
-                if tex_names[slot] and tex_names[slot] not in self.images:
-                    base = tex_names[slot]
-                    img = self._image_for_key(base)
-                    if img is not None:
-                        tex_names[slot] = self._texture_for(img)
-                    else:
-                        tex_names[slot] = None
+            # Old scenes may only have texture names in the material JSON and
+            # no per-slot sidebar map.  Accept those keys, but never inspect
+            # material nodes.
+            if not any(tex_names):
+                for slot, key in enumerate(d.get("texNames") or []):
+                    if slot < 8 and key in self.images:
+                        tex_names[slot] = key
             d["texNames"] = tex_names
             if (d.get("cull") == 2) != cull_back:
                 d["cull"] = 2 if cull_back else 0
@@ -1189,16 +1191,10 @@ class _MaterialCollector:
             return d, name
 
         # brand-new material: build a simple unlit texture * vertex colour material
-        tex_name = None
+        tex_name = next((key for key in tex_names if key is not None), None)
         has_alpha = False
-        if 0 in nodes and nodes[0][0] is not None:
-            tex_name = self._texture_for(nodes[0][0])
+        if tex_name is not None:
             has_alpha = gx.has_alpha(self.images[tex_name].rgba)
-        elif nodes:
-            slot = min(nodes)
-            if nodes[slot][0] is not None:
-                tex_name = self._texture_for(nodes[slot][0])
-                has_alpha = gx.has_alpha(self.images[tex_name].rgba)
         if mode == "AUTO":
             blended = False
             try:

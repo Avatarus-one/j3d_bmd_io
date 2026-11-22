@@ -21,7 +21,8 @@ from . import blender_common as bc
 from . import blk_import
 from . import bls_import
 from . import bls_session
-from .j3d import anim, blk
+from . import btp_import
+from .j3d import anim, blk, btp as btp_data
 
 
 MAX_ANIMATION_ROWS = 12
@@ -246,6 +247,11 @@ def _already_imported_for_target(item, arm, mesh):
 
         if animation_data is not None and animation_data.action is not None:
             actions.append(animation_data.action)
+    elif item.kind == "BTP":
+        owner = animation_registry.owner_for(arm or mesh)
+        if owner is None:
+            return False
+        return btp_import.already_imported(owner, item.filepath)
     else:
         if mesh is None:
             return False
@@ -413,6 +419,50 @@ def _refresh_impl(settings):
 
                 if not _was_imported:
                     item.include = False
+        elif item.kind == "BTP":
+            if target is None:
+                item.status = "No target"
+                incompatible += 1
+                continue
+
+            owner = animation_registry.owner_for(target) or target
+            session_item = _session_for(item.filepath)
+            animation = session_item[1] if session_item is not None else None
+
+            if (owner is None or not bc.is_bmd_object(owner)
+                    or animation is None):
+                item.status = "No BMD target"
+                incompatible += 1
+                continue
+
+            missing = btp_import.missing_materials(owner, animation)
+            item.track_count = len(animation.entries)
+
+            if item.track_count == 0:
+                item.status = "No material tracks"
+                incompatible += 1
+                continue
+
+            if missing:
+                item.status = (f"Incompatible: {len(missing)} material(s) "
+                               "not in target")
+                incompatible += 1
+                continue
+
+            item.compatible = True
+            restore_include(item)
+            item.status = f"OK: {item.track_count} material(s)"
+            item.status_icon = "CHECKMARK"
+
+            if _already_imported_for_target(item, arm, mesh):
+                _was_imported = previous.get(
+                    item.filepath, (False, True, False))[2]
+                item.status = "Already imported"
+                item.status_icon = "INFO"
+                item.already_imported = True
+
+                if not _was_imported:
+                    item.include = False
         else:
             if target is None:
                 item.status = "No target"
@@ -515,17 +565,22 @@ def _populate(settings, parsed):
 
             if kind == "BCK":
                 item.track_count = len(animation.tracks)
+            elif kind == "BTP":
+                item.track_count = len(animation.entries)
             else:
                 item.track_count = max(0, len(animation.tracks) - 1)
 
-            item.duration = int(animation.duration)
+            if kind == "BTP":
+                item.duration = btp_data.frame_end(animation) + 1
+            else:
+                item.duration = int(animation.duration)
 
         settings.active_animation = 0
     finally:
         _SYNCING = previous
 
 
-def _is_relevant_target(context, obj, has_bck, has_blk):
+def _is_relevant_target(context, obj, has_bck, has_blk, has_btp=False):
     if obj is None or obj.type not in {"MESH", "ARMATURE"}:
         return False
 
@@ -542,14 +597,20 @@ def _is_relevant_target(context, obj, has_bck, has_blk):
                 and mesh.data.shape_keys is not None):
             return True
 
+    if has_btp:
+        owner = animation_registry.owner_for(obj)
+        if owner is not None and bc.is_bmd_object(owner):
+            return True
+
     return False
 
 
 def _choose_target(context, parsed, selected):
     has_bck = any(item[1] == "BCK" for item in parsed)
     has_blk = any(item[1] == "BLK" for item in parsed)
+    has_btp = any(item[1] == "BTP" for item in parsed)
 
-    if _is_relevant_target(context, selected, has_bck, has_blk):
+    if _is_relevant_target(context, selected, has_bck, has_blk, has_btp):
         return selected
 
     bck_items = [item for item in parsed if item[1] == "BCK"]
@@ -569,11 +630,16 @@ def _choose_target(context, parsed, selected):
         return blk_import.find_compatible_mesh(
             context, track_count, blk_import._selected_mesh(context))
 
+    btp_items = [item for item in parsed if item[1] == "BTP"]
+    if btp_items:
+        return btp_import.find_compatible_owner(
+            context, [item[2] for item in btp_items])
+
     return None
 
 
 def begin_import(context, paths, operator):
-    """Parse BCK/BLK files and open the unified import dialog."""
+    """Parse BCK/BLK/BTP files and open the unified import dialog."""
     global _ANIM_SESSION
 
     parsed = []
@@ -592,6 +658,11 @@ def begin_import(context, paths, operator):
                     animation = blk.parse_blk(file.read())
 
                 parsed.append((filepath, "BLK", animation))
+            elif extension == ".btp":
+                with open(filepath, "rb") as file:
+                    animation = btp_data.parse_btp(file.read())
+
+                parsed.append((filepath, "BTP", animation))
             else:
                 operator.report(
                     {"WARNING"},
@@ -602,7 +673,7 @@ def begin_import(context, paths, operator):
                 f"Could not read {os.path.basename(filepath)}: {exc}")
 
     if not parsed:
-        operator.report({"ERROR"}, "No BCK or BLK animations could be read")
+        operator.report({"ERROR"}, "No BCK, BLK or BTP animations could be read")
         return {"CANCELLED"}
 
     parsed.sort(key=lambda item: os.path.basename(item[0]).casefold())
@@ -641,13 +712,13 @@ def _open_settings_dialog():
 
 
 class BMD_ANIM_OT_import(Operator, ImportHelper):
-    """Import J3D joint and/or shape-key animations (.bck / .blk)"""
+    """Import J3D joint, shape-key and texture-pattern animations (.bck/.blk/.btp)"""
     bl_idname = "import_anim.j3d"
     bl_label = "Import J3D Animations"
     bl_options = {"UNDO"}
 
     filename_ext = ".bck"
-    filter_glob: StringProperty(default="*.bck;*.blk", options={"HIDDEN"})
+    filter_glob: StringProperty(default="*.bck;*.blk;*.btp", options={"HIDDEN"})
     files: CollectionProperty(
         type=bpy.types.OperatorFileListElement,
         options={"HIDDEN", "SKIP_SAVE"})
@@ -710,7 +781,7 @@ class BMD_ANIM_OT_select_bls(Operator):
 class BMD_ANIM_OT_settings(Operator):
     bl_idname = "import_anim.j3d_settings"
     bl_label = "Import J3D Animations"
-    bl_description = "Import the selected BCK and BLK animations"
+    bl_description = "Import the selected BCK, BLK and BTP animations"
     bl_options = {"UNDO"}
 
     def invoke(self, context, _event):
@@ -958,11 +1029,52 @@ class BMD_ANIM_OT_settings(Operator):
 
             imported += 1
 
+        owner = (animation_registry.owner_for(settings.target)
+                 or settings.target)
+
+        for item in selected:
+            if item.kind != "BTP":
+                continue
+
+            if owner is None or not bc.is_bmd_object(owner):
+                self.report({"ERROR"},
+                            f"{item.name}: the target has no BMD materials")
+                continue
+
+            session_item = _session_for(item.filepath)
+
+            if session_item is None or session_item[0] != "BTP":
+                continue
+
+            try:
+                entry = btp_import.import_btp(
+                    context, owner, session_item[1], item.filepath,
+                    report=self.report)
+            except Exception as exc:
+                self.report({"ERROR"}, f"{item.name}: {exc}")
+                continue
+
+            if entry is not None:
+                registry = animation_registry.registry_for(owner)
+                last_entry = entry
+                last_registry = registry
+
+                if registry is not None:
+                    registries[registry.as_pointer()] = registry
+
+                imported += 1
+
         for registry in registries.values():
             animation_registry.sort_animations(registry)
 
         if last_entry is not None and last_registry is not None:
             animation_registry._select_entry(last_registry, last_entry)
+            if any(track.format == animation_registry.FORMAT_BTP
+                   for track in last_entry.tracks):
+                owner = (animation_registry.owner_for(settings.target)
+                         or settings.target)
+                animation_registry.activate_animation(
+                    context, owner, last_entry)
         elif last_action is not None:
             context.scene.frame_start = 0
             context.scene.frame_end = int(last_action.get("bmd_duration", 0))

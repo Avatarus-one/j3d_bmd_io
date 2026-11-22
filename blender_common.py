@@ -798,7 +798,6 @@ def image_format_allowed(image, fmt):
         return True
     return str(image.get("bmd_orig_format", "")) == fmt
 
-WRAP_EXT = {0: "EXTEND", 1: "REPEAT", 2: "MIRROR"}
 WRAP_ITEMS = [
     ("0", "Clamp", "Clamp to edge"),
     ("1", "Repeat", "Repeat the texture"),
@@ -824,14 +823,100 @@ RENDER_ITEMS = [
     (mat3.RENDER_TRANSLUCENT, "Translucent (alpha blend)", "Alpha blended, no depth write"),
 ]
 
+BTP_TRACK_DESCRIPTION = "BTP animation: TEX1 texture index"
+
+MATERIAL_TRACK_ITEMS = [
+    ("BTP", "Texture Index", BTP_TRACK_DESCRIPTION),
+]
+
+
+def _material_btp_index_changed(self, context):
+    material = self.id_data
+    if material is None:
+        return
+    try:
+        from . import btp_preview
+        value = int(self.btp_texture_index)
+        screen = getattr(context, "screen", None) if context is not None else None
+        if getattr(screen, "is_animation_playing", False):
+            # Playback writes this property from the animation system.  Swapping
+            # the node image here would modify data and tag the depsgraph in the
+            # middle of the evaluation; the frame handler swaps it once instead.
+            return
+        if not btp_preview.updates_suppressed():
+            btp_preview.auto_key(material, value, context)
+        btp_preview.show_index(material, value)
+    except Exception:
+        pass
+
+
+def _material_render_mode_changed(self, context):
+    try:
+        from . import blender_mat
+        blender_mat.sync_shading(self.id_data)
+    except Exception:
+        pass
+
+
+def _material_vertex_color_changed(self, context):
+    try:
+        from . import blender_mat
+        blender_mat.sync_shading(self.id_data)
+    except Exception:
+        pass
+
+
+class BMDMaterialTrack(PropertyGroup):
+    """One animatable material field shown in the Material Animation box."""
+    type: EnumProperty(name="Track", items=MATERIAL_TRACK_ITEMS, default="BTP",
+                       options=set())
+
 
 class BMDMaterialProps(PropertyGroup):
     render_mode: EnumProperty(name="Render Mode", items=RENDER_ITEMS, default="AUTO",
                               description="How the game renders this material",
+                              update=_material_render_mode_changed,
                               options=set())
+    use_vertex_color: BoolProperty(
+        name="Use Vertex Color", default=False,
+        description=("Multiply the texture colour and alpha by the vertex colour"
+                     "(preview only: it does not change the exported TEV data yet)"),
+        update=_material_vertex_color_changed,
+        options=set())
     alpha_ref: IntProperty(name="Alpha Reference", default=128, min=0, max=255,
                            description="Alpha test threshold for the Cutout mode",
+                           update=_material_render_mode_changed,
                            options=set())
+    btp_texture_index: IntProperty(
+        name="Texture Index", default=0, min=0, max=65535,
+        description=BTP_TRACK_DESCRIPTION,
+        update=_material_btp_index_changed)
+    tracks: CollectionProperty(type=BMDMaterialTrack)
+
+
+def material_track_types(material):
+    """Track types already added to the material's Material Animation box."""
+    if material is None:
+        return []
+    try:
+        return [track.type for track in material.bmd.tracks]
+    except Exception:
+        return []
+
+
+def ensure_material_track(material, track_type="BTP"):
+    """Add the material animation track unless it is already there."""
+    if material is None:
+        return False
+    try:
+        tracks = material.bmd.tracks
+    except Exception:
+        return False
+    if any(track.type == track_type for track in tracks):
+        return False
+    track = tracks.add()
+    track.type = track_type
+    return True
 
 
 def _image_format_changed(self, context):
@@ -851,70 +936,6 @@ def _image_key_changed(self, context):
     self.key_custom = True
 
 
-def _set_wrap_math(node, mode):
-    if mode == 1:
-        node.operation = "FRACT"
-        node.use_clamp = False
-    elif mode == 2:
-        node.operation = "PINGPONG"
-        node.inputs[1].default_value = 1.0
-        node.use_clamp = False
-    else:
-        node.operation = "ADD"
-        node.inputs[1].default_value = 0.0
-        node.use_clamp = True
-
-
-def _layout_wrap_chain(node, sep, comb, s, t, uv=None):
-    """Lay the per-axis wrap chain out as a compact tree left of *node*."""
-    x, y = node.location
-    if uv is not None:
-        uv.location = (x - 800, y)
-    sep.location = (x - 600, y)
-    s.location = (x - 400, y)
-    t.location = (x - 400, y - 160)
-    comb.location = (x - 200, y)
-
-
-def _apply_wrap_to_node(node, wrap_s, wrap_t):
-    tree = node.id_data
-    chain = {n.get("bmd_wrap_axis"): n for n in tree.nodes
-             if n.get("bmd_wrap_for") == node.name}
-    if not chain and wrap_s == wrap_t:
-        node.extension = WRAP_EXT.get(wrap_s, "REPEAT")
-        return
-    if not chain:
-        uv = None
-        if node.inputs["Vector"].is_linked:
-            link = node.inputs["Vector"].links[0]
-            source = link.from_socket
-            if link.from_node.type == "UVMAP":
-                uv = link.from_node
-        else:
-            uv = tree.nodes.new("ShaderNodeUVMap")
-            uv.uv_map = "UV0"
-            source = uv.outputs["UV"]
-        sep = tree.nodes.new("ShaderNodeSeparateXYZ")
-        comb = tree.nodes.new("ShaderNodeCombineXYZ")
-        s = tree.nodes.new("ShaderNodeMath")
-        s["bmd_wrap_for"] = node.name
-        s["bmd_wrap_axis"] = "S"
-        t = tree.nodes.new("ShaderNodeMath")
-        t["bmd_wrap_for"] = node.name
-        t["bmd_wrap_axis"] = "T"
-        _layout_wrap_chain(node, sep, comb, s, t, uv)
-        tree.links.new(source, sep.inputs["Vector"])
-        tree.links.new(sep.outputs["X"], s.inputs[0])
-        tree.links.new(sep.outputs["Y"], t.inputs[0])
-        tree.links.new(s.outputs[0], comb.inputs["X"])
-        tree.links.new(t.outputs[0], comb.inputs["Y"])
-        tree.links.new(comb.outputs["Vector"], node.inputs["Vector"])
-        chain = {"S": s, "T": t}
-    _set_wrap_math(chain["S"], wrap_s)
-    _set_wrap_math(chain["T"], wrap_t)
-    node.extension = "EXTEND"
-
-
 def _image_wrap_changed(self, context):
     image = self.id_data
     for material in bpy.data.materials:
@@ -924,7 +945,9 @@ def _image_wrap_changed(self, context):
         for node in tree.nodes:
             if node.type == "TEX_IMAGE" and node.image is image:
                 try:
-                    _apply_wrap_to_node(node, int(self.wrap_s), int(self.wrap_t))
+                    from . import blender_mat
+                    blender_mat.apply_wrap_to_node(
+                        node, int(self.wrap_s), int(self.wrap_t), material)
                 except Exception:
                     pass
 
@@ -1098,6 +1121,8 @@ def material_texture_slots(mat, owner=None, store=True):
             key = str(s.key or "") or texture_slot_key(s)
             if key:
                 key_to_index.setdefault(key, i)
+            if s.name:
+                key_to_index.setdefault(str(s.name), i)
         stored = mat.get("bmd_material")
         names = []
         if stored:
@@ -1108,14 +1133,6 @@ def material_texture_slots(mat, owner=None, store=True):
         for i, key in enumerate(names):
             if key and key in key_to_index:
                 slots[i] = key_to_index[key]
-        tree = mat.node_tree
-        if tree is not None:
-            for node in tree.nodes:
-                if (node.type == "TEX_IMAGE" and node.name.startswith("bmd_tex")
-                        and node.name[7:].isdigit() and node.image is not None):
-                    key = texture_key(node.image)
-                    if key in key_to_index:
-                        slots[int(node.name[7:])] = key_to_index[key]
         if store:
             set_material_texture_slots(mat, slots)
     return list(slots)[:8]
@@ -1432,6 +1449,82 @@ def target_armature(obj):
             return modifier.object
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Material node helpers shared by the importer and the material preview
+# ---------------------------------------------------------------------------
+
+def material_meshes(material, owner=None):
+    """Mesh datablocks that use *material*, optionally limited to *owner*."""
+    if material is None:
+        return []
+
+    scopes = []
+    if owner is not None:
+        if owner.type == "MESH":
+            scopes.append([owner])
+        elif owner.type == "ARMATURE":
+            scopes.append([obj for obj in bpy.data.objects
+                           if obj.type == "MESH"
+                           and target_armature(obj) is owner])
+    scopes.append([obj for obj in bpy.data.objects if obj.type == "MESH"])
+
+    for scope in scopes:
+        meshes = []
+        for obj in scope:
+            if obj.data is None:
+                continue
+            if not any(slot.material is material for slot in obj.material_slots):
+                continue
+            if obj.data not in meshes:
+                meshes.append(obj.data)
+        if meshes:
+            return meshes
+
+    return []
+
+
+def uv_layer_names(material, owner=None):
+    """UV layer names of the meshes that use *material*, in mesh order."""
+    names = []
+    for mesh in material_meshes(material, owner):
+        for layer in mesh.uv_layers:
+            if layer.name not in names:
+                names.append(layer.name)
+
+    return names
+
+
+def uv_layer_name(material, index=0, owner=None):
+    """Real UV layer name for UV channel *index* of *material*'s meshes.
+
+    BMD import creates ``UV<n>`` layers after the materials, so until a mesh
+    uses the material the importer's naming is returned unchanged.  Custom
+    meshes keep their own layer names (``UVMap``, ``UVMap.001``, ...), which
+    are used instead of a non-existent ``UV<n>``.
+    """
+    try:
+        index = max(0, int(index))
+    except (TypeError, ValueError):
+        index = 0
+
+    preferred = f"UV{index}"
+    names = uv_layer_names(material, owner)
+    if not names:
+        # No mesh uses the material yet (BMD import creates the UV<n> layers
+        # afterwards) -> keep the importer's naming.  Meshes without any UV
+        # layer fall back to the active UV map instead of a missing name.
+        return "" if material_meshes(material, owner) else preferred
+
+    if preferred in names:
+        return preferred
+
+    for mesh in material_meshes(material, owner):
+        if len(mesh.uv_layers) > index:
+            return mesh.uv_layers[index].name
+
+    return names[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1944,8 +2037,8 @@ def _register_type_property(owner, name, prop):
 
 
 def register_classes():
-    for cls in (BMDMaterialProps, BMDImageProps, BMDTextureSlot,
-                BMD_VertexFormatSettings):
+    for cls in (BMDMaterialTrack, BMDMaterialProps, BMDImageProps,
+                BMDTextureSlot, BMD_VertexFormatSettings):
         try:
             bpy.utils.register_class(cls)
         except Exception:
@@ -2001,7 +2094,7 @@ def unregister_classes():
     _remove_type_property(bpy.types.Material, "bmd")
 
     for cls in (BMD_VertexFormatSettings, BMDTextureSlot,
-                BMDImageProps, BMDMaterialProps):
+                BMDImageProps, BMDMaterialProps, BMDMaterialTrack):
         try:
             bpy.utils.unregister_class(cls)
         except Exception:
