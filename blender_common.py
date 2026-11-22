@@ -775,24 +775,26 @@ EXPORT_FORMAT_ITEMS = [
      "4-bit grayscale, no alpha."),
 ]
 
-# Indexed formats: readable, and selectable again only for a texture that was
-# imported in that exact format.  Re-encoding requires a palette quantizer.
+# Indexed formats: all are re-encoded from any image with the octree quantizer.
 PALETTE_FORMAT_ITEMS = [
-    ("C4", "C4", "4-bit indexed, 16 colors; needs a palette quantizer."),
-    ("C8", "C8", "8-bit indexed, 256 colors; needs a palette quantizer."),
-    ("C14X2", "C14X2", "14-bit indexed, 16,384 colors; needs a palette quantizer."),
+    ("C4", "C4", "4-bit indexed, 16 colors (octree-quantized RGBA)."),
+    ("C8", "C8", "8-bit indexed, 256 colors (octree-quantized RGBA)."),
+    ("C14X2", "C14X2", "14-bit indexed, 16,384 colors (octree-quantized RGBA)."),
 ]
 
 IMAGE_FORMAT_ITEMS = list(EXPORT_FORMAT_ITEMS + PALETTE_FORMAT_ITEMS)
 EXPORT_FORMAT_NAMES = {item[0] for item in EXPORT_FORMAT_ITEMS}
 PALETTE_FORMAT_NAMES = {item[0] for item in PALETTE_FORMAT_ITEMS}
+ENCODABLE_PALETTE_NAMES = {"C4", "C8", "C14X2"}
 
 FORMAT_ITEMS = list(IMAGE_FORMAT_ITEMS)
 
 
 def image_format_allowed(image, fmt):
-    """Palette formats stay selectable only on their original texture."""
+    """C4, C8 and C14X2 can be encoded for any image."""
     if fmt not in PALETTE_FORMAT_NAMES:
+        return True
+    if fmt in ENCODABLE_PALETTE_NAMES:
         return True
     return str(image.get("bmd_orig_format", "")) == fmt
 

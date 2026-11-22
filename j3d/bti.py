@@ -5,8 +5,6 @@ from __future__ import annotations
 from . import gx_texture as gx
 from .common import J3DError, align
 
-_PALETTE_FORMATS = gx.PALETTE_FORMATS
-
 
 def parse_bti(data, name="texture"):
     """Parse a standalone ``.bti`` file into a :class:`j3d.model.Texture`."""
@@ -82,18 +80,28 @@ def build_bti(texture):
         image = texture.raw_data
         mips = max(1, int(texture.mip_count))
     else:
-        if fmt not in gx.BLOCK or fmt in _PALETTE_FORMATS:
-            # Palette formats cannot be encoded from RGBA without quantising;
-            # fall back to a format that can.
+        if fmt not in gx.BLOCK:
             fmt = gx.RGB5A3 if gx.has_partial_alpha(texture.rgba) else gx.CMPR
             texture.format = fmt
-        image, mips = gx.encode_with_mips(fmt, texture.rgba, texture.mip_count)
-        texture.mip_count = mips
-        texture.max_lod = (mips - 1) * 8
-        palette = None
+        if fmt in gx.PALETTE_ENCODABLE:
+            image, palette, pal_format, pal_count, mips = (
+                gx.encode_palette_with_mips(fmt, texture.rgba,
+                                            texture.mip_count))
+            texture.format = fmt
+            texture.pal_enabled = 1
+            texture.pal_format = pal_format
+            texture.pal_count = pal_count
+            texture.mip_count = mips
+            texture.max_lod = (mips - 1) * 8
+        else:
+            image, mips = gx.encode_with_mips(
+                fmt, texture.rgba, texture.mip_count)
+            texture.mip_count = mips
+            texture.max_lod = (mips - 1) * 8
+            palette = None
 
     if palette:
-        pal_enabled = int(texture.pal_enabled)
+        pal_enabled = int(texture.pal_enabled) or 1
         pal_format = int(texture.pal_format)
         pal_count = int(texture.pal_count)
         pal_offset = 0x20

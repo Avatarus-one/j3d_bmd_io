@@ -9,6 +9,7 @@ from collections import namedtuple
 import numpy as np
 
 from .common import J3DError
+from .octree_quantizer import Color as QuantizerColor, OctreeQuantizer
 
 TEXTURE_HEADER_SIZE = 0x20
 TEXTURE_HEADER_STRUCT = ">BBHHBBBBHI4BBBbbBBhI"
@@ -24,9 +25,11 @@ I4, I8, IA4, IA8, RGB565, RGB5A3, RGBA32 = 0, 1, 2, 3, 4, 5, 6
 C4, C8, C14X2 = 8, 9, 10
 CMPR = 14
 
-# Indexed formats: decoded on import, but not encodable without palette
-# quantisation.  Unchanged bytes are still written back as-is.
+# Indexed formats: decoded on import and re-encoded from RGBA with the octree
+# quantizer (C14X2 stores 14-bit indices in 16-bit words).
 PALETTE_FORMATS = (C4, C8, C14X2)
+PALETTE_ENCODABLE = (C4, C8, C14X2)
+PALETTE_MAX_COLORS = {C4: 16, C8: 256, C14X2: 16384}
 
 FORMAT_NAMES = {
     I4: "I4", I8: "I8", IA4: "IA4", IA8: "IA8", RGB565: "RGB565",
@@ -321,6 +324,128 @@ def _pack_rgb5a3(rgba):
     v_op = 0x8000 | (_q5(r) << 10) | (_q5(g) << 5) | _q5(b)
     v_tr = (_q3(a) << 12) | (_q4(r) << 8) | (_q4(g) << 4) | _q4(b)
     return np.where(opaque, v_op, v_tr).astype(np.uint16)
+
+
+def _pad_indices(indices, bw, bh):
+    h, w = indices.shape
+    ph, pw = -h % bh, -w % bw
+    if ph or pw:
+        indices = np.pad(indices, ((0, ph), (0, pw)), mode="edge")
+    return indices
+
+
+def _encode_indexed(fmt, indices):
+    """Tile palette indices as C4, C8 or C14X2."""
+    bw, bh, _ = BLOCK[fmt]
+    dtype = np.uint16 if fmt == C14X2 else np.uint8
+    tiled = _tile(_pad_indices(indices.astype(dtype), bw, bh), bh, bw)
+    if fmt == C4:
+        return ((tiled[..., 0::2] << 4)
+                | tiled[..., 1::2]).astype(np.uint8).tobytes()
+    if fmt == C14X2:
+        return np.ascontiguousarray(tiled.astype(">u2")).tobytes()
+    return np.ascontiguousarray(tiled).tobytes()
+
+
+def pack_palette(pal_fmt, palette):
+    """Pack an ``(n, 4)`` uint8 RGBA palette as big-endian TLUT entries."""
+    palette = np.asarray(palette, np.uint8)
+    if pal_fmt == PAL_IA8:
+        v = (_intensity(palette).astype(np.uint16)
+             | (palette[..., 3].astype(np.uint16) << 8))
+    elif pal_fmt == PAL_RGB565:
+        v = _pack565(palette[..., :3])
+    elif pal_fmt == PAL_RGB5A3:
+        v = _pack_rgb5a3(palette)
+    else:
+        raise J3DError(f"Unsupported palette format {pal_fmt}")
+    return np.ascontiguousarray(v.astype(">u2")).tobytes()
+
+
+def _palette_format(palette):
+    """Best GX TLUT format for *palette* (IA8 keeps 8-bit alpha)."""
+    if not len(palette):
+        return PAL_RGB565
+    if (palette[:, 3] < 255).any():
+        rgb = palette[:, :3].astype(np.int16)
+        if bool(((rgb.max(1) - rgb.min(1)) <= 1).all()):
+            return PAL_IA8
+        return PAL_RGB5A3
+    return PAL_RGB565
+
+
+def _nearest_palette_indices(palette, colors, chunk=2048):
+    """Index of the closest palette color for each RGBA color."""
+    entries = palette.astype(np.int32)
+    # Keep the temporary (#colors x #palette x 4) array small for C14X2.
+    chunk = max(1, min(chunk, 2_000_000 // max(1, len(entries))))
+    out = np.empty(len(colors), np.int32)
+    for start in range(0, len(colors), chunk):
+        part = colors[start:start + chunk].astype(np.int32)
+        diff = part[:, None, :] - entries[None, :, :]
+        out[start:start + chunk] = (diff * diff).sum(-1).argmin(1)
+    return out
+
+
+def _quantize_palette(rgba, max_colors):
+    """Build an octree palette from *rgba* (at most *max_colors* entries)."""
+    flat = np.ascontiguousarray(rgba[..., :4].reshape(-1, 4))
+    unique, counts = np.unique(flat, axis=0, return_counts=True)
+    quantizer = OctreeQuantizer()
+    for color, count in zip(unique, counts):
+        quantizer.add_color(QuantizerColor(
+            int(color[0]), int(color[1]), int(color[2]), int(color[3])),
+            int(count))
+    palette = quantizer.make_palette(max_colors)
+    if not palette:
+        return quantizer, np.array([[0, 0, 0, 255]], np.uint8)
+    colors = np.array(
+        [[c.red, c.green, c.blue, c.alpha] for c in palette], np.float32)
+    return quantizer, np.clip(np.rint(colors), 0, 255).astype(np.uint8)
+
+
+def _palette_indices(quantizer, palette, rgba):
+    """Map every pixel of *rgba* to the closest palette index."""
+    flat = np.ascontiguousarray(rgba[..., :4].reshape(-1, 4))
+    unique, inverse = np.unique(flat, axis=0, return_inverse=True)
+    lookup = np.empty(len(unique), np.int32)
+    for i, color in enumerate(unique):
+        index = quantizer.get_palette_index(QuantizerColor(
+            int(color[0]), int(color[1]), int(color[2]), int(color[3])))
+        lookup[i] = (-1 if index is None or index >= len(palette) else index)
+    missing = lookup < 0
+    if missing.any():
+        lookup[missing] = _nearest_palette_indices(palette, unique[missing])
+    return lookup[inverse].reshape(rgba.shape[0], rgba.shape[1])
+
+
+def encode_palette_with_mips(fmt, rgba, mip_count=1):
+    """Encode a C4/C8 image with an octree-built TLUT.
+
+    The palette is built from the base level and reused by every mip level.
+    Returns ``(image_bytes, palette_bytes, pal_format, pal_count, mip_count)``.
+    """
+    max_colors = PALETTE_MAX_COLORS.get(fmt)
+    if max_colors is None:
+        raise J3DError(
+            f"Cannot encode palette format {FORMAT_NAMES.get(fmt, fmt)}")
+
+    mip_count = max(1, min(mip_count, max_mip_count(
+        rgba.shape[1], rgba.shape[0])))
+    quantizer, palette = _quantize_palette(rgba, max_colors)
+    pal_format = _palette_format(palette)
+    palette_bytes = pack_palette(pal_format, palette)
+
+    out = bytearray()
+    current = rgba
+    indices = _palette_indices(quantizer, palette, current)
+    for level in range(mip_count):
+        if level:
+            current = downsample(current)
+            indices = _palette_indices(quantizer, palette, current)
+        out += _encode_indexed(fmt, indices)
+    return (bytes(out), palette_bytes, pal_format, int(len(palette)),
+            mip_count)
 
 
 def _encode_cmpr(rgba):

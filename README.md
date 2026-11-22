@@ -140,10 +140,12 @@ from the origin) and puts a bounding box on the root joint only.
 The importer stores the original encoded texture bytes (all mips, palettes) on each image. On export,
 images that still match the imported pixels are written back **byte-identically**, so texture packs
 that match textures by content keep working. Only edited images, or images whose format / mip setting
-you changed, are re-encoded (CMPR, RGB5A3, RGBA32, RGB565, IA8, IA4, I8, I4). Palette formats are
-decoded on import and re-encoded as CMPR / RGB5A3 only if you change the image. Edited images update
-the GX transparency flag and the mipmap flag; an automatically kept format is switched to CMPR /
-RGB5A3 when the edited pixels now contain alpha.
+you changed, are re-encoded (CMPR, RGB5A3, RGBA32, RGB565, IA8, IA4, I8, I4, C4, C8, C14X2).
+Palette formats are decoded on import; C4, C8 and C14X2 can also be chosen for any image and
+are re-encoded from RGBA with an octree quantizer (16, 256 or 16,384 colors).
+The quantizer is a Python 3 / RGBA port of [delimitry/octree_color_quantizer](https://github.com/delimitry/octree_color_quantizer) (MIT).
+Edited images update the GX transparency flag and the mipmap flag; an automatically kept
+format is switched to CMPR / RGB5A3 when the edited pixels now contain alpha.
 
 ### Texture formats (GX)
 | Format | Bits/px | Colors | Alpha | Notes |
@@ -156,9 +158,9 @@ RGB5A3 when the edited pixels now contain alpha.
 | **IA4** | 8 | 16 grayscale levels | 4-bit (16 levels) | Intensity + alpha |
 | **I8** | 8 | 256 grayscale levels | None | Intensity only |
 | **I4** | 4 | 16 grayscale levels | None | Smallest uncompressed format |
-| **C4** | 4 | 16 palette entries | From palette | No encoding support yet |
-| **C8** | 8 | 256 palette entries | From palette | No encoding support yet |
-| **C14X2** | 16 | 16,384 palette entries | From palette | 14-bit index + 2 unused bits; no encoding support yet |
+| **C4** | 4 | 16 palette entries | From palette | Octree-quantized from RGBA |
+| **C8** | 8 | 256 palette entries | From palette | Octree-quantized from RGBA |
+| **C14X2** | 16 | 16,384 palette entries | From palette | Octree-quantized from RGBA; 14-bit index + 2 unused bits |
 
 ### External stage textures (`STG_00/texc`)
 Some stage models keep their texture pixels outside the BMD. In `TEX1`, such an entry has

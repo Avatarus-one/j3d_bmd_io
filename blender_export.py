@@ -893,10 +893,10 @@ def texture_from_image(image, warn=None):
         fmt = gx.NAME_TO_FORMAT.get(want) if want else None
         if fmt is None:
             return gx.RGB5A3 if partial else gx.CMPR
-        if fmt in gx.PALETTE_FORMATS:
+        if fmt in gx.PALETTE_FORMATS and fmt not in gx.PALETTE_ENCODABLE:
             fallback = gx.RGB5A3 if partial else gx.CMPR
             _warn(warn, f"Image '{name}': {gx.FORMAT_NAMES.get(fmt, fmt)} export "
-                        "needs a palette quantizer; using "
+                        "is not supported; using "
                         f"{gx.FORMAT_NAMES[fallback]}")
             return fallback
         # An automatically kept format must not silently discard alpha that

@@ -705,6 +705,7 @@ def _build_tex1(textures):
     for i, t in enumerate(textures):
         hpos = hdr_off + 0x20 * i
         pal_enabled, pal_fmt, pal_cnt, pal_pos = 0, 0, 0, 0
+        palette = t.raw_palette if t.raw_data is not None else None
         external = bool(getattr(t, "external", False))
         group = None if external else getattr(t, "data_group", None)
         shared = group is not None and group in group_positions
@@ -723,12 +724,24 @@ def _build_tex1(textures):
             if shared:
                 # Another TEX1 index already wrote this image's pixels.
                 data = b""
+                if fmt in gx.PALETTE_ENCODABLE and t.rgba is not None:
+                    _data, palette, pal_fmt, pal_cnt, _mips = (
+                        gx.encode_palette_with_mips(fmt, t.rgba, mips))
+                    pal_enabled = 1
+                    t.pal_format, t.pal_count = pal_fmt, pal_cnt
             elif t.raw_data is not None:
                 data = t.raw_data
             else:
                 if t.rgba is None:
                     raise J3DError(f"Texture '{t.name}' has no pixel data")
-                data, mips = gx.encode_with_mips(fmt, t.rgba, t.mip_count)
+                if fmt in gx.PALETTE_ENCODABLE:
+                    data, palette, pal_fmt, pal_cnt, mips = (
+                        gx.encode_palette_with_mips(fmt, t.rgba, t.mip_count))
+                    pal_enabled = 1
+                    t.pal_format, t.pal_count = pal_fmt, pal_cnt
+                else:
+                    data, mips = gx.encode_with_mips(
+                        fmt, t.rgba, t.mip_count)
 
         if (getattr(t, "max_lod_custom", False)
                 or t.raw_data is not None or external):
@@ -740,7 +753,7 @@ def _build_tex1(textures):
             data_pos, pal_pos = group_positions[group]
         else:
             data_pos = pos
-            if not external and t.raw_data is not None and t.raw_palette:
+            if not external and palette:
                 pal_pos = align(pos + len(data), 32)
 
         headers += gx.pack_texture_header(gx.TextureHeader(
@@ -757,8 +770,8 @@ def _build_tex1(textures):
         blobs.append((data_pos, data))
         end = data_pos + len(data)
         if pal_pos:
-            blobs.append((pal_pos, t.raw_palette))
-            end = pal_pos + len(t.raw_palette)
+            blobs.append((pal_pos, palette))
+            end = pal_pos + len(palette)
         pos = align(end, 32)
         if group is not None:
             group_positions[group] = (data_pos, pal_pos)
