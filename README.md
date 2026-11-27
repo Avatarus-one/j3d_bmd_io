@@ -19,7 +19,7 @@ The operators are under *File -> Import / Export* and in *3D View > Sidebar > J3
 
 ## Documentation
 
-See the [Wiki](Wiki/Home.md) for installation details and usage.
+See the [Wiki](https://github.com/Avatarus-one/j3d_bmd_io/wiki) for installation details and usage.
 
 ## Disclaimer
 
