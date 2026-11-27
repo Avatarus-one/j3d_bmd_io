@@ -1905,7 +1905,7 @@ def _raster_is_lit(data):
     is much darker than the full-brightness raster the preview feeds and a TEV
     colour scale compensates it.  An unlit channel outputs its source colour
     (material or vertex colour) directly, so the preview matches the game and
-    the scale must stay (``o_g_hutk`` window frames, eyeballs, marks, arrows).
+    the scale must stay.
     """
     channels = data.get("colorChan") or []
     channel = channels[0] if channels else None
@@ -1923,7 +1923,7 @@ def _raster_cancel_stages(stages, data=None):
     through ``prev`` / C0-C2 (e.g. a final brightening) and is dropped there
     too, as before.  A x2 on such a downstream stage is left alone: it is not
     raster compensation, and dropping it would darken colour grades and toon
-    ramps (``knj_body_m``).  Materials with an unlit colour channel keep every
+    ramps.  Materials with an unlit colour channel keep every
     scale: there is no dim lit raster to compensate.
     """
     if data is not None and not _raster_is_lit(data):
@@ -1944,6 +1944,30 @@ def _raster_cancel_stages(stages, data=None):
     return cancel
 
 
+def _raster_ambient(data):
+    """Raw ambient level of colour channel 0 (0..1)."""
+    try:
+        return max(0.0, min(1.0, float(((data.get("ambColor") or [[0]])[0][0])) / 255.0))
+    except (IndexError, TypeError, ValueError):
+        return 0.0
+
+
+def _stage_adds_bare_raster(stage):
+    """True when the stage adds the raster itself (``A`` / ``D`` is RASC)."""
+    args = [int(arg) for arg in (stage.get("colorIn") or [])]
+    if len(args) < 4:
+        return False
+    return args[0] == 10 or args[3] == 10
+
+
+def _stage_is_pure_raster(stage):
+    """True when the whole stage output is the raster (nothing else added)."""
+    args = [int(arg) for arg in (stage.get("colorIn") or [])]
+    if len(args) < 4:
+        return False
+    return sum(1 for arg in args if arg != 15) == 1 and 10 in args
+
+
 def _raster_model(stages, data=None):
     """How the preview should feed the raster colour of this material.
 
@@ -1955,14 +1979,24 @@ def _raster_model(stages, data=None):
 
     Some materials also *add* a bare raster operand (``a * (1 - c)`` or the ``d``
     operand) that has no such compensation: it would add a whole white raster
-    instead of the dim lit one and the result clips to white - ``al_SWM_m`` lost
-    the blade texture that way, and the ``Demo31`` eyeball materials went flat
-    too.  For those the consistent model is to keep every stored scale and feed
-    the raster at the brightness the compensated scale implies, which is exact
-    for both the scaled and the added terms.
+    instead of the dim lit one and the result clips to white, hiding the
+    texture.  For those the consistent model is to keep every stored scale and
+    feed the raster at the brightness the compensated scale implies, which is
+    exact for both the scaled and the added terms.  When there is no scale at
+    all the raster is added at the channel's ambient level instead: the game
+    lights it, the preview cannot, and a full white raster washes the whole
+    material out.
     """
     cancel = _raster_cancel_stages(stages, data)
     if not cancel:
+        if data is not None and _raster_is_lit(data):
+            added = [stage for _index, stage in stages
+                     if _stage_adds_bare_raster(stage)]
+            if added and not all(_stage_is_pure_raster(stage)
+                                 for stage in added):
+                ambient = _raster_ambient(data)
+                if 0.0 < ambient < 1.0:
+                    return set(), ambient
         return cancel, 1.0
     factor = 1
     for index, stage in stages:
@@ -2346,8 +2380,8 @@ def _env_srt_translation(srt):
     texture's down-positive V, so it mirrors the whole SRT placed before it.
     The SRT translation is authored in texture space, though, and must not be
     mirrored: without this the window moves to the opposite side of the map
-    and lands on the bright part of the highlight texture (`zrc.bmd` body,
-    face and eye all sampling the `nurunuru` blobs).
+    and samples the bright part of the highlight texture, washing the surface
+    out.
     """
     out = srt.copy()
     out[1][3] = -out[1][3]
@@ -3215,10 +3249,9 @@ def _build_raster(material, data, with_alpha=True, with_color=True,
     stages sharing one node.  Stage 0 keeps the historical names; later
     stages append their index.
 
-    ``mat_5cylinder_in_v_x`` and similar materials only read the raster
-    *alpha* (RASA), so building the BPK matColor x vertex colour multiply
-    would leave a node that nothing uses.  Build each half only when the stage
-    actually selects it.
+    Materials that only read the raster *alpha* (RASA) would otherwise get an
+    unused node from the BPK matColor x vertex colour multiply.  Build each
+    half only when the stage actually selects it.
     """
     tree = material.node_tree
     anchor = _layout_node(tree)

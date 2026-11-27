@@ -201,9 +201,9 @@ def _unique_name(base_name, used):
 def _rename_base(entry):
     """Base name for an auto-renamed key.
 
-    Keys from ``<archive>/bls/file.bls`` get the archive folder tag, e.g.
-    ``md_mouth_mu [Demo22_01]``.  Any other layout uses plain numbering
-    (``md_mouth_mu.001``) instead of inventing a folder name.
+    Keys from ``<archive>/bls/file.bls`` get the archive folder tag in
+    brackets, e.g. ``key_name [archive]``.  Any other layout uses plain
+    numbering (``key_name.001``) instead of inventing a folder name.
     """
     parent = os.path.dirname(entry.file.path)
 

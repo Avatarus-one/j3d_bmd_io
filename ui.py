@@ -172,7 +172,7 @@ def _draw_slot_sampler(layout, slot):
 
 
 class IMAGE_PT_bmd(Panel):
-    bl_label = "J3D (BMD) Texture"
+    bl_label = "BMD Texture"
     bl_space_type = "IMAGE_EDITOR"
     bl_region_type = "UI"
     bl_category = "Image"

@@ -15,15 +15,11 @@ def _name_key(name):
 
 
 def _folder_stem(path):
-    """STG_00, STG_00.arc, STG_00.arc_dir -> stg_00."""
     return Path(path).name.split(".", 1)[0].casefold()
 
 
 def _texc_children(folder):
     """Return ``texc`` folders directly inside *folder* or one level below.
-
-    The extra folder is not necessarily called ``archive``; any folder name is
-    accepted, for example ``STG_00/files/texc``.
     """
     found = []
     try:
