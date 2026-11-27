@@ -112,7 +112,7 @@ _NODE_HEIGHTS = {
     "VECT_TRANSFORM": 140.0, "SEPARATE_COLOR": 140.0,
     "COMBINE_COLOR": 140.0, "MATH": 140.0,
     "BSDF_PRINCIPLED": 540.0, "BSDF_TRANSPARENT": 80.0,
-    "OUTPUT_MATERIAL": 160.0, "GROUP": 280.0,
+    "OUTPUT_MATERIAL": 160.0,
 }
 NODE_WIDTH = 140.0
 NODE_HEIGHT = 140.0
@@ -125,11 +125,23 @@ def _node_extent(node):
     """Width/height of a node as the node editor draws it (the layout spec)."""
     width = _NODE_WIDTHS.get(node.type, NODE_WIDTH)
     height = _NODE_HEIGHTS.get(node.type, NODE_HEIGHT)
+    if node.type in ("GROUP_INPUT", "GROUP_OUTPUT"):
+        # These grow with their sockets; the plain 140 default is too short
+        # for a TEV group (9 sockets), which pushed the first branch row into
+        # the input node.  Header plus one row per socket.
+        sockets = max(len(node.inputs), len(node.outputs))
+        height = max(height, 30.0 + 22.0 * sockets)
     if node.type == "GROUP":
-        # A group grows with its sockets; the drawn size is known once the
-        # editor has drawn it.
+        # A group node draws as tall as its interface needs.  Use the height
+        # Blender reports, snapped up to the node-editor grid (20), so a node
+        # below the group is not pushed down by a stale fixed estimate.
         width = max(width, float(getattr(node, "width", 0.0) or 0.0))
-        height = max(height, float(getattr(node, "height", 0.0) or 0.0))
+        real_height = float(getattr(node, "height", 0.0) or 0.0)
+        if real_height > 0.0:
+            height = 20.0 * math.ceil(real_height / 20.0)
+        else:
+            sockets = len(node.inputs) + len(node.outputs)
+            height = 20.0 * math.ceil((30.0 + 22.0 * sockets) / 20.0)
     if node.type == "VECT_MATH":
         # A vector math using a single input is the tall "one argument" shape.
         linked = sum(1 for socket in node.inputs if socket.is_linked)
@@ -729,9 +741,20 @@ def _layout_group_tree(nodes, incoming, outgoing, topological, width, height):
                                - width[node] - H_GAP)
         placed.add(node)
 
-    _place_stage_block([node for node in nodes if node != sink], 0.0,
-                       outgoing, {sink}, width, height)
-    left = min(node.location.x for node in nodes)
+    # Group Input and Output wrap the block from outside: Input sits one gap
+    # left of it, Output one gap right of it, so the group reads as
+    # input | block | output instead of Input being packed into the block.
+    source = next((node for node in nodes if node.type == "GROUP_INPUT"), None)
+    block = [node for node in nodes if node is not sink and node is not source]
+    if block:
+        _place_stage_block(block, 0.0, outgoing, {sink}, width, height)
+        left = min(node.location.x for node in block)
+    else:
+        left = sink.location.x
+    if source is not None:
+        source.location.x = left - width[source] - H_GAP
+        source.location.y = 0.0
+        left = min(left, source.location.x)
     if left:
         for node in nodes:
             node.location.x -= left
@@ -848,11 +871,51 @@ def _wrap_modes(node):
 
 def _set_surface_method(material, mode):
     try:
-        material.surface_render_method = (
-            "BLENDED" if mode in (mat3.RENDER_TRANSLUCENT, mat3.RENDER_ADDITIVE)
-            else "DITHERED")
+        if mode in (mat3.RENDER_TRANSLUCENT, mat3.RENDER_ADDITIVE):
+            method = ("DITHERED" if mode == mat3.RENDER_TRANSLUCENT
+                      and dithered_translucency_enabled() else "BLENDED")
+        else:
+            method = "DITHERED"
+        material.surface_render_method = method
     except Exception:
         pass
+
+
+def dithered_translucency_enabled():
+    """Whether the Utility switch renders translucent materials as Dithered."""
+    try:
+        return bool(bpy.context.scene.bmd_dithered_translucency)
+    except Exception:
+        return False
+
+
+def material_is_translucent(material):
+    """True when the material's shader or Render Mode makes it Translucent."""
+    bmd = getattr(material, "bmd", None)
+    if bmd is None or getattr(material, "node_tree", None) is None:
+        return False
+    mode = bmd.render_mode
+    if mode == mat3.RENDER_TRANSLUCENT:
+        return True
+    if mode != "AUTO":
+        return False
+    data = material_data(material) or {}
+    kind, _ = mat3.classify_alpha(data)
+    if kind != mat3.RENDER_TRANSLUCENT:
+        return False
+    # A TEV material whose blend equation uses no alpha is previewed opaque.
+    return not has_tev_graph(material) or mat3.blend_uses_alpha(data)
+
+
+def apply_dithered_translucency(enabled):
+    """Switch every Translucent material between Dithered and Blended."""
+    for material in bpy.data.materials:
+        if not material_is_translucent(material):
+            continue
+        try:
+            material.surface_render_method = "DITHERED" if enabled else "BLENDED"
+        except Exception:
+            pass
 
 
 def main_texture_node(material):
@@ -1300,8 +1363,37 @@ def apply_alpha(material, tree, bsdf, sources, mode, alpha_ref=128):
                 (source.location.x + bsdf.location.x) / 2.0,
                 source.location.y - 120.0)
         alpha = cutout
+    elif mode == mat3.RENDER_TRANSLUCENT:
+        # The game compares the final alpha even for a blended material and
+        # discards the fragment before blending; without the test a clamped
+        # transparent texel still tints the surface instead of hiding it.
+        test_ref = _translucent_alpha_test(material, alpha_ref)
+        if test_ref is not None:
+            test = alpha_cutout(tree, bsdf, alpha, test_ref)
+            if material.get("bmd_material") and hasattr(alpha, "node"):
+                source = alpha.node
+                test.node.location = (
+                    (source.location.x + bsdf.location.x) / 2.0,
+                    source.location.y - 120.0)
+            alpha = alpha_multiply(tree, bsdf, alpha, test)
     _link(tree, bsdf.inputs["Alpha"], alpha)
     _set_surface_method(material, mode)
+
+
+def _translucent_alpha_test(material, alpha_ref):
+    """Alpha compare reference for a Translucent preview, if any.
+
+    An imported ``AUTO`` material follows the stored GX alpha compare; an
+    explicit Translucent mode uses the Alpha Reference field like Cutout.
+    """
+    bmd = getattr(material, "bmd", None)
+    if bmd is None:
+        return None
+    if bmd.render_mode == "AUTO":
+        return mat3.alpha_test_reference(material_data(material) or {})
+    if bmd.render_mode == mat3.RENDER_TRANSLUCENT:
+        return int(alpha_ref)
+    return None
 
 
 def _link_bsdf_output(material, tree):

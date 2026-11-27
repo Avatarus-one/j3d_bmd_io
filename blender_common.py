@@ -858,6 +858,15 @@ def _material_render_mode_changed(self, context):
         pass
 
 
+def _dithered_translucency_changed(self, context):
+    try:
+        from . import blender_mat
+        blender_mat.apply_dithered_translucency(
+            bool(self.bmd_dithered_translucency))
+    except Exception:
+        pass
+
+
 class BMDMaterialTrack(PropertyGroup):
     """One animatable material field shown in the Material Animation box."""
     type: EnumProperty(name="Track", items=MATERIAL_TRACK_ITEMS, default="BTP",
@@ -870,7 +879,8 @@ class BMDMaterialProps(PropertyGroup):
                               update=_material_render_mode_changed,
                               options=set())
     alpha_ref: IntProperty(name="Alpha Reference", default=128, min=0, max=255,
-                           description="Alpha test threshold for the Cutout mode",
+                           description="Alpha test threshold for the Cutout "
+                                       "and Translucent modes",
                            update=_material_render_mode_changed,
                            options=set())
     btp_texture_index: IntProperty(
@@ -2501,6 +2511,12 @@ def register_classes():
     _register_type_property(
         bpy.types.Object, "bmd_vtx",
         PointerProperty(type=BMD_VertexFormatSettings))
+    _register_type_property(
+        bpy.types.Scene, "bmd_dithered_translucency",
+        BoolProperty(name="Dithered Translucency", default=False,
+                     description="Render Translucent materials with the "
+                                 "Dithered method",
+                     update=_dithered_translucency_changed))
 
 
 def _remove_type_property(owner, name):
@@ -2521,6 +2537,7 @@ def unregister_classes():
         _remove_type_property(bpy.types.Object, name)
     _remove_type_property(bpy.types.Image, "bmd")
     _remove_type_property(bpy.types.Material, "bmd")
+    _remove_type_property(bpy.types.Scene, "bmd_dithered_translucency")
 
     for cls in (BMD_VertexFormatSettings, BMDTextureSlot,
                 BMDImageProps, BMDMaterialProps, BMDMaterialTrack):

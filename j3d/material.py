@@ -360,8 +360,11 @@ def apply_render_mode(mat, mode, alpha_ref=128):
         mat["zMode"] = [1, 3, 1, 0xFF]
         mat["zCompLoc"] = 0
     elif mode == RENDER_TRANSLUCENT:
+        # The game compares alpha before blending, so a Translucent material can
+        # keep an alpha test as well; the reference is shared with Cutout.
         mat["flags"] = 4
-        mat["alphaComp"] = [7, 0, 1, 7, 0, 0xFF, 0xFF, 0xFF]
+        mat["alphaComp"] = [4, int(alpha_ref), 0, 7, 0,
+                            0xFF, 0xFF, 0xFF]
         mat["blend"] = [1, 4, 5, 3]
         mat["zMode"] = [1, 3, 0, 0xFF]
         mat["zCompLoc"] = 0
@@ -428,13 +431,26 @@ def classify_alpha(mat):
     blend = mat.get("blend") or [0]
     if blend[0] == 1:
         return RENDER_TRANSLUCENT, None
-    ac = mat.get("alphaComp")
-    if ac:
-        if ac[0] in (4, 6):      # GREATER / GEQUAL
-            return RENDER_CUTOUT, ac[1]
-        if ac[3] in (4, 6) and ac[0] == 7 and ac[2] != 1:
-            return RENDER_CUTOUT, ac[4]
+    ref = alpha_test_reference(mat)
+    if ref is not None:
+        return RENDER_CUTOUT, ref
     return RENDER_OPAQUE, None
+
+
+def alpha_test_reference(mat):
+    """GX alpha compare threshold, or ``None`` when every fragment passes.
+
+    GX tests alpha before blending, so a Translucent material can still carry
+    an alpha test (blend mode and alpha compare are independent settings).
+    """
+    ac = mat.get("alphaComp")
+    if not ac:
+        return None
+    if ac[0] in (4, 6):      # GREATER / GEQUAL
+        return int(ac[1])
+    if ac[3] in (4, 6) and ac[0] == 7 and ac[2] != 1:
+        return int(ac[4])
+    return None
 
 
 def required_uv_sets(mat):

@@ -71,7 +71,7 @@ class MATERIAL_PT_bmd(Panel):
         op.owner_name = owner.name if owner is not None else ""
 
         layout.prop(mat.bmd, "render_mode")
-        if mat.bmd.render_mode in {"AUTO", "CUTOUT"}:
+        if mat.bmd.render_mode in {"CUTOUT", "TRANSLUCENT"}:
             layout.prop(mat.bmd, "alpha_ref")
         layout.prop(mat, "use_backface_culling")
 
@@ -361,6 +361,10 @@ class BMD_PT_utility(Panel):
 
         column.operator(BMD_OT_set_30_fps.bl_idname, text="Set 30 FPS",
                         icon="TIME")
+
+        column.separator()
+
+        column.prop(context.scene, "bmd_dithered_translucency")
 
 
 class BMD_PT_animations(Panel):
