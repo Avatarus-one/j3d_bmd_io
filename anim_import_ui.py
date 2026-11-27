@@ -702,6 +702,181 @@ def begin_import(context, paths, operator):
     return {"FINISHED"}
 
 
+def _folder_child(parent, name):
+    """Existing folder *name* inside *parent* (case-insensitive), or None."""
+    candidate = os.path.join(parent, name)
+    if os.path.isdir(candidate):
+        return candidate
+    try:
+        for child in os.listdir(parent):
+            if child.casefold() != name.casefold():
+                continue
+            path = os.path.join(parent, child)
+            if os.path.isdir(path):
+                return path
+    except OSError:
+        pass
+    return None
+
+
+def _bmd_animation_folders(bmd_path, extension):
+    """BMD folder plus the sibling/sub animation folder for one format."""
+    bmd_dir = os.path.dirname(os.path.abspath(bmd_path))
+    parent = os.path.dirname(bmd_dir)
+    folders, seen = [], set()
+    for folder in (bmd_dir, _folder_child(parent, extension),
+                   _folder_child(bmd_dir, extension)):
+        if not folder:
+            continue
+        key = _session_key(folder)
+        if key in seen:
+            continue
+        seen.add(key)
+        folders.append(folder)
+    return folders
+
+
+def _animation_files(folders, extension):
+    paths, seen = [], set()
+    for folder in folders:
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        for name in names:
+            if not name.casefold().endswith(extension):
+                continue
+            path = os.path.join(folder, name)
+            if not os.path.isfile(path):
+                continue
+            key = _session_key(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            paths.append(path)
+    return paths
+
+
+def import_animations_for_bmd(context, arm, bmd_path, scale=0.01, report=None,
+                              bls_ok=False):
+    """Import BCK/BTP (and BLK when BLS shape keys exist) next to a BMD.
+
+    The BMD folder and the sibling ``bck`` / ``blk`` / ``btp`` folders are
+    scanned separately for each format.  No dialog is opened; files that
+    cannot be read are skipped with a warning.
+    """
+    if arm is None or arm.type != "ARMATURE":
+        return 0
+
+    mesh = _mesh_for_target(context, arm)
+    owner = animation_registry.owner_for(arm) or arm
+    joints = bck_import._armature_joint_count(arm)
+    imported = 0
+    registries = {}
+
+    def failed(path, exc):
+        if report:
+            report({"WARNING"}, f"{os.path.basename(path)}: {exc}")
+
+    for path in _animation_files(_bmd_animation_folders(bmd_path, "bck"),
+                                 ".bck"):
+        try:
+            with open(path, "rb") as file:
+                animation = anim.parse_bck(file.read())
+            if joints <= 0 or len(animation.tracks) != joints:
+                continue
+            action = bck_import.import_bck(
+                context, path, scale=scale, set_scene_range=False,
+                report=report, target=arm, bck=animation)
+        except Exception as exc:
+            failed(path, exc)
+            continue
+        if action is None:
+            continue
+        base = os.path.splitext(os.path.basename(path))[0]
+        entry = animation_registry.register_armature_action(
+            arm, action, base, 0, int(action.get("bmd_duration", 0)),
+            animation_registry.loop_mode_name(action),
+            select=False, sort=False)
+        if entry is not None:
+            registry = animation_registry.registry_for(arm)
+            if registry is not None:
+                registries[registry.as_pointer()] = registry
+        imported += 1
+
+    if bls_ok and mesh is not None and mesh.data is not None:
+        shape_keys = mesh.data.shape_keys
+        key_names = ([block.name for block in shape_keys.key_blocks[1:]]
+                     if shape_keys else [])
+        for path in _animation_files(_bmd_animation_folders(bmd_path, "blk"),
+                                     ".blk"):
+            try:
+                with open(path, "rb") as file:
+                    animation = blk.parse_blk(file.read())
+            except Exception as exc:
+                failed(path, exc)
+                continue
+            # A different track count means the file belongs to another mesh
+            # (or BLS set); skip it without a warning like the manual importer.
+            if len(animation.tracks) - 1 != len(key_names):
+                continue
+            mapping, used = [], set()
+            for index in range(1, len(animation.tracks)):
+                name = key_names[index - 1]
+                if not name or name in used:
+                    continue
+                used.add(name)
+                mapping.append((index, name))
+            if not mapping:
+                if report:
+                    report({"WARNING"},
+                           f"{os.path.basename(path)}: no tracks could be "
+                           "assigned to shape keys")
+                continue
+            try:
+                action = blk_import.apply_blk_animation(
+                    context, mesh, animation, mapping, filepath=path,
+                    set_scene_range=False, report=report)
+            except Exception as exc:
+                failed(path, exc)
+                continue
+            if action is None:
+                continue
+            base = os.path.splitext(os.path.basename(path))[0]
+            entry = animation_registry.register_shape_action(
+                mesh, action, base, 0, int(animation.duration),
+                animation_registry.loop_mode_name(action),
+                select=False, sort=False)
+            if entry is not None:
+                registry = animation_registry.registry_for(mesh)
+                if registry is not None:
+                    registries[registry.as_pointer()] = registry
+            imported += 1
+
+    for path in _animation_files(_bmd_animation_folders(bmd_path, "btp"),
+                                 ".btp"):
+        try:
+            with open(path, "rb") as file:
+                animation = btp_data.parse_btp(file.read())
+            if btp_import.missing_materials(owner, animation):
+                continue
+            entry = btp_import.import_btp(context, owner, animation, path,
+                                          report=report)
+        except Exception as exc:
+            failed(path, exc)
+            continue
+        if entry is not None:
+            registry = animation_registry.registry_for(owner)
+            if registry is not None:
+                registries[registry.as_pointer()] = registry
+            imported += 1
+
+    for registry in registries.values():
+        animation_registry.sort_animations(registry)
+
+    return imported
+
+
 def _open_settings_dialog():
     try:
         bpy.ops.import_anim.j3d_settings("INVOKE_DEFAULT")

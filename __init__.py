@@ -88,6 +88,10 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
     import_shape_keys: BoolProperty(
         name="Import Shape Keys", default=True,
         description="Import compatible BLS shape keys found next to the model")
+    import_animations: BoolProperty(
+        name="Import Animations", default=True,
+        description="Import BCK, BLK and BTP animations found next to the model "
+                    "(BLK needs successfully imported BLS shape keys)")
 
     def invoke(self, context, event):
         self.convert_units = bc.saved_convert_units(context)
@@ -100,6 +104,7 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
         layout.prop(self, "bone_axis")
         layout.prop(self, "import_textures")
         layout.prop(self, "import_shape_keys")
+        layout.prop(self, "import_animations")
 
     def execute(self, context):
         from . import blender_import
@@ -148,6 +153,7 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
                     "bone_axis": self.bone_axis,
                     "import_textures": self.import_textures,
                     "import_shape_keys": self.import_shape_keys,
+                    "import_animations": self.import_animations,
                     "convert_units": self.convert_units,
                     "files": files,
                     "missing": missing,
@@ -179,10 +185,28 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
 
             last_arm = arm
 
+            bls_imported = None
             if self.import_shape_keys:
                 from . import bls_import
-                bls_import.import_shape_keys_for_bmd(
+                bls_imported = bls_import.import_shape_keys_for_bmd(
                     context, arm, p, scale, report=self.report)
+
+            if self.import_animations:
+                from . import anim_import_ui
+                try:
+                    count = anim_import_ui.import_animations_for_bmd(
+                        context, arm, p, scale, report=self.report,
+                        bls_ok=bool(bls_imported))
+                except Exception as exc:
+                    self.report({"WARNING"},
+                                f"{os.path.basename(p)}: animation import "
+                                f"failed: {exc}")
+                else:
+                    if count:
+                        self.report(
+                            {"INFO"},
+                            f"{os.path.basename(p)}: imported {count} "
+                            "animation file(s)")
 
         _select_imported_model(context, last_arm)
         bc.remember_convert_units(context, self.convert_units, last_arm)
@@ -320,11 +344,30 @@ class IMPORT_OT_bmd_texc(Operator):
 
             last_arm = arm
 
+            bls_imported = None
             if pending.get("import_shape_keys", True):
                 from . import bls_import
-                bls_import.import_shape_keys_for_bmd(
+                bls_imported = bls_import.import_shape_keys_for_bmd(
                     context, arm, path, pending["scale"],
                     report=self.report)
+
+            if pending.get("import_animations", True):
+                from . import anim_import_ui
+                try:
+                    count = anim_import_ui.import_animations_for_bmd(
+                        context, arm, path, pending["scale"],
+                        report=self.report,
+                        bls_ok=bool(bls_imported))
+                except Exception as exc:
+                    self.report({"WARNING"},
+                                f"{os.path.basename(path)}: animation import "
+                                f"failed: {exc}")
+                else:
+                    if count:
+                        self.report(
+                            {"INFO"},
+                            f"{os.path.basename(path)}: imported {count} "
+                            "animation file(s)")
 
         _PENDING_BMD_IMPORT = None
         _select_imported_model(context, last_arm)
