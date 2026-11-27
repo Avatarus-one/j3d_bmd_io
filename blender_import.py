@@ -52,7 +52,7 @@ def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=Tru
         images = _create_images(bmd, base, uuid.uuid4().hex)
     else:
         images = {}
-    materials = [_create_material(bmd, i, m, images, warn)
+    materials = [_create_material(bmd, i, m, images, warn, scale)
                  for i, m in enumerate(bmd.materials)]
     arm_obj = _create_armature(context, coll, bmd, base, scale, bone_axis)
     bone_names = [b for b in arm_obj["bmd_bone_names"]]
@@ -80,6 +80,7 @@ def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=Tru
             slot.key = texture.key
             slot.name = texture.name
             slot.image = images.get(texture.key)
+            apply_slot_sampler(slot, texture)
     finally:
         if "bmd_texture_loading" in arm_obj:
             del arm_obj["bmd_texture_loading"]
@@ -108,16 +109,22 @@ def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=Tru
 # --------------------------------------------------------------------------
 
 def _texture_signature(t):
+    """Pixel identity of a texture (format, mips, palette, payload).
+
+    The sampler state lives on the texture slot, so it must not split images:
+    two entries that share pixels and only differ in wrap are one image.
+    """
     header = (
         bool(t.external),
-        int(t.format), int(t.mip_count), int(t.wrap_s), int(t.wrap_t),
-        int(t.min_filter), int(t.mag_filter), int(t.min_lod), int(t.max_lod),
-        int(t.lod_bias), int(t.transparency), bytes(t.flags10),
+        int(t.format), int(t.mip_count),
         int(t.pal_enabled), int(t.pal_format), int(t.pal_count),
         tuple(int(v) for v in (t.external_size or ())),
     )
     digest = hashlib.sha1()
     digest.update(repr(header).encode("utf-8", "surrogatepass"))
+    if t.raw_palette:
+        # Indexed formats: the same indices with another TLUT are another image.
+        digest.update(bytes(t.raw_palette))
 
     if t.external:
         # External pixels live in a .bti file.  Identity is the BMD header
@@ -155,25 +162,21 @@ def _image_texture_signature(image):
         fmt = gx.NAME_TO_FORMAT.get(str(image.bmd.format), None)
     if fmt is None:
         fmt = int(image.get("bmd_raw_fmt", 0))
-    flags = str(image.get("bmd_flags10", "00000000"))
-    try:
-        flags_bytes = bytes.fromhex(flags)
-    except ValueError:
-        flags_bytes = b"\0\0\0\0"
     header = (
         bool(image.bmd.external),
         int(fmt), int(image.bmd.mip_count),
-        int(image.get("bmd_wrap_s", 1)), int(image.get("bmd_wrap_t", 1)),
-        int(image.get("bmd_min_filter", 1)), int(image.get("bmd_mag_filter", 1)),
-        int(image.get("bmd_min_lod", 0)), int(image.get("bmd_max_lod", 0)),
-        int(image.get("bmd_lod_bias", 0)), int(image.get("bmd_transparency", 0)),
-        flags_bytes,
         int(image.get("bmd_pal_en", 0)), int(image.get("bmd_pal_fmt", 0)),
         int(image.get("bmd_pal_count", 0)),
         tuple(int(v) for v in (image.get("bmd_external_size") or ())),
     )
     digest = hashlib.sha1()
     digest.update(repr(header).encode("utf-8", "surrogatepass"))
+    raw_pal = image.get("bmd_raw_pal")
+    if raw_pal:
+        try:
+            digest.update(zlib.decompress(base64.b64decode(raw_pal)))
+        except Exception:
+            pass
     if bool(image.bmd.external):
         digest.update(b"placeholder")
         digest.update(f"{width}x{height}".encode("ascii"))
@@ -217,21 +220,37 @@ def _add_image_key(image, key):
         image["bmd_keys"] = json.dumps(keys, separators=(",", ":"))
 
 
-def apply_texture_metadata(image, texture, path=None):
-    """Copy parsed J3D texture metadata to a Blender image."""
+def apply_slot_sampler(slot, texture):
+    """Store one TEX1 entry's sampler state on its texture slot."""
+    slot.wrap_s = str(int(texture.wrap_s))
+    slot.wrap_t = str(int(texture.wrap_t))
+    slot.min_filter = str(int(texture.min_filter))
+    slot.mag_filter = str(int(texture.mag_filter))
+    slot.min_lod = int(texture.min_lod)
+    slot.max_lod = int(texture.max_lod)
+    slot.max_lod_custom = (
+        int(texture.max_lod) != (max(1, int(texture.mip_count)) - 1) * 8)
+    slot.lod_bias = int(texture.lod_bias)
+    slot["bmd_transparency"] = int(texture.transparency)
+    slot["bmd_flags10"] = texture.flags10.hex()
+    slot.sampler_ready = True
+
+
+def apply_texture_metadata(image, texture, path=None, store_sampler=False):
+    """Copy parsed J3D texture metadata to a Blender image.
+
+    Only pixel-block data lives here: format, mips, external flag and the raw
+    payload.  The GX sampler state (wrap, filters, LOD, bias) belongs to the
+    TEX1 entry and is stored on the texture slot, because entries may share
+    one image and sample it differently.  *store_sampler* keeps it on the image
+    for a standalone ``.bti``, which has no slot.
+    """
     h, w = texture.rgba.shape[:2]
     image["bmd_name"] = texture.name
     image["bmd_key"] = texture.key
     if path is not None:
         image["bmd_source_path"] = os.path.abspath(path)
     image["bmd_transparency"] = int(texture.transparency)
-    image["bmd_wrap_s"] = int(texture.wrap_s)
-    image["bmd_wrap_t"] = int(texture.wrap_t)
-    image["bmd_min_filter"] = int(texture.min_filter)
-    image["bmd_mag_filter"] = int(texture.mag_filter)
-    image["bmd_min_lod"] = int(texture.min_lod)
-    image["bmd_max_lod"] = int(texture.max_lod)
-    image["bmd_lod_bias"] = int(texture.lod_bias)
     image["bmd_flags10"] = texture.flags10.hex()
     image["bmd_orig_format"] = gx.FORMAT_NAMES.get(texture.format, str(texture.format))
     if texture.rgba is not None and texture.raw_data is not None:
@@ -267,27 +286,46 @@ def apply_texture_metadata(image, texture, path=None):
         # stored in the enum itself.
         image.pop("bmd_format_auto", None)
         image.bmd.key = texture.key
-        image.bmd.wrap_s = str(int(texture.wrap_s))
-        image.bmd.wrap_t = str(int(texture.wrap_t))
-        image.bmd.min_filter = str(int(texture.min_filter))
-        image.bmd.mag_filter = str(int(texture.mag_filter))
-        image.bmd.min_lod = int(texture.min_lod)
-        image.bmd.lod_bias = int(texture.lod_bias)
         image.bmd.mip_count = int(texture.mip_count)
-        image.bmd.max_lod = int(texture.max_lod)
-        image.bmd.max_lod_custom = (
-            int(texture.max_lod) != (max(1, int(texture.mip_count)) - 1) * 8)
         image.bmd.external = bool(texture.external)
+        if store_sampler:
+            image["bmd_wrap_s"] = int(texture.wrap_s)
+            image["bmd_wrap_t"] = int(texture.wrap_t)
+            image["bmd_min_filter"] = int(texture.min_filter)
+            image["bmd_mag_filter"] = int(texture.mag_filter)
+            image["bmd_min_lod"] = int(texture.min_lod)
+            image["bmd_max_lod"] = int(texture.max_lod)
+            image["bmd_lod_bias"] = int(texture.lod_bias)
+            image.bmd.wrap_s = str(int(texture.wrap_s))
+            image.bmd.wrap_t = str(int(texture.wrap_t))
+            image.bmd.min_filter = str(int(texture.min_filter))
+            image.bmd.mag_filter = str(int(texture.mag_filter))
+            image.bmd.min_lod = int(texture.min_lod)
+            image.bmd.max_lod = int(texture.max_lod)
+            image.bmd.max_lod_custom = (
+                int(texture.max_lod)
+                != (max(1, int(texture.mip_count)) - 1) * 8)
+            image.bmd.lod_bias = int(texture.lod_bias)
     except Exception:
         pass
 
     _add_image_key(image, texture.key)
 
 
-def create_texture_image(texture, name=None, path=None):
+def create_texture_image(texture, name=None, path=None, store_sampler=False):
     """Create a packed Blender image from a parsed J3D texture."""
     height, width = texture.rgba.shape[:2]
     image = bpy.data.images.new(name or texture.key, width, height, alpha=True)
+    if int(texture.format) in gx.DATA_FORMATS:
+        # I4/I8 are intensity masks used raw by the TEV; keep the sampled
+        # value equal to the stored byte instead of sRGB decoding it.  Set the
+        # colours space before the pixels: changing it afterwards makes
+        # Blender regenerate the generated image and drop the buffer.
+        try:
+            image.colorspace_settings.name = "Non-Color"
+        except Exception:
+            pass
+
     pixels = (texture.rgba[::-1].astype(np.float32) / 255.0).reshape(-1)
     image.pixels.foreach_set(pixels)
 
@@ -296,7 +334,8 @@ def create_texture_image(texture, name=None, path=None):
     except Exception:
         pass
 
-    apply_texture_metadata(image, texture, path=path)
+    apply_texture_metadata(image, texture, path=path,
+                           store_sampler=store_sampler)
 
     try:
         image.pack()
@@ -318,11 +357,10 @@ def _create_images(bmd, base, import_id):
         candidates.setdefault(str(name), []).append(image)
     candidate_signatures = {}
 
-    def reusable(t):
+    def reusable(t, signature):
         same_name = candidates.get(t.name)
         if not same_name:
             return None
-        signature = _texture_signature(t)
         for image in same_name:
             key = image.name
             if key not in candidate_signatures:
@@ -331,25 +369,30 @@ def _create_images(bmd, base, import_id):
                 return image
         return None
 
+    # Two TEX1 entries may point at one pixel block.  The sampler state lives on
+    # the texture slot now, so they share one image; only a different palette
+    # changes the decoded pixels and forces a second datablock.
     shared_images = {}
 
     for t in bmd.textures:
         block = getattr(t, "data_block", None) if not t.external else None
+        signature = _texture_signature(t)
 
-        if block is not None and block in shared_images:
-            # Same pixel block under another TEX1 index: reuse the image.
-            image = shared_images[block]
-            images[t.key] = image
-            _add_image_key(image, t.key)
-            continue
+        if block is not None:
+            image = shared_images.get((block, bytes(t.raw_palette or b"")))
+            if image is not None:
+                # Same pixels and palette under another index.
+                images[t.key] = image
+                _add_image_key(image, t.key)
+                continue
 
-        existing = reusable(t)
+        existing = reusable(t, signature)
         if existing is not None:
             apply_texture_metadata(existing, t)
             images[t.key] = existing
 
             if block is not None:
-                shared_images[block] = existing
+                shared_images[(block, bytes(t.raw_palette or b""))] = existing
             continue
 
         img = create_texture_image(t, name=t.key)
@@ -357,7 +400,7 @@ def _create_images(bmd, base, import_id):
         images[t.key] = img
 
         if block is not None:
-            shared_images[block] = img
+            shared_images[(block, bytes(t.raw_palette or b""))] = img
 
     return images
 
@@ -366,7 +409,7 @@ def _get_json_material(bmd_mat):
     return json.dumps(bmd_mat, separators=(",", ":"))
 
 
-def _create_material(bmd, index, m, images, warn=None):
+def _create_material(bmd, index, m, images, warn=None, scale=0.01):
     name = bmd.material_names[index] if index < len(bmd.material_names) else f"material{index}"
     mat = bpy.data.materials.new(name)
     mat["bmd_name"] = name
@@ -381,18 +424,15 @@ def _create_material(bmd, index, m, images, warn=None):
     alpha_ref = m["alphaComp"][1] if m.get("alphaComp") else 128
     mat.bmd.alpha_ref = int(alpha_ref)
     try:
-        blender_mat.build_import_nodes(mat, m, images)
+        samplers = {texture.key: {
+            "wrap_s": int(texture.wrap_s),
+            "wrap_t": int(texture.wrap_t),
+            "mag_filter": int(texture.mag_filter),
+        } for texture in bmd.textures}
+        blender_mat.build_import_nodes(mat, m, images, scale,
+                                       samplers=samplers)
     except Exception as exc:  # node API differences must never break the import
         _warn(warn, f"Material '{name}': preview nodes could not be built: {exc}")
-
-    try:
-        blender_mat.begin_sync()
-        try:
-            mat.bmd.use_vertex_color = bool(mat3.uses_vertex_colors(m))
-        finally:
-            blender_mat.end_sync()
-    except Exception:
-        pass
 
     try:
         mapping = {}

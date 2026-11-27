@@ -69,6 +69,7 @@ class Texture:
         self.external_path = None
         self.external_size = None  # original BMD header size (w, h)
         self.data_block = None     # absolute offset of the pixel data (shared by indices)
+        self.pal_block = None      # absolute offset of this entry's palette (indexed formats)
         self.data_group = None     # export hint: textures sharing one image share one data block
         self.pal_enabled = 0
         self.pal_format = 0
@@ -402,14 +403,21 @@ def _parse_tex1(d, off, load_data=True):
             textures.append(t)
             continue
         t.data_block = e + header.data_offset
+        t.pal_block = (e + header.pal_offset
+                       if header.pal_enabled and header.pal_count else None)
         first = shared_blocks.get(t.data_block)
         if first is not None:
             # Several TEX1 entries may point at the same pixel block.  They are
             # the same texture under different indices: share the decoded data
             # instead of copying it, while keeping separate names/keys/settings.
-            t.rgba = first.rgba
-            t.raw_data = first.raw_data
-            t.raw_palette = first.raw_palette
+            if t.pal_block is not None and t.pal_block != first.pal_block:
+                # Same indices, different TLUT: the colours are not the same.
+                t.rgba, t.raw_data, t.raw_palette = gx.decode_texture_payload(
+                    d, header, base=e, label=f"Texture '{t.name}'")
+            else:
+                t.rgba = first.rgba
+                t.raw_data = first.raw_data
+                t.raw_palette = first.raw_palette
             textures.append(t)
             continue
         shared_blocks[t.data_block] = t

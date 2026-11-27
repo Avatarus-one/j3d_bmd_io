@@ -858,14 +858,6 @@ def _material_render_mode_changed(self, context):
         pass
 
 
-def _material_vertex_color_changed(self, context):
-    try:
-        from . import blender_mat
-        blender_mat.sync_shading(self.id_data)
-    except Exception:
-        pass
-
-
 class BMDMaterialTrack(PropertyGroup):
     """One animatable material field shown in the Material Animation box."""
     type: EnumProperty(name="Track", items=MATERIAL_TRACK_ITEMS, default="BTP",
@@ -877,12 +869,6 @@ class BMDMaterialProps(PropertyGroup):
                               description="How the game renders this material",
                               update=_material_render_mode_changed,
                               options=set())
-    use_vertex_color: BoolProperty(
-        name="Use Vertex Color", default=False,
-        description=("Multiply the texture colour and alpha by the vertex colour"
-                     "(preview only: it does not change the exported TEV data yet)"),
-        update=_material_vertex_color_changed,
-        options=set())
     alpha_ref: IntProperty(name="Alpha Reference", default=128, min=0, max=255,
                            description="Alpha test threshold for the Cutout mode",
                            update=_material_render_mode_changed,
@@ -919,6 +905,90 @@ def ensure_material_track(material, track_type="BTP"):
     return True
 
 
+def _set_image_colorspace(image, name):
+    """Change an image's colour space without losing its pixels.
+
+    Blender regenerates a ``GENERATED`` image (which every imported texture is)
+    when its colour space changes, which throws the buffer away - so the pixels
+    are kept in memory and written back.
+    """
+    try:
+        if image.colorspace_settings.name == name:
+            return
+    except Exception:
+        return
+    buffer = None
+    try:
+        if image.source == "GENERATED" and image.has_data:
+            size = int(image.size[0]) * int(image.size[1]) * 4
+            if size > 0:
+                from array import array
+                buffer = array("f", [0.0]) * size
+                image.pixels.foreach_get(buffer)
+    except Exception:
+        buffer = None
+    try:
+        image.colorspace_settings.name = name
+    except Exception:
+        return
+    if buffer is not None:
+        try:
+            image.pixels.foreach_set(buffer)
+            image.update()
+        except Exception:
+            pass
+
+
+def _sync_image_colorspace(image, fmt):
+    """Data formats (I4/I8/IA4/IA8) are sampled raw, colour formats as sRGB."""
+    from .j3d import gx_texture as gx
+    try:
+        value = fmt if isinstance(fmt, int) else gx.NAME_TO_FORMAT.get(str(fmt))
+        if value is None:
+            return
+        wanted = ("Non-Color" if int(value) in gx.DATA_FORMATS else "sRGB")
+    except (TypeError, ValueError):
+        return
+    _set_image_colorspace(image, wanted)
+
+
+def _refresh_recovery_for_image(image):
+    """Re-sync "Texture to TEV" in materials whose own slot uses *image*.
+
+    An image that only sits in a ``bmd_tex<N>`` node (a BTP preview frame or a
+    manual swap) is not part of the material, so its format must not touch the
+    material's conversion nodes.
+    """
+    try:
+        from . import blender_mat
+    except Exception:
+        return
+    keys = {texture_key(image)}
+    raw = image.get("bmd_keys")
+    if raw:
+        try:
+            keys.update(str(key) for key in json.loads(raw))
+        except Exception:
+            pass
+    keys.discard("")
+    if not keys:
+        return
+    for material in bpy.data.materials:
+        tree = getattr(material, "node_tree", None)
+        if tree is None:
+            continue
+        try:
+            names = {name for name in material_texture_keys(material) if name}
+        except Exception:
+            continue
+        if not (names & keys):
+            continue
+        try:
+            blender_mat.refresh_texture_recovery(material)
+        except Exception:
+            pass
+
+
 def _image_format_changed(self, context):
     image = self.id_data
     if image is None:
@@ -930,6 +1000,10 @@ def _image_format_changed(self, context):
         return
 
     image.pop("bmd_format_auto", None)
+    # The format decides how the image must be sampled (raw intensity vs sRGB),
+    # and with it whether the material needs its "Texture to TEV" node.
+    _sync_image_colorspace(image, self.format)
+    _refresh_recovery_for_image(image)
 
 
 def _image_key_changed(self, context):
@@ -956,12 +1030,35 @@ def _image_max_lod_changed(self, context):
     self.max_lod_custom = True
 
 
+def _update_slot_mip_levels(image, mips):
+    """Keep the slots that use *image* on the automatic max LOD."""
+    if image is None:
+        return
+    key = texture_key(image)
+    for obj in bpy.data.objects:
+        try:
+            slots = obj.bmd_texture_list
+        except Exception:
+            continue
+        was_loading = bool(obj.get("bmd_texture_loading", False))
+        obj["bmd_texture_loading"] = True
+        try:
+            for slot in slots:
+                if slot.image is image or (key and texture_slot_key(slot) == key):
+                    if not slot.max_lod_custom:
+                        slot.max_lod = (mips - 1) * 8
+        finally:
+            if not was_loading and "bmd_texture_loading" in obj:
+                del obj["bmd_texture_loading"]
+
+
 def _image_mip_count_changed(self, context):
     if self.max_lod_custom:
         return
     mips = max(1, int(self.mip_count))
     self.max_lod = (mips - 1) * 8
     self.max_lod_custom = False
+    _update_slot_mip_levels(self.id_data, mips)
 
 
 def image_interpolation(mag_filter):
@@ -982,6 +1079,155 @@ def _image_filter_changed(self, context):
                     node.interpolation = interpolation
                 except Exception:
                     pass
+
+
+def slot_sampler(slot, image=None):
+    """Sampler state of one TEX1 entry as a plain dict.
+
+    Prefers the slot; falls back to the legacy image fields so slots saved
+    before the sampler moved can still be read before migration runs.
+    """
+    if slot is not None and bool(getattr(slot, "sampler_ready", False)):
+        data = {
+            "wrap_s": int(slot.wrap_s), "wrap_t": int(slot.wrap_t),
+            "min_filter": int(slot.min_filter),
+            "mag_filter": int(slot.mag_filter),
+            "min_lod": int(slot.min_lod), "max_lod": int(slot.max_lod),
+            "max_lod_custom": bool(slot.max_lod_custom),
+            "lod_bias": int(slot.lod_bias),
+        }
+        if slot.get("bmd_transparency") is not None:
+            data["transparency"] = int(slot["bmd_transparency"])
+        if slot.get("bmd_flags10"):
+            data["flags10"] = str(slot["bmd_flags10"])
+        return data
+    if image is None and slot is not None:
+        image = slot.image
+    legacy = getattr(image, "bmd", None) if image is not None else None
+    if legacy is None:
+        return {}
+    data = {
+        "wrap_s": int(getattr(legacy, "wrap_s", 1)),
+        "wrap_t": int(getattr(legacy, "wrap_t", 1)),
+        "min_filter": int(getattr(legacy, "min_filter", 1)),
+        "mag_filter": int(getattr(legacy, "mag_filter", 1)),
+        "min_lod": int(getattr(legacy, "min_lod", 0)),
+        "max_lod": int(getattr(legacy, "max_lod", 0)),
+        "max_lod_custom": bool(getattr(legacy, "max_lod_custom", False)),
+        "lod_bias": int(getattr(legacy, "lod_bias", 0)),
+    }
+    if image.get("bmd_transparency") is not None:
+        data["transparency"] = int(image["bmd_transparency"])
+    if image.get("bmd_flags10"):
+        data["flags10"] = str(image["bmd_flags10"])
+    return data
+
+
+def sampler_for_image(image):
+    """Sampler of the first texture slot that uses *image* (BTI/defaults)."""
+    if image is None:
+        return {}
+    key = texture_key(image)
+    for obj in bpy.data.objects:
+        try:
+            slots = obj.bmd_texture_list
+        except Exception:
+            continue
+        for slot in slots:
+            if slot.image is image or (key and texture_slot_key(slot) == key):
+                return slot_sampler(slot, image)
+    return slot_sampler(None, image)
+
+
+def refresh_slot_sampler(owner, index):
+    """Push one slot's sampler state into the materials that use it."""
+    if owner is None:
+        return
+    try:
+        slots = owner.bmd_texture_list
+        if not 0 <= int(index) < len(slots):
+            return
+        slot = slots[int(index)]
+    except Exception:
+        return
+    sampler = slot_sampler(slot)
+    if not sampler:
+        return
+    interpolation = image_interpolation(sampler.get("mag_filter", 1))
+    try:
+        from . import blender_mat
+    except Exception:
+        return
+    for material in _sync_materials(owner):
+        raw = material.get("bmd_texture_slots")
+        if not raw:
+            continue
+        try:
+            mapping = json.loads(raw)
+        except Exception:
+            continue
+        tree = getattr(material, "node_tree", None)
+        if tree is None:
+            continue
+        for material_slot, texture_index in enumerate(mapping):
+            if texture_index != int(index):
+                continue
+            node = tree.nodes.get(f"bmd_tex{material_slot}")
+            if node is None or node.type != "TEX_IMAGE":
+                continue
+            try:
+                blender_mat.set_node_sampler(
+                    node, sampler.get("wrap_s", 1), sampler.get("wrap_t", 1),
+                    interpolation)
+                blender_mat.apply_wrap_to_node(
+                    node, int(sampler.get("wrap_s", 1)),
+                    int(sampler.get("wrap_t", 1)), material)
+            except Exception:
+                pass
+
+
+def migrate_texture_samplers(owner):
+    """Move merged image-level sampler state onto the texture slots.
+
+    Old scenes stored wrap/filter/LOD/bias on the image, so every slot that
+    shared the pixels also shared (and overwrote) those values.  Fill each
+    slot once from its image and mark it; ``sampler_ready`` makes this
+    idempotent.  Returns True when anything was migrated.
+    """
+    if owner is None:
+        return False
+    try:
+        slots = owner.bmd_texture_list
+    except Exception:
+        return False
+    if not len(slots):
+        return False
+    pending = [slot for slot in slots
+               if not bool(getattr(slot, "sampler_ready", False))]
+    if not pending:
+        return False
+    was_loading = bool(owner.get("bmd_texture_loading", False))
+    owner["bmd_texture_loading"] = True
+    try:
+        for slot in pending:
+            sampler = slot_sampler(None, slot.image or image_by_key(slot.key))
+            slot.wrap_s = str(int(sampler.get("wrap_s", 1)))
+            slot.wrap_t = str(int(sampler.get("wrap_t", 1)))
+            slot.min_filter = str(int(sampler.get("min_filter", 1)))
+            slot.mag_filter = str(int(sampler.get("mag_filter", 1)))
+            slot.min_lod = int(sampler.get("min_lod", 0))
+            slot.max_lod = int(sampler.get("max_lod", 0))
+            slot.max_lod_custom = bool(sampler.get("max_lod_custom", False))
+            slot.lod_bias = int(sampler.get("lod_bias", 0))
+            if "transparency" in sampler:
+                slot["bmd_transparency"] = int(sampler["transparency"])
+            if sampler.get("flags10"):
+                slot["bmd_flags10"] = str(sampler["flags10"])
+            slot.sampler_ready = True
+    finally:
+        if not was_loading and "bmd_texture_loading" in owner:
+            del owner["bmd_texture_loading"]
+    return True
 
 
 def texture_slot_key(slot):
@@ -1057,6 +1303,7 @@ def ensure_texture_list(arm_obj):
     """Return the texture list, rebuilding it from the legacy arrays if needed."""
     coll = arm_obj.bmd_texture_list
     if len(coll):
+        migrate_texture_samplers(arm_obj)
         return coll
     names = list(arm_obj.get("bmd_textures", []))
     keys = list(arm_obj.get("bmd_texture_keys", []))
@@ -1103,8 +1350,26 @@ def texture_label(arm_obj, image):
     return f"{image.name} (not in BMD list)"
 
 
+def active_material_json(material):
+    """JSON of the MAT3 data the material currently uses.
+
+    An imported shader preset (``bmd_shader_material``) shadows the original
+    ``bmd_material`` until it is reset, so the original stays available for the
+    reset without a rebuild of the scene.
+    """
+    if material is None:
+        return None
+    if material.get("bmd_shader_active") and material.get("bmd_shader_material"):
+        return str(material["bmd_shader_material"])
+    return material.get("bmd_material")
+
+
 def material_texture_slots(mat, owner=None, store=True):
-    """BMD texture index per material texture slot (8 entries)."""
+    """BMD texture index per material texture slot (8 entries).
+
+    ``owner``/``store`` are kept for the callers that still pass them; the
+    mapping is stored on the material by the importer and by the texture UI.
+    """
     raw = mat.get("bmd_texture_slots")
     slots = None
     if raw:
@@ -1113,28 +1378,7 @@ def material_texture_slots(mat, owner=None, store=True):
         except Exception:
             slots = None
     if slots is None:
-        if owner is None:
-            return [None] * 8
-        slots = [None] * 8
-        key_to_index = {}
-        for i, s in enumerate(owner.bmd_texture_list):
-            key = str(s.key or "") or texture_slot_key(s)
-            if key:
-                key_to_index.setdefault(key, i)
-            if s.name:
-                key_to_index.setdefault(str(s.name), i)
-        stored = mat.get("bmd_material")
-        names = []
-        if stored:
-            try:
-                names = json.loads(stored).get("texNames") or []
-            except Exception:
-                names = []
-        for i, key in enumerate(names):
-            if key and key in key_to_index:
-                slots[i] = key_to_index[key]
-        if store:
-            set_material_texture_slots(mat, slots)
+        return [None] * 8
     return list(slots)[:8]
 
 
@@ -1145,8 +1389,65 @@ def set_material_texture_slots(mat, slots):
     mat["bmd_texture_slots"] = json.dumps(values, separators=(",", ":"))
 
 
+def material_texture_keys(mat):
+    """Native texture key per material slot (8 entries), from the MAT3 data.
+
+    The node tree may show a different image (BTP preview or a manual swap), so
+    the material's own ``texNames`` is the authority for its texture slots.
+    """
+    stored = active_material_json(mat)
+    if not stored:
+        return []
+    try:
+        data = json.loads(stored)
+    except Exception:
+        return []
+    return [str(name) if name else None
+            for name in (data.get("texNames") or [])][:8]
+
+
+def owner_meshes(owner):
+    """Mesh objects whose texture list / materials belong to *owner*."""
+    if owner is None:
+        return []
+    if owner.type == "MESH":
+        return [owner]
+    if owner.type == "ARMATURE":
+        return [obj for obj in bpy.data.objects
+                if obj.type == "MESH" and target_armature(obj) is owner]
+    return []
+
+
+def owner_materials(owner):
+    """Materials used by *owner* (only these may follow its texture list)."""
+    result, seen = [], set()
+    for mesh in owner_meshes(owner):
+        for slot in mesh.material_slots:
+            material = slot.material
+            if material is None or material.name in seen:
+                continue
+            seen.add(material.name)
+            result.append(material)
+    return result
+
+
+def _sync_materials(owner):
+    """Materials the texture list of *owner* is allowed to update."""
+    if owner is None:
+        return list(bpy.data.materials)
+    return owner_materials(owner)
+
+
+def set_active_mat3_json(material, text):
+    """Store MAT3 JSON where the material currently reads it from."""
+    if material.get("bmd_shader_active") and "bmd_shader_material" in material:
+        material["bmd_shader_material"] = text
+    else:
+        material["bmd_material"] = text
+
+
 def remap_material_texture_slots(owner, mapping):
-    for material in bpy.data.materials:
+    for material in _sync_materials(owner):
         if not is_bmd_material(material):
             continue
         slots = material_texture_slots(material, owner)
@@ -1156,7 +1457,7 @@ def remap_material_texture_slots(owner, mapping):
 
 
 def remove_material_texture_slot(owner, index):
-    for material in bpy.data.materials:
+    for material in _sync_materials(owner):
         if not is_bmd_material(material):
             continue
         slots = material_texture_slots(material, owner)
@@ -1175,17 +1476,18 @@ def remove_material_texture_slot(owner, index):
 
 
 def material_slot_users(owner, index):
-    return sum(1 for material in bpy.data.materials
+    return sum(1 for material in _sync_materials(owner)
                if index in material_texture_slots(material, owner, store=False))
 
 
 def count_texture_users(key):
+    """Materials that reference the texture *key* (hidden key, never the name)."""
     if not key:
         return 0
     count = 0
     for material in bpy.data.materials:
         tree = material.node_tree
-        stored = material.get("bmd_material")
+        stored = active_material_json(material)
         names = None
         if stored:
             try:
@@ -1212,7 +1514,7 @@ def clear_material_textures(old_key, slot_index=None, owner=None):
     """Clear the material image but keep the texture link for a later assignment."""
     if not old_key:
         return
-    for material in bpy.data.materials:
+    for material in _sync_materials(owner):
         if not is_bmd_material(material):
             continue
         tree = material.node_tree
@@ -1231,7 +1533,7 @@ def clear_material_textures(old_key, slot_index=None, owner=None):
             continue
         if tree is None:
             continue
-        stored = material.get("bmd_material")
+        stored = active_material_json(material)
         if stored:
             try:
                 data = json.loads(stored)
@@ -1252,19 +1554,30 @@ def clear_material_textures(old_key, slot_index=None, owner=None):
                 node.image = None
 
 
+def _refresh_recovery(material):
+    """Re-sync the "Texture to TEV" nodes of a material after an image change."""
+    try:
+        from . import blender_mat
+        blender_mat.refresh_texture_recovery(material)
+    except Exception:
+        pass
+
+
 def retarget_material_textures(old_key, new_key, new_image, slot_index=None,
                                owner=None, drop_slot=False):
     """Point the materials linked to the changed BMD texture at its replacement."""
-    if not old_key:
+    # A slot that had no image yet has no old key; the slot index is enough to
+    # find the materials that reference it (shader presets create such slots).
+    if not old_key and slot_index is None:
         return
-    for material in bpy.data.materials:
+    for material in _sync_materials(owner):
         if not is_bmd_material(material):
             continue
         tree = material.node_tree
         slots = (material_texture_slots(material, owner)
                  if slot_index is not None and owner is not None else None)
         if slots is not None and any(s is not None for s in slots):
-            stored = material.get("bmd_material")
+            stored = active_material_json(material)
             data = None
             if stored:
                 try:
@@ -1293,11 +1606,13 @@ def retarget_material_textures(old_key, new_key, new_image, slot_index=None,
                     slots[n] = None
                     slots_changed = True
             if names_changed:
-                material["bmd_material"] = json.dumps(data, separators=(",", ":"))
+                set_active_mat3_json(material,
+                                     json.dumps(data, separators=(",", ":")))
             if slots_changed:
                 set_material_texture_slots(material, slots)
+            _refresh_recovery(material)
             continue
-        stored = material.get("bmd_material")
+        stored = active_material_json(material)
         data = None
         if stored:
             try:
@@ -1320,7 +1635,8 @@ def retarget_material_textures(old_key, new_key, new_image, slot_index=None,
                             if "bmd_cleared_texture" in node:
                                 del node["bmd_cleared_texture"]
                 if changed:
-                    material["bmd_material"] = json.dumps(data, separators=(",", ":"))
+                    set_active_mat3_json(material,
+                                         json.dumps(data, separators=(",", ":")))
         if tree is None:
             continue
         for node in tree.nodes:
@@ -1332,6 +1648,7 @@ def retarget_material_textures(old_key, new_key, new_image, slot_index=None,
             elif (node.image is not None
                   and texture_key(node.image) == old_key):
                 node.image = new_image
+        _refresh_recovery(material)
 
 
 def _texture_slot_image_changed(self, context):
@@ -1349,13 +1666,21 @@ def _texture_slot_image_changed(self, context):
     if image is None:
         if old_key:
             clear_material_textures(old_key, slot_index, arm_obj)
-        # Keep self.key so assigning a new image can restore the material link.
+            # The BMD name belonged to the removed texture; a slot that never
+            # had an image keeps the name it was created with (shader presets
+            # create named, empty slots that the user fills in later).
+            self.name = ""
+        # Keep self.key so a new image can restore the material link.
         sync_texture_legacy(arm_obj)
         return
     retarget_material_textures(old_key, new_key, image, slot_index, arm_obj)
     self.key = new_key
-    stored = image.get("bmd_name")
-    self.name = str(stored) if stored else clean_texture_name(image)
+    # Replacing an assigned texture renames the slot after the new image.  A slot
+    # that had no image yet keeps the name it was created with (a shader preset
+    # creates named, empty slots that the user fills in later).
+    if old_key or not self.name:
+        stored = image.get("bmd_name")
+        self.name = str(stored) if stored else clean_texture_name(image)
     sync_texture_legacy(arm_obj)
 
 
@@ -1371,12 +1696,58 @@ def _texture_slot_name_changed(self, context):
     sync_texture_legacy(arm_obj)
 
 
+def _slot_sampler_changed(self, context):
+    owner = self.id_data
+    if owner is None or owner.get("bmd_texture_loading"):
+        return
+    try:
+        index = next((i for i, slot in enumerate(owner.bmd_texture_list)
+                      if slot == self), None)
+    except Exception:
+        index = None
+    if index is not None:
+        refresh_slot_sampler(owner, index)
+
+
+def _slot_max_lod_changed(self, context):
+    owner = self.id_data
+    if owner is not None and owner.get("bmd_texture_loading"):
+        return
+    self.max_lod_custom = True
+    _slot_sampler_changed(self, context)
+
+
 class BMDTextureSlot(PropertyGroup):
     image: PointerProperty(type=bpy.types.Image, name="Image",
                            update=_texture_slot_image_changed, options=set())
     name: StringProperty(name="BMD Name", update=_texture_slot_name_changed,
                          options=set())
     key: StringProperty(options={"HIDDEN"})
+    # GX sampler state belongs to the TEX1 entry, not to the pixel block: two
+    # entries may share one image and still clamp/repeat it differently.
+    wrap_s: EnumProperty(name="Wrap S", items=WRAP_ITEMS, default="1",
+                         update=_slot_sampler_changed, options=set())
+    wrap_t: EnumProperty(name="Wrap T", items=WRAP_ITEMS, default="1",
+                         update=_slot_sampler_changed, options=set())
+    min_filter: EnumProperty(name="Min Filter", items=MIN_FILTER_ITEMS,
+                             default="1", update=_slot_sampler_changed,
+                             options=set())
+    mag_filter: EnumProperty(name="Mag Filter", items=MAG_FILTER_ITEMS,
+                             default="1", update=_slot_sampler_changed,
+                             options=set())
+    min_lod: IntProperty(name="Min LOD", default=0, min=-128, max=127,
+                         description="Raw GX LOD value (1/8 units)",
+                         update=_slot_sampler_changed, options=set())
+    max_lod: IntProperty(name="Max LOD", default=0, min=-128, max=127,
+                         description="Raw GX LOD value (1/8 units)",
+                         update=_slot_max_lod_changed, options=set())
+    max_lod_custom: BoolProperty(default=False, options={"HIDDEN"})
+    lod_bias: IntProperty(name="LOD Bias", default=0, min=-32768, max=32767,
+                          description="Raw GX LOD bias (1/100 units)",
+                          update=_slot_sampler_changed, options=set())
+    # False on slots saved before the sampler state moved here; the image still
+    # carries the merged values and ``migrate_texture_samplers`` copies them.
+    sampler_ready: BoolProperty(default=False, options={"HIDDEN"})
 
 
 class BMDImageProps(PropertyGroup):
@@ -1392,6 +1763,9 @@ class BMDImageProps(PropertyGroup):
         options=set(),
     )
     key_custom: BoolProperty(default=False, options={"HIDDEN"})
+    # Legacy sampler fields.  The sampler state now lives on BMDTextureSlot;
+    # these stay defined so old .blend files load their merged values and
+    # ``migrate_texture_samplers`` can copy them onto the slots.
     wrap_s: EnumProperty(name="Wrap S", items=WRAP_ITEMS, default="1",
                          update=_image_wrap_changed, options=set())
     wrap_t: EnumProperty(name="Wrap T", items=WRAP_ITEMS, default="1",
@@ -2007,6 +2381,61 @@ def texture_key(image):
     # release the old key, and two new images with the same base name must not
     # collapse into one texture.  The datablock name is unique in Blender.
     return f"__image__{image.name}"
+
+
+def strip_blender_suffix(name):
+    """Remove Blender's automatic ``.001`` duplicate suffix from an exported name."""
+    text = str(name)
+    base, sep, suffix = text.rpartition(".")
+    if sep and len(suffix) == 3 and suffix.isdigit():
+        return base
+    return text
+
+
+def material_export_name(material):
+    """Material name written to a J3D file (BMD ``MAT3``, BTP entries).
+
+    The name stored on import is authoritative; a material without one (created
+    in Blender) exports under its datablock name without Blender's automatic
+    ``.001`` suffix.  The animation exporters use the same helper so a BTP entry
+    always matches the name inside the BMD.
+    """
+    if material is None:
+        return "default"
+    stored = material.get("bmd_name")
+    if stored:
+        return str(stored)
+    return strip_blender_suffix(material.name)
+
+
+def material_shader_name(material):
+    """Current material name used by shader presets (file name and ``Name``).
+
+    Unlike :func:`material_export_name` this follows a rename in Blender and
+    never uses the name stored in the BMD.
+    """
+    return str(material.name) if material is not None else "material"
+
+
+def material_preset_payload(material, owner=None):
+    """Shader preset for *material* (active shader data)."""
+    from . import blender_mat
+    from .j3d import mat3_json
+
+    data = blender_mat.material_data(material) or {}
+    names = [None] * 8
+    try:
+        slots = material_texture_slots(material, owner) if owner is not None else []
+        textures = owner.bmd_texture_list if owner is not None else ()
+    except Exception:
+        slots, textures = [], ()
+    for slot, index in enumerate(list(slots or [])[:8]):
+        if index is None:
+            continue
+        if 0 <= index < len(textures):
+            names[slot] = textures[index].name or None
+    return mat3_json.to_superbmd(data, material_shader_name(material), names)
+
 
 
 def clean_texture_name(image):

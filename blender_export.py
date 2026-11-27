@@ -205,11 +205,7 @@ def is_duplicate_bone_name(name):
 
 def strip_blender_suffix(name):
     """Remove Blender's automatic ``.001`` duplicate suffix from an exported name."""
-    text = str(name)
-    base, sep, suffix = text.rpartition(".")
-    if sep and len(suffix) == 3 and suffix.isdigit():
-        return base
-    return text
+    return bc.strip_blender_suffix(name)
 
 
 def exported_joint_name(bone):
@@ -522,11 +518,6 @@ def _build_joints(model, arm_obj, scale):
 # meshes
 # --------------------------------------------------------------------------
 
-def _srgb_from_linear(c):
-    c = np.clip(c, 0.0, 1.0)
-    return np.where(c <= 0.0031308, c * 12.92, 1.055 * np.power(c, 1 / 2.4) - 0.055)
-
-
 def _read_color(me, name_hint):
     attrs = me.color_attributes
     if len(attrs) == 0:
@@ -539,11 +530,8 @@ def _read_color(me, name_hint):
     n = len(attr.data)
     arr = np.empty(n * 4, np.float32)
     attr.data.foreach_get("color", arr)
-    arr = arr.reshape(n, 4)
-    if attr.data_type in ("BYTE_COLOR",):
-        arr = arr.copy()
-        arr[:, :3] = _srgb_from_linear(arr[:, :3])
-    return arr, attr.domain
+    # J3D vertex colours are raw 0..1 values; no gamma conversion is applied.
+    return arr.reshape(n, 4), attr.domain
 
 
 def _eval_mesh(obj, apply_modifiers, context):
@@ -842,6 +830,30 @@ def _reuse_raw(image, t, w, h, warn=None):
     return True
 
 
+def _apply_sampler(t, sampler):
+    """Copy a texture slot's sampler state onto an export texture."""
+    if not sampler:
+        return
+    t.wrap_s = int(sampler.get("wrap_s", t.wrap_s))
+    t.wrap_t = int(sampler.get("wrap_t", t.wrap_t))
+    t.min_filter = int(sampler.get("min_filter", t.min_filter))
+    t.mag_filter = int(sampler.get("mag_filter", t.mag_filter))
+    t.min_lod = int(sampler.get("min_lod", t.min_lod))
+    t.lod_bias = int(sampler.get("lod_bias", t.lod_bias))
+    if sampler.get("max_lod_custom"):
+        t.max_lod = int(sampler.get("max_lod", t.max_lod))
+    else:
+        t.max_lod = (max(1, int(t.mip_count)) - 1) * 8
+    if sampler.get("transparency") is not None:
+        t.transparency = int(sampler["transparency"])
+    flags = sampler.get("flags10")
+    if flags:
+        try:
+            t.flags10 = bytes.fromhex(str(flags))
+        except ValueError:
+            pass
+
+
 class _DefaultImageSettings:
     """Fallback for images that have no BMD settings yet."""
 
@@ -858,6 +870,31 @@ class _DefaultImageSettings:
     lod_bias = 0
 
 
+def _texture_data_group(tex):
+    """Content key for sharing one TEX1 pixel block between entries.
+
+    Game files often let several TEX1 entries point at the same pixels and only
+    vary the sampling state, so the importer keeps one image per state.  Keying
+    the block by its content writes those pixels once again instead of
+    duplicating them in the exported file.
+    """
+    if tex.raw_data is not None:
+        payload = bytes(tex.raw_data)
+        palette = bytes(tex.raw_palette or b"")
+    elif tex.rgba is not None:
+        payload = np.ascontiguousarray(tex.rgba).tobytes()
+        palette = b""
+    else:
+        return None
+    digest = hashlib.blake2b(digest_size=8)
+    digest.update(f"{int(tex.format)}:{int(tex.mip_count)}:"
+                  f"{int(tex.transparency)}:{int(tex.pal_enabled)}:"
+                  f"{int(tex.pal_format)}:{int(tex.pal_count)}".encode("ascii"))
+    digest.update(payload)
+    digest.update(palette)
+    return digest.hexdigest()
+
+
 def _image_settings(image):
     """Return BMD settings without adding a ``bmd`` group to a plain image."""
     if "bmd" in image or any(str(key).startswith("bmd_")
@@ -867,7 +904,7 @@ def _image_settings(image):
     return _DefaultImageSettings()
 
 
-def texture_from_image(image, warn=None):
+def texture_from_image(image, warn=None, sampler=None):
     """Build an export :class:`j3d.Texture` from a Blender image."""
     name = bc.clean_texture_name(image)
     t = j3d.Texture(name)
@@ -900,9 +937,17 @@ def texture_from_image(image, warn=None):
                         f"{gx.FORMAT_NAMES[fallback]}")
             return fallback
         # An automatically kept format must not silently discard alpha that
-        # the edited image now has.  An explicit user choice is respected.
-        if auto and has_a and fmt in (gx.I4, gx.I8, gx.RGB565):
-            return gx.RGB5A3 if partial else gx.CMPR
+        # the edited image now has.  Intensity masks stay intensity masks
+        # (I4/I8 gain an alpha channel instead of being re-encoded as colour);
+        # RGB565 has no alpha, so it uses CMPR (1-bit) or RGB5A3 (smooth).
+        # An explicit user choice is respected.
+        if auto and has_a:
+            if fmt == gx.I4:
+                return gx.IA4
+            if fmt == gx.I8:
+                return gx.IA8
+            if fmt == gx.RGB565:
+                return gx.RGB5A3 if partial else gx.CMPR
         return fmt
 
     # An imported image keeps its original format in the UI.  Treat that value
@@ -955,6 +1000,9 @@ def texture_from_image(image, warn=None):
         flags = flags + b"\0" * (4 - len(flags))
     # flags10 bit 0 is the mipmap flag; keep it in sync with mip_count.
     t.flags10 = bytes([(flags[0] & 0xFE) | (1 if mips > 1 else 0)]) + flags[1:4]
+    if sampler:
+        # The sampler state belongs to the texture slot, not to the image.
+        _apply_sampler(t, sampler)
     return t
 
 
@@ -1041,7 +1089,10 @@ class _MaterialCollector:
                 count = seen_keys.get(slot_key, 0)
 
                 tex = texture_from_image(image, self.warn)
-                tex.data_group = str(image.as_pointer())
+                group = _texture_data_group(tex)
+                if group is not None:
+                    tex.data_group = group
+                _apply_sampler(tex, bc.slot_sampler(slot, image))
 
                 if count == 0 and slot_key not in self.images:
                     tex.key = slot_key
@@ -1069,6 +1120,7 @@ class _MaterialCollector:
                 tex = copy.deepcopy(source_tex if source_tex is not None
                                      else self.images[key])
                 tex.key = duplicate_key(key)
+                _apply_sampler(tex, bc.slot_sampler(slot))
 
                 if slot.name:
                     tex.name = slot.name
@@ -1082,6 +1134,7 @@ class _MaterialCollector:
             if source_tex is not None:
                 tex = copy.deepcopy(source_tex)
                 tex.key = key
+                _apply_sampler(tex, bc.slot_sampler(slot))
 
                 if slot.name:
                     tex.name = slot.name
@@ -1113,7 +1166,8 @@ class _MaterialCollector:
         key = bc.texture_key(image)
         if key in self.images:
             return key
-        t = texture_from_image(image, self.warn)
+        t = texture_from_image(image, self.warn,
+                               sampler=bc.sampler_for_image(image))
         self.images[key] = t
         self.model.textures.append(t)
         return key
@@ -1136,13 +1190,14 @@ class _MaterialCollector:
         return out
 
     def _build(self, bl_mat, mesh):
-        stored = bl_mat.get("bmd_material") if bl_mat else None
-        is_bmd = bool(bl_mat is not None and bc.is_bmd_material(bl_mat))
+        stored = bc.active_material_json(bl_mat) if bl_mat else None
+        is_bmd = bool(bl_mat is not None
+                      and (bc.is_bmd_material(bl_mat)
+                           or bl_mat.get("bmd_shader_active")))
         mode = bl_mat.bmd.render_mode if is_bmd else "AUTO"
         alpha_ref = bl_mat.bmd.alpha_ref if is_bmd else 128
         cull_back = bool(bl_mat.use_backface_culling) if bl_mat else True
-        name = ((bl_mat.get("bmd_name")
-                 or strip_blender_suffix(bl_mat.name)) if bl_mat else "default")
+        name = ((bc.material_export_name(bl_mat)) if bl_mat else "default")
 
         # The J3D Textures sidebar is authoritative.  Material node trees are
         # only a preview and must not change the exported TEX1 indices.

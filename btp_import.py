@@ -25,13 +25,20 @@ def owner_meshes(owner):
 
 
 def material_map(owner):
-    """Material name -> material for all meshes of *owner*."""
+    """Material name -> material for all meshes of *owner*.
+
+    Both the Blender datablock name and the name written to the BMD are keys, so
+    a BTP that names the material the way the file does (`bmd_name`, or without
+    Blender's ``.001`` suffix) still finds the right slot.
+    """
     result = {}
     for mesh in owner_meshes(owner):
         for slot in mesh.material_slots:
             material = slot.material
-            if material is not None:
-                result.setdefault(material.name, material)
+            if material is None:
+                continue
+            result.setdefault(material.name, material)
+            result.setdefault(bc.material_export_name(material), material)
     return result
 
 

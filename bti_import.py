@@ -65,7 +65,8 @@ def import_bti(context, filepath, report=None):
 
     name = os.path.splitext(os.path.basename(filepath))[0] or "texture"
     texture = bti_parser.parse_bti(data, name=name)
-    image = blender_import.create_texture_image(texture, name=name, path=filepath)
+    image = blender_import.create_texture_image(texture, name=name, path=filepath,
+                                                store_sampler=True)
 
     _add_image_node(context, image)
     _show_in_image_editor(context, image)

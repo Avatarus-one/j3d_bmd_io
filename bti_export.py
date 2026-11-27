@@ -15,10 +15,10 @@ from .j3d.common import J3DError
 
 
 def _bti_filename(name):
-    """Texture name -> safe lowercase ``.bti`` file name."""
+    """Texture name -> safe ``.bti`` file name (case preserved)."""
     safe = "".join("_" if ch in '<>:"/\\|?*' else ch for ch in str(name))
     safe = safe.strip().rstrip(".")
-    return (safe or "texture").lower() + ".bti"
+    return (safe or "texture") + ".bti"
 
 
 def _disambiguate_labels(groups):
@@ -65,8 +65,13 @@ def _image_external(image):
         return False
 
 
-def scene_bti_groups():
-    """Group every external image in the scene by imported BMD/model."""
+def scene_bti_groups(external_only=True):
+    """Group the scene's textures by imported BMD/model.
+
+    With *external_only* (the historical behaviour) only textures whose data
+    lives outside the BMD are listed; otherwise every texture of the models is
+    returned.
+    """
     models = [obj for obj in bpy.data.objects
               if obj.type == "ARMATURE" and ("bmd_textures" in obj or "bmd_source" in obj
                                              or len(obj.bmd_texture_list))]
@@ -88,9 +93,12 @@ def scene_bti_groups():
             image = slot.image
             if image is None and slot.key:
                 image = bc.image_by_key(slot.key)
-            if _image_external(image) and image.name not in seen:
-                seen.add(image.name)
-                group["images"].append(image)
+            if image is None or image.name in seen:
+                continue
+            if external_only and not _image_external(image):
+                continue
+            seen.add(image.name)
+            group["images"].append(image)
 
     model_by_arm = {group["arm"]: group for group in groups}
     for obj in bpy.data.objects:
@@ -111,13 +119,18 @@ def scene_bti_groups():
                 if node.name.startswith("bmd_btp"):
                     continue
                 image = node.image
-                if _image_external(image) and image.name not in seen:
-                    seen.add(image.name)
-                    group["images"].append(image)
+                if image is None or image.name in seen:
+                    continue
+                if external_only and not _image_external(image):
+                    continue
+                seen.add(image.name)
+                group["images"].append(image)
 
     assigned = {image.name for group in groups for image in group["images"]}
     orphans = [image for image in bpy.data.images
-               if image.name not in assigned and _image_external(image)]
+               if image.name not in assigned
+               and (_image_external(image) if external_only
+                    else bc.is_bmd_image(image))]
     if orphans:
         groups.append({
             "label": "Scene",
@@ -140,12 +153,13 @@ def _image_signature(image):
     image.pixels.foreach_get(buf)
     pixels = np.clip(np.rint(buf * 255.0), 0, 255).astype(np.uint8)
     props = image.bmd
+    sampler = bc.sampler_for_image(image)
     header = (
         int(w), int(h), str(props.format), int(props.mip_count),
         image.get("bmd_orig_format"),
-        int(image.get("bmd_wrap_s", 1)), int(image.get("bmd_wrap_t", 1)),
-        int(image.get("bmd_min_filter", 1)), int(image.get("bmd_mag_filter", 1)),
-        int(image.get("bmd_min_lod", 0)), image.get("bmd_flags10"),
+        int(sampler.get("wrap_s", 1)), int(sampler.get("wrap_t", 1)),
+        int(sampler.get("min_filter", 1)), int(sampler.get("mag_filter", 1)),
+        int(sampler.get("min_lod", 0)), sampler.get("flags10"),
         tuple(int(v) for v in (image.get("bmd_external_size") or ())),
     )
     digest = hashlib.sha1()
@@ -232,7 +246,8 @@ def bti_export_plan(images, directory, with_payload=True,
 
         entry["path"] = os.path.join(directory, filename)
         try:
-            t = texture_from_image(image)
+            t = texture_from_image(image,
+                                   sampler=bc.sampler_for_image(image))
         except (ExportError, J3DError) as exc:
             entry["error"] = str(exc)
             seen_target[key] = entry
@@ -282,11 +297,12 @@ def bti_scene_plan(groups, directory, with_payload=True):
             for group in groups]
 
 
-def export_bti_textures(context, directory, report=None, selected=None):
-    """Write every selected external texture of the scene to *directory*."""
-    groups = scene_bti_groups()
+def export_bti_textures(context, directory, report=None, selected=None,
+                        external_only=True):
+    """Write every selected texture of the scene to *directory*."""
+    groups = scene_bti_groups(external_only)
     if not groups:
-        raise ExportError("No external textures found in the scene")
+        raise ExportError("No textures found in the scene")
 
     directory = os.path.abspath(directory)
     try:
@@ -342,11 +358,15 @@ def export_bti_textures(context, directory, report=None, selected=None):
 
 
 def default_bti_directory(context):
-    """Suggested output folder for the separate .bti exporter."""
+    """Suggested output folder for the separate .bti exporter.
+
+    Only a folder an external texture was actually loaded from is suggested.
+    The blend folder (or Blender's working directory) is not a meaningful
+    target for .bti files, so the field stays empty instead.
+    """
     for group in scene_bti_groups():
         for image in group["images"]:
             path = image.get("bmd_external_path")
             if path:
                 return os.path.dirname(path)
-    blend_dir = bpy.path.abspath("//")
-    return blend_dir or os.path.abspath(".")
+    return ""

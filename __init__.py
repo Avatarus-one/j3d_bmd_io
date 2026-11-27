@@ -657,6 +657,9 @@ def register():
     from . import btp_preview
     btp_preview.install()
 
+    from . import blender_mat
+    blender_mat.install_texture_recovery()
+
     _file_handlers = _make_file_handlers()
     for fh in _file_handlers:
         try:
@@ -671,6 +674,11 @@ def unregister():
     try:
         from . import btp_preview
         btp_preview.uninstall()
+    except Exception:
+        pass
+    try:
+        from . import blender_mat
+        blender_mat.uninstall_texture_recovery()
     except Exception:
         pass
     try:

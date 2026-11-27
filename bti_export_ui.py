@@ -100,7 +100,7 @@ class BMD_UL_bti_tree(UIList):
 
 
 class EXPORT_OT_bti(Operator):
-    """Export external textures of the whole scene as .bti files"""
+    """Export textures as .bti files"""
 
     bl_idname = "export_scene.bti"
     bl_label = "Export BTI"
@@ -111,6 +111,9 @@ class EXPORT_OT_bti(Operator):
     directory: StringProperty(
         name="Export Folder", subtype="DIR_PATH", default="",
         description="Folder for the .bti files")
+    external_only: BoolProperty(
+        name="External Only", default=False,
+        description="Show only textures stored outside the BMD")
     group_states: CollectionProperty(type=BMDExportGroupState,
                                      options={"HIDDEN"})
     texture_states: CollectionProperty(type=BMDExportTextureState,
@@ -121,7 +124,14 @@ class EXPORT_OT_bti(Operator):
     def invoke(self, context, _event):
         if not self.directory:
             self.directory = bti_export.default_bti_directory(context)
-        self._groups = bti_export.scene_bti_groups()
+        self._filter = self.external_only
+        self._refresh_groups()
+        return context.window_manager.invoke_props_dialog(
+            self, width=600, confirm_text="Export")
+
+    def _refresh_groups(self):
+        """Rebuild the list (and its checkbox state) for the current filter."""
+        self._groups = bti_export.scene_bti_groups(self.external_only)
         self.group_states.clear()
         self.texture_states.clear()
         total = 0
@@ -134,8 +144,6 @@ class EXPORT_OT_bti(Operator):
         self._last_texture_selected = [True] * total
         self._plan_key = None
         self._plans = None
-        return context.window_manager.invoke_props_dialog(
-            self, width=600, confirm_text="Export")
 
     @staticmethod
     def _texture_offsets(groups):
@@ -273,13 +281,16 @@ class EXPORT_OT_bti(Operator):
     def draw(self, context):
         layout = self.layout
 
+        if getattr(self, "_filter", None) != self.external_only:
+            self._filter = self.external_only
+            self._refresh_groups()
         groups = getattr(self, "_groups", None)
         if groups is None:
-            groups = bti_export.scene_bti_groups()
+            groups = bti_export.scene_bti_groups(self.external_only)
             self._groups = groups
 
         directory = self.directory.strip()
-        key = (directory,
+        key = (directory, bool(self.external_only),
                tuple(tuple(image.name for image in group["images"])
                      for group in groups))
         if getattr(self, "_plan_key", None) != key:
@@ -292,9 +303,8 @@ class EXPORT_OT_bti(Operator):
         self._apply_group_toggles(groups, plans)
         self._sync_texture_states(groups, plans)
 
-        field = layout.column()
-        field.use_property_split = True
-        field.prop(self, "directory")
+        layout.prop(self, "directory", text="Export Folder")
+        layout.prop(self, "external_only", text="External Only")
 
         if groups:
             visible = 0
@@ -313,8 +323,9 @@ class EXPORT_OT_bti(Operator):
                 maxrows=MAX_BTI_TREE_ROWS,
             )
         else:
-            layout.label(text="No external textures found in the scene",
-                         icon="INFO")
+            text = ("No external textures found in the scene"
+                    if self.external_only else "No textures found in the scene")
+            layout.label(text=text, icon="INFO")
 
     def execute(self, context):
         directory = self.directory.strip()
@@ -323,7 +334,7 @@ class EXPORT_OT_bti(Operator):
             return {"CANCELLED"}
         groups = getattr(self, "_groups", None)
         if groups is not None:
-            key = (directory,
+            key = (directory, bool(self.external_only),
                    tuple(tuple(image.name for image in group["images"])
                          for group in groups))
             if getattr(self, "_plan_key", None) != key:
@@ -336,7 +347,8 @@ class EXPORT_OT_bti(Operator):
         selected = self._selected_image_names(groups)
         try:
             bti_export.export_bti_textures(context, directory, self.report,
-                                           selected=selected)
+                                           selected=selected,
+                                           external_only=self.external_only)
         except (bti_export.ExportError, J3DError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}

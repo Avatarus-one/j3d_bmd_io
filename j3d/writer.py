@@ -694,6 +694,9 @@ def write(model):
 
 def _build_tex1(textures):
     n = len(textures)
+    if n > 0xFFFF:
+        raise J3DError(f"Too many textures ({n}): the TEX1 entry count is "
+                       "16-bit (max 65535)")
     names = write_string_table([t.name for t in textures])
     hdr_off = 0x20
     name_off = hdr_off + 0x20 * n

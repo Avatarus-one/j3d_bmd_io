@@ -890,7 +890,11 @@ def _export_all(context, settings, operator):
                         action = registry_data._track_action(track)
                         frames = btp_export.frames_from_action(action)
                         if frames:
-                            pairs.append((track.target, frames))
+                            material = bpy.data.materials.get(track.target)
+                            name = (bc.material_export_name(material)
+                                    if material is not None
+                                    else bc.strip_blender_suffix(track.target))
+                            pairs.append((name, frames))
 
                     if pairs:
                         path = _unique_path(

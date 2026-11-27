@@ -196,6 +196,11 @@ def parse_mat3(d, off, tex_names):
 
     def entry_bytes(table, idx):
         base = offs[SLOT_INDEX[table]]
+        if not base:
+            # An omitted table has no entries.  Referencing one of its slots
+            # means the identity/default value (e.g. an identity tex matrix),
+            # not bytes from the chunk header.
+            return None
         size = ELEM_SIZE[table]
         o = off + base + size * idx
         return bytes(d[o:o + size])
@@ -215,7 +220,8 @@ def parse_mat3(d, off, tex_names):
             out = []
             sentinel = 0xFFFF if code == "H" else 0xFF
             for v in vals:
-                out.append(None if v == sentinel else unpack(entry_bytes(table, v)))
+                raw = None if v == sentinel else entry_bytes(table, v)
+                out.append(None if raw is None else unpack(raw))
             mat[field] = out[0] if field in SCALAR_TABLE_FIELDS else out
         # resolve texture names
         tn = []
@@ -336,6 +342,7 @@ def default_fog():
 
 
 RENDER_OPAQUE, RENDER_CUTOUT, RENDER_TRANSLUCENT = "OPAQUE", "CUTOUT", "TRANSLUCENT"
+RENDER_ADDITIVE = "ADDITIVE"
 
 
 def apply_render_mode(mat, mode, alpha_ref=128):
@@ -356,6 +363,14 @@ def apply_render_mode(mat, mode, alpha_ref=128):
         mat["flags"] = 4
         mat["alphaComp"] = [7, 0, 1, 7, 0, 0xFF, 0xFF, 0xFF]
         mat["blend"] = [1, 4, 5, 3]
+        mat["zMode"] = [1, 3, 0, 0xFF]
+        mat["zCompLoc"] = 0
+    elif mode == RENDER_ADDITIVE:
+        # GX additive blend: the TEV colour scaled by the source alpha is added
+        # to the framebuffer, so the background stays visible.
+        mat["flags"] = 4
+        mat["alphaComp"] = [7, 0, 1, 7, 0, 0xFF, 0xFF, 0xFF]
+        mat["blend"] = [1, 4, 1, 3]
         mat["zMode"] = [1, 3, 0, 0xFF]
         mat["zCompLoc"] = 0
     else:
@@ -434,6 +449,40 @@ def required_uv_sets(mat):
 
 def uses_vertex_colors(mat):
     return any(c and c[1] == 1 for c in mat.get("colorChan", [])[:2 * max(1, mat.get("colorChanCount", 1))])
+
+
+def blend_uses_alpha(mat):
+    """True when the GX blend factors read the source/destination alpha."""
+    blend = mat.get("blend") or []
+    if len(blend) < 3 or blend[0] != 1:
+        return False
+    return any(int(factor) in (4, 5, 6, 7) for factor in blend[1:3])
+
+
+def blend_equation(mat):
+    """(type, source factor, destination factor) of the GX blend."""
+    blend = mat.get("blend") or []
+    if len(blend) < 4:
+        return 0, 1, 0
+    return int(blend[0]), int(blend[1]), int(blend[2])
+
+
+def blend_is_additive(mat):
+    """True for GX blends that add the source to the framebuffer (dst = ONE).
+
+    ``dst = ONE`` covers SRCALPHA/ONE (the water and glow materials) as well as
+    ONE/ONE and INVSRCALPHA/ONE; the source factor decides how much is added.
+    """
+    kind, source, destination = blend_equation(mat)
+    return kind == 1 and destination == 1 and source in (1, 2, 3, 4, 5)
+
+
+def blend_is_source_squared(mat):
+    """True for SRCCOLOR / ZERO, where GX writes source_color * source_color."""
+    blend = mat.get("blend") or []
+    if len(blend) < 4 or blend[0] != 1:
+        return False
+    return int(blend[1]) == 2 and int(blend[2]) == 0
 
 
 def deep_copy(mat):

@@ -25,6 +25,12 @@ I4, I8, IA4, IA8, RGB565, RGB5A3, RGBA32 = 0, 1, 2, 3, 4, 5, 6
 C4, C8, C14X2 = 8, 9, 10
 CMPR = 14
 
+# Intensity formats are shading masks, not colour: the game samples the raw
+# byte as R = G = B = I (and A = I for I4/I8, A = the stored alpha for IA4/IA8).
+# They are imported as Non-Color (data) images so the shader sees those raw
+# values, and the material skips the sRGB recovery.
+DATA_FORMATS = frozenset((I4, I8, IA4, IA8))
+
 # Indexed formats: decoded on import and re-encoded from RGBA with the octree
 # quantizer (C14X2 stores 14-bit indices in 16-bit words).
 PALETTE_FORMATS = (C4, C8, C14X2)

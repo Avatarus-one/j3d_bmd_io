@@ -14,12 +14,13 @@ import bpy
 from bpy.props import (BoolProperty, EnumProperty, IntProperty, PointerProperty,
                        StringProperty)
 from bpy.types import Operator, Panel, UIList
+from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from . import blender_common as bc
 
 
 class MATERIAL_PT_bmd(Panel):
-    bl_label = "J3D (BMD) Material"
+    bl_label = "BMD Material"
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"
     bl_context = "material"
@@ -33,8 +34,15 @@ class MATERIAL_PT_bmd(Panel):
         mat = context.material
         owner = _texture_owner(context)
 
-        if not bc.is_bmd_material(mat):
+        shader_active = bool(mat.get("bmd_shader_active"))
+        if not (bc.is_bmd_material(mat) or shader_active):
             layout.label(text="Not a BMD material", icon="INFO")
+            row = layout.row(align=True)
+            row.operator_context = "INVOKE_DEFAULT"
+            op = row.operator(BMD_OT_material_shader_import.bl_idname,
+                              text="Import Shader", icon="IMPORT")
+            op.material_name = mat.name
+            op.owner_name = owner.name if owner is not None else ""
             column = layout.column()
             column.enabled = owner is not None
             column.operator_context = "INVOKE_DEFAULT"
@@ -42,13 +50,30 @@ class MATERIAL_PT_bmd(Panel):
                             text="Create BMD Material", icon="MATERIAL")
             return
 
+        row = layout.row(align=True)
+        row.operator_context = "INVOKE_DEFAULT"
+        op = row.operator(BMD_OT_material_shader_import.bl_idname,
+                          text="Import Shader", icon="IMPORT")
+        op.material_name = mat.name
+        op.owner_name = owner.name if owner is not None else ""
+        export_row = row.row(align=True)
+        export_row.enabled = bool(shader_active or "bmd_material" in mat)
+        op = export_row.operator(BMD_OT_material_shader_export.bl_idname,
+                                 text="Export Shader", icon="EXPORT")
+        op.material_name = mat.name
+        op.owner_name = owner.name if owner is not None else ""
+
+        reset_row = layout.row(align=True)
+        reset_row.enabled = shader_active
+        op = reset_row.operator(BMD_OT_material_shader_reset.bl_idname,
+                                text="Reset Shader", icon="LOOP_BACK")
+        op.material_name = mat.name
+        op.owner_name = owner.name if owner is not None else ""
+
         layout.prop(mat.bmd, "render_mode")
         if mat.bmd.render_mode in {"AUTO", "CUTOUT"}:
             layout.prop(mat.bmd, "alpha_ref")
-        layout.prop(mat.bmd, "use_vertex_color")
         layout.prop(mat, "use_backface_culling")
-        if "bmd_material" in mat:
-            layout.label(text="Imported TEV data kept in 'bmd_material'", icon="INFO")
 
         box = layout.box()
         box.label(text="Textures", icon="IMAGE_DATA")
@@ -61,6 +86,9 @@ class MATERIAL_PT_bmd(Panel):
                 key = bc.texture_slot_key(owner_slot)
                 label = f"{owner_index}: {owner_slot.name or key}"
                 row = box.row(align=True)
+                # An empty slot (a texture the imported shader expects) needs an
+                # image from the user, so it is highlighted.
+                row.alert = owner_slot.image is None
                 row.label(text=f"{slot}: {label}")
                 op = row.operator(BMD_OT_material_texture_menu.bl_idname,
                                   text="", icon="IMAGE_DATA")
@@ -77,8 +105,6 @@ class MATERIAL_PT_bmd(Panel):
         else:
             if owner is not None and not items:
                 box.label(text="Add textures in the J3D → Textures first", icon="INFO")
-            else:
-                box.label(text="No textures", icon="INFO")
         if owner is None:
             box.label(text="No BMD texture list for this material", icon="INFO")
         elif items:
@@ -126,23 +152,23 @@ def _draw_bmd_prop(layout, data, prop, label, factor=0.42, alert=False):
     row.prop(data, prop, text="")
 
 
-def _draw_bmd_image_settings(layout, img, hint=False):
-    _draw_bmd_prop(layout, img.bmd, "format", "GX Format", 0.3)
+def _draw_bmd_image_settings(layout, img):
+    """Image (pixel block) settings: format, mips, external storage."""
     _draw_bmd_prop(layout, img.bmd, "mip_count", "Mip Levels", 0.3)
     row = layout.split(factor=0.3)
     row.label(text="")
     row.prop(img.bmd, "external")
-    if hint:
-        layout.label(text="Order and assignment: J3D sidebar > Textures",
-                     icon="INFO")
 
-    _draw_bmd_prop(layout, img.bmd, "wrap_s", "Wrap S", 0.3)
-    _draw_bmd_prop(layout, img.bmd, "wrap_t", "Wrap T", 0.3)
-    _draw_bmd_prop(layout, img.bmd, "min_filter", "Min Filter", 0.3)
-    _draw_bmd_prop(layout, img.bmd, "mag_filter", "Mag Filter", 0.3)
-    _draw_bmd_prop(layout, img.bmd, "min_lod", "Min LOD", 0.3)
-    _draw_bmd_prop(layout, img.bmd, "max_lod", "Max LOD", 0.3)
-    _draw_bmd_prop(layout, img.bmd, "lod_bias", "LOD Bias", 0.3)
+
+def _draw_slot_sampler(layout, slot):
+    """GX sampler state of one TEX1 entry."""
+    _draw_bmd_prop(layout, slot, "wrap_s", "Wrap S", 0.3)
+    _draw_bmd_prop(layout, slot, "wrap_t", "Wrap T", 0.3)
+    _draw_bmd_prop(layout, slot, "min_filter", "Min Filter", 0.3)
+    _draw_bmd_prop(layout, slot, "mag_filter", "Mag Filter", 0.3)
+    _draw_bmd_prop(layout, slot, "min_lod", "Min LOD", 0.3)
+    _draw_bmd_prop(layout, slot, "max_lod", "Max LOD", 0.3)
+    _draw_bmd_prop(layout, slot, "lod_bias", "LOD Bias", 0.3)
 
 
 class IMAGE_PT_bmd(Panel):
@@ -164,7 +190,8 @@ class IMAGE_PT_bmd(Panel):
             self.layout.label(text="Not a BMD texture", icon="INFO")
             return
 
-        _draw_bmd_image_settings(self.layout, img, hint=True)
+        _draw_bmd_prop(self.layout, img.bmd, "format", "GX Format", 0.3)
+        _draw_bmd_image_settings(self.layout, img)
         external_path = img.get("bmd_external_path")
         if external_path:
             self.layout.label(text=f"External: {os.path.basename(external_path)}")
@@ -664,9 +691,15 @@ class BMD_OT_material_remove_texture(Operator):
         owner = _texture_owner(context)
         tree = mat.node_tree
         if tree is not None:
-            node = tree.nodes.get(f"bmd_tex{self.slot}")
-            if node is not None:
+            for name in (f"bmd_tex{self.slot}", f"bmd_uv_tex{self.slot}",
+                         f"bmd_wrap_tex{self.slot}"):
+                node = tree.nodes.get(name)
+                if node is None:
+                    continue
+                group = node.node_tree if node.type == "GROUP" else None
                 tree.nodes.remove(node)
+                if group is not None and group.users == 0:
+                    bpy.data.node_groups.remove(group)
         _set_material_texname(mat, self.slot, None)
         slots = bc.material_texture_slots(mat, owner)
         slots[self.slot] = None
@@ -711,7 +744,7 @@ def _activate_j3d_sidebar(area):
 
 class BMD_OT_texture_focus(Operator):
     bl_idname = "bmd.texture_focus"
-    bl_label = "Show BMD Texture Settings"
+    bl_label = "Show BMD Texture"
     bl_description = "Show this texture's preview and settings"
     bl_options = set()
 
@@ -805,10 +838,15 @@ class BMD_UL_textures(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data,
                   active_propname, index, *args):
         row = layout.row(align=True)
+        # Empty slots (e.g. textures an imported shader expects) need an image.
+        row.alert = item.image is None
         index_col = row.column()
         index_col.ui_units_x = 2.0
         index_col.label(text=f"{index:02d}")
-        name = item.name or (item.image.name if item.image is not None else "(no image)")
+        if item.image is None and item.name:
+            name = f"{item.name} (no image)"
+        else:
+            name = item.name or (item.image.name if item.image is not None else "(no image)")
         row.label(text=name)
 
 
@@ -825,7 +863,8 @@ class BMD_OT_texture_add(Operator):
             return {"CANCELLED"}
         coll = bc.ensure_texture_list(arm)
         slot = coll.add()
-        slot.name = f"texture{len(coll) - 1}"
+        # The BMD name belongs to the assigned texture: an empty slot has none.
+        slot.name = ""
         arm.bmd_texture_index = len(coll) - 1
         bc.sync_texture_legacy(arm)
         return {"FINISHED"}
@@ -955,14 +994,17 @@ def _draw_texture_details(layout, owner, index, boxed=True):
 
     index = min(max(int(index), 0), len(coll) - 1)
     slot = coll[index]
-    key = bc.texture_slot_key(slot)
     target = layout.box() if boxed else layout
     target.label(text=f"Texture {index}", icon="TEXTURE")
 
     if slot.image is None:
         target.label(text="No image (skipped on export)", icon="ERROR")
-
-    _draw_bmd_prop(target, slot, "name", "BMD Name", 0.3)
+    else:
+        _draw_bmd_prop(target, slot, "name", "BMD Name", 0.3)
+        image_settings = slot.image.bmd
+        _draw_bmd_prop(target, image_settings, "format", "GX Format", 0.3)
+        _draw_bmd_prop(target, image_settings, "mip_count", "Mip Levels", 0.3)
+        _draw_bmd_prop(target, image_settings, "external", "External Texture", 0.3)
     image_col = target.column()
 
     if slot.image is not None:
@@ -975,16 +1017,14 @@ def _draw_texture_details(layout, owner, index, boxed=True):
         slot, "image", new="image.new", open="image.open",
         unlink=BMD_OT_texture_clear_image.bl_idname)
 
-    if key:
-        target.label(
-            text=f"Used by {bc.material_slot_users(owner, index)} "
-                 "material slot(s)",
-            icon="MATERIAL")
+    target.label(
+        text=f"Used by {bc.material_slot_users(owner, index)} "
+             "material slot(s)",
+        icon="MATERIAL")
 
-    if slot.image is not None:
-        settings = target.box()
-        settings.label(text="Texture Settings", icon="PREFERENCES")
-        _draw_bmd_image_settings(settings, slot.image)
+    settings = target.box()
+    settings.label(text="Sample Settings", icon="PREFERENCES")
+    _draw_slot_sampler(settings, slot)
 
 
 class BMD_PT_textures(Panel):
@@ -1114,6 +1154,258 @@ class BMD_OT_material_create(Operator):
 
     def execute(self, context):
         return _run_material_create(self, context, self.mode)
+
+
+def _shader_read_entries(path):
+    """Load a materials.json file as a list of material objects."""
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if isinstance(payload, dict):
+        payload = [payload]
+    if not isinstance(payload, list) or not payload:
+        raise ValueError("no materials in the file")
+    return [entry for entry in payload if isinstance(entry, dict)]
+
+
+class BMD_OT_material_shader_import(Operator, ImportHelper):
+    """Import a shader preset into this material"""
+
+    bl_idname = "bmd.material_shader_import"
+    bl_label = "Import Shader"
+    bl_description = (
+        "Apply a shader preset to this material.")
+    # The operator rewrites the material's node tree and its MAT3 data; its own
+    # undo step keeps Ctrl+Z from restoring a half-rebuilt tree.
+    bl_options = {"REGISTER", "UNDO"}
+
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
+    material_name: StringProperty(options={"HIDDEN"})
+    owner_name: StringProperty(options={"HIDDEN"})
+    index: IntProperty(default=-1, options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        material = (bpy.data.materials.get(self.material_name)
+                    if self.material_name else context.material)
+        if material is None:
+            self.report({"ERROR"}, "Select a material")
+            return {"CANCELLED"}
+        self.material_name = material.name
+        if not self.owner_name:
+            owner = _texture_owner(context)
+            self.owner_name = owner.name if owner is not None else ""
+        return ImportHelper.invoke(self, context, event)
+
+    def execute(self, context):
+        try:
+            entries = _shader_read_entries(self.filepath)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Cannot read {os.path.basename(self.filepath)}: {exc}")
+            return {"CANCELLED"}
+        index = self.index
+        if not (0 <= index < len(entries)):
+            index = self._match_index(entries)
+        if index is None:
+            self._pick(entries)
+            return {"FINISHED"}
+        return self._apply(context, entries[index])
+
+    def _match_index(self, entries):
+        """Index of the entry named like this material, when there is one."""
+        material = bpy.data.materials.get(self.material_name)
+        if material is None:
+            return 0 if len(entries) == 1 else None
+        wanted = bc.material_shader_name(material)
+        for index, entry in enumerate(entries):
+            if str(entry.get("Name") or "") == wanted:
+                return index
+        if len(entries) == 1:
+            return 0
+        return None
+
+    def _pick(self, entries):
+        # The popup outlives this operator, so nothing here may reference
+        # ``self`` (the operator instance is freed as soon as execute returns).
+        names = [str(entry.get("Name") or f"material{i}")
+                 for i, entry in enumerate(entries)]
+        filepath = str(self.filepath)
+        material_name = str(self.material_name)
+        owner_name = str(self.owner_name)
+
+        def draw(menu, _context):
+            for index, name in enumerate(names):
+                item = menu.layout.operator(BMD_OT_material_shader_apply.bl_idname,
+                                            text=name)
+                item.filepath = filepath
+                item.index = index
+                item.material_name = material_name
+                item.owner_name = owner_name
+
+        window_manager = bpy.context.window_manager
+        if window_manager is None:
+            self.report({"ERROR"},
+                        "Several materials in the file; export one material per "
+                        "file or name one of them like the target material")
+            return
+        try:
+            window_manager.popup_menu(draw, title="Import Shader")
+        except Exception as exc:
+            self.report({"ERROR"}, f"Cannot show the material list: {exc}")
+
+    def _apply(self, context, preset):
+        return BMD_OT_material_shader_apply.apply_preset(
+            self, context, preset, self.material_name, self.owner_name)
+
+
+class BMD_OT_material_shader_apply(Operator):
+    """Apply one material object from a shader preset file"""
+
+    bl_idname = "bmd.material_shader_apply"
+    bl_label = "Apply Shader"
+    bl_description = "Apply the selected material from the shader preset file"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filepath: StringProperty(options={"HIDDEN"})
+    index: IntProperty(default=0, options={"HIDDEN"})
+    material_name: StringProperty(options={"HIDDEN"})
+    owner_name: StringProperty(options={"HIDDEN"})
+
+    @staticmethod
+    def apply_preset(operator, context, preset, material_name, owner_name):
+        from . import blender_mat
+
+        material = (bpy.data.materials.get(material_name)
+                    if material_name else context.material)
+        if material is None:
+            operator.report({"ERROR"}, "Select a material")
+            return {"CANCELLED"}
+        owner = (bpy.data.objects.get(owner_name)
+                 if owner_name else _texture_owner(context))
+        try:
+            name, created, empty = blender_mat.apply_shader_preset(material, owner, preset)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            operator.report({"ERROR"}, f"Cannot import shader: {exc}")
+            return {"CANCELLED"}
+        notes = []
+        if created:
+            notes.append(f"{len(created)} empty texture slot(s) added: "
+                         + ", ".join(created[:8]))
+        if empty:
+            notes.append("still without a texture: " + ", ".join(empty[:8]))
+        message = f"Imported shader {name or '(unnamed)'} into {material.name}"
+        if notes:
+            message += " (" + "; ".join(notes) + ")"
+        operator.report({"INFO"}, message)
+        return {"FINISHED"}
+
+    def execute(self, context):
+        try:
+            entries = _shader_read_entries(self.filepath)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Cannot read {os.path.basename(self.filepath)}: {exc}")
+            return {"CANCELLED"}
+        index = self.index if 0 <= self.index < len(entries) else 0
+        return self.apply_preset(self, context, entries[index],
+                                 self.material_name, self.owner_name)
+
+
+def _shader_export_path(current, material):
+    """Default export path: the current material name, previous folder."""
+    directory = os.path.dirname(current or "")
+    name = bc.material_shader_name(material).strip() or "material"
+    # A datablock name may contain characters Windows cannot put in a file
+    # name; the JSON "Name" keeps the exact material name.
+    for char in '<>:"/\\|?*':
+        name = name.replace(char, "_")
+    name = name.rstrip(" .") or "material"
+    name += ".json"
+    return os.path.join(directory, name) if directory else name
+
+
+class BMD_OT_material_shader_export(Operator, ExportHelper):
+    """Export this material's shader as a json preset"""
+
+    bl_idname = "bmd.material_shader_export"
+    bl_label = "Export Shader"
+    bl_description = (
+        "Save the material's MAT3 data as a json preset, so "
+        "it can be applied to another model or material. "
+        "Textures are referenced by name")
+
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
+    material_name: StringProperty(options={"HIDDEN"})
+    owner_name: StringProperty(options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        material = (bpy.data.materials.get(self.material_name)
+                    if self.material_name else context.material)
+        if material is None or not (material.get("bmd_material")
+                                    or material.get("bmd_shader_active")):
+            self.report({"ERROR"}, "Nothing to export: no imported shader")
+            return {"CANCELLED"}
+        self.material_name = material.name
+        if not self.owner_name:
+            owner = _texture_owner(context)
+            self.owner_name = owner.name if owner is not None else ""
+        # Always name the file after the material: Blender keeps the path of the
+        # previous export in the operator properties, which must not leak into
+        # the next (different) material's file name.
+        self.filepath = _shader_export_path(self.filepath, material)
+        return ExportHelper.invoke(self, context, event)
+
+    def execute(self, context):
+        material = (bpy.data.materials.get(self.material_name)
+                    if self.material_name else context.material)
+        if material is None or not (material.get("bmd_material")
+                                    or material.get("bmd_shader_active")):
+            self.report({"ERROR"}, "Nothing to export: no imported shader")
+            return {"CANCELLED"}
+        owner = (bpy.data.objects.get(self.owner_name)
+                 if self.owner_name else _texture_owner(context))
+        payload = [bc.material_preset_payload(material, owner)]
+        path = bpy.path.ensure_ext(self.filepath, self.filename_ext)
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+                handle.write("\n")
+        except OSError as exc:
+            self.report({"ERROR"}, f"Cannot write {path}: {exc}")
+            return {"CANCELLED"}
+        self.report({"INFO"},
+                    f"Wrote shader preset {os.path.basename(path)}")
+        return {"FINISHED"}
+
+
+class BMD_OT_material_shader_reset(Operator):
+    """Drop the imported shader and rebuild the material from its own data"""
+
+    bl_idname = "bmd.material_shader_reset"
+    bl_label = "Reset Shader"
+    bl_description = ("Remove the imported shader and restore the "
+                      "original MAT3 data")
+    bl_options = {"REGISTER", "UNDO"}
+
+    material_name: StringProperty(options={"HIDDEN"})
+    owner_name: StringProperty(options={"HIDDEN"})
+
+    def execute(self, context):
+        from . import blender_mat
+
+        material = (bpy.data.materials.get(self.material_name)
+                    if self.material_name else context.material)
+        if material is None:
+            self.report({"ERROR"}, "Select a material")
+            return {"CANCELLED"}
+        owner = (bpy.data.objects.get(self.owner_name)
+                 if self.owner_name else _texture_owner(context))
+        if not blender_mat.reset_shader(material, owner):
+            self.report({"ERROR"}, "No imported shader to reset")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Restored the original shader of {material.name}")
+        return {"FINISHED"}
 
 
 class BMD_OT_material_create_menu(Operator):
@@ -1349,6 +1641,10 @@ CLASSES = (
     BMD_OT_set_30_fps,
     BMD_OT_material_create,
     BMD_OT_material_create_menu,
+    BMD_OT_material_shader_import,
+    BMD_OT_material_shader_apply,
+    BMD_OT_material_shader_export,
+    BMD_OT_material_shader_reset,
     *CREATE_OPERATORS,
     BMD_OT_material_track_menu,
     BMD_OT_material_track_add,

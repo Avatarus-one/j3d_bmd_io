@@ -276,10 +276,6 @@ def show_index(material, index):
             image = None
     node = texture_node(material)
     if image is not None and node is not None and node.image != image:
-        # Assigning the image already tags the node tree, the relations and
-        # sends an image notifier (rna_Node_tex_image_update).  Calling
-        # node_tree.update_tag() on top of that forces a second, full material
-        # rebuild, which makes Eevee recompile its shader a few frames later.
         node.image = image
 
 
