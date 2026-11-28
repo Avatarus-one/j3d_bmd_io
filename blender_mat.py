@@ -125,6 +125,9 @@ def _node_extent(node):
     """Width/height of a node as the node editor draws it (the layout spec)."""
     width = _NODE_WIDTHS.get(node.type, NODE_WIDTH)
     height = _NODE_HEIGHTS.get(node.type, NODE_HEIGHT)
+    if node.type == "TEX_IMAGE" and node.get("bmd_simple_texture"):
+        # A simple preview has no "Texture to TEV" group in its slot.
+        width = 240.0
     if node.type in ("GROUP_INPUT", "GROUP_OUTPUT"):
         # These grow with their sockets; the plain 140 default is too short
         # for a TEV group (9 sockets), which pushed the first branch row into
@@ -1208,6 +1211,27 @@ def ensure_output_bsdf(tree):
     return output, bsdf
 
 
+def _is_simple_preview(material):
+    if material is None:
+        return False
+    if material.get("bmd_material") or material.get("bmd_shader_active"):
+        return False
+    return bool(material.get("bmd_simple") or material.get("bmd_simple_textures"))
+
+
+def _mark_simple_textures(material):
+    tree = getattr(material, "node_tree", None)
+    if tree is None:
+        return
+    for node in tree.nodes:
+        if node.type == "TEX_IMAGE":
+            node["bmd_simple_texture"] = 1
+            try:
+                node.width = 240.0
+            except Exception:
+                pass
+
+
 def ensure_texture_node(material, slot, image=None, uv_index=None,
                         attach_uv=False, link_base=False, sampler=None):
     """Create/update the material's ``bmd_tex<N>`` node.
@@ -1285,6 +1309,15 @@ def ensure_texture_node(material, slot, image=None, uv_index=None,
         if bsdf is not None and not bsdf.inputs["Base Color"].is_linked:
             tree.links.new(node.outputs["Color"],
                            bsdf.inputs["Base Color"])
+
+    if _is_simple_preview(material):
+        node["bmd_simple_texture"] = 1
+        try:
+            node.width = 240.0
+        except Exception:
+            pass
+    elif "bmd_simple_texture" in node:
+        del node["bmd_simple_texture"]
 
     return node
 
@@ -3005,6 +3038,15 @@ def refresh_texture_recovery(material, slot=None):
     tree = getattr(material, "node_tree", None)
     if tree is None:
         return
+    if _is_simple_preview(material):
+        # Simple unlit previews sample the sRGB image directly; the TEV
+        # Linear -> sRGB helper belongs only to shader previews.
+        for index in range(8):
+            group = tree.nodes.get(_texcol_name(index))
+            if group is not None:
+                _drop_texture_recovery(tree, group,
+                                       tree.nodes.get(f"bmd_tex{index}"))
+        return
     keys = bc.material_texture_keys(material)
     key_images = _image_key_map() if keys else {}
     _RECOVERY_UPDATING = True
@@ -4550,6 +4592,50 @@ def build_import_nodes(material, data, images, scale=0.01, samplers=None):
     layout_material_tree(material)
 
 
+def clear_simple_uv_maps(material):
+    """Leave the UV Map field empty on generated simple previews."""
+    tree = getattr(material, "node_tree", None)
+    if tree is None:
+        return
+    for node in tree.nodes:
+        if node.type == "UVMAP":
+            node.uv_map = ""
+
+
+def build_simple_import_material(material, data, images, samplers=None):
+    """Simple texture preview for a BMD imported without shader data."""
+    material.use_nodes = True
+    material["bmd_simple"] = 1
+    tree = material.node_tree
+    if tree is None:
+        return
+    tree.nodes.clear()
+    _output, bsdf = ensure_output_bsdf(tree)
+
+    kind, ref = mat3.classify_alpha(data)
+    mode = kind if kind in READY_MODES else mat3.RENDER_OPAQUE
+    try:
+        material.bmd.render_mode = mode
+        alpha = (int(ref) if ref is not None
+                 else int((data.get("alphaComp") or [0, 128])[1]))
+        material.bmd.alpha_ref = max(0, min(255, alpha))
+    except Exception:
+        pass
+    material.use_backface_culling = (data.get("cull") == 2)
+
+    simple = dict(data)
+    simple["colorChanCount"] = 0
+    simple["colorChan"] = []
+    _build_simple_nodes(material, simple, images, samplers)
+    keys = [str(name) if name else None
+            for name in (data.get("texNames") or [])][:8]
+    keys += [None] * (8 - len(keys))
+    material["bmd_simple_textures"] = json.dumps(keys, separators=(",", ":"))
+    _mark_simple_textures(material)
+    layout_material_tree(material)
+    clear_simple_uv_maps(material)
+
+
 def _build_simple_nodes(material, data, images, samplers=None):
     """Fallback preview for materials without TEV stages."""
     tree = material.node_tree
@@ -4677,6 +4763,8 @@ def create_material(material, owner, mode):
 
     from . import btp_preview
 
+    if not material.get("bmd_material") and not material.get("bmd_shader_active"):
+        material["bmd_simple"] = 1
     ensure_base(material, owner)
     if not material.get(bc.MATERIAL_LAST_NAME_PROP):
         material[bc.MATERIAL_LAST_NAME_PROP] = str(material.name)
@@ -4689,6 +4777,8 @@ def create_material(material, owner, mode):
 
     btp_preview.prepare_preview(material, owner)
     sync_shading(material)
+    _mark_simple_textures(material)
+    clear_simple_uv_maps(material)
     return True
 
 
@@ -4795,6 +4885,7 @@ def sync_shading(material):
     # Imported materials without TEV stages keep their hand-built preview
     # until a concrete render mode is selected.
     if mode == "AUTO" and material.get("bmd_material"):
+        layout_material_tree(material)
         return
 
     base_color = bsdf.inputs["Base Color"]
@@ -4836,6 +4927,7 @@ def sync_shading(material):
         sources.append(vc.outputs["Alpha"])
     apply_alpha(material, tree, bsdf, sources, mode,
                 material.bmd.alpha_ref)
+    layout_material_tree(material)
 
 
 # ---------------------------------------------------------------------------
@@ -5017,7 +5109,8 @@ def apply_shader_preset(material, owner, preset):
     for key in ("bmd_shader_active", "bmd_shader_material",
                 "bmd_texture_slots_backup", "bmd_shader_mode_backup",
                 "bmd_shader_alpha_backup", "bmd_shader_cull_backup",
-                "bmd_shader_created_slots"):
+                "bmd_shader_created_slots", "bmd_simple",
+                "bmd_simple_textures"):
         if key in material:
             del material[key]
     material["bmd_material"] = json.dumps(data, separators=(",", ":"))

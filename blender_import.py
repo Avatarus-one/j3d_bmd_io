@@ -28,7 +28,8 @@ def _warn(warn, message):
 
 
 def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=True,
-               report=None, texc_dir=None):
+               report=None, texc_dir=None, import_meshes=True,
+               import_shaders=True):
     with open(filepath, "rb") as f:
         raw = f.read()
     bmd = j3d.parse(raw)
@@ -45,15 +46,31 @@ def import_bmd(context, filepath, scale=0.01, bone_axis="X", import_textures=Tru
     else:
         missing_external = []
 
-    coll = bpy.data.collections.new(base)
-    context.scene.collection.children.link(coll)
+    coll = bpy.data.collections.new(base) if import_meshes else None
+    if coll is not None:
+        context.scene.collection.children.link(coll)
 
     if import_textures:
         images = _create_images(bmd, base, uuid.uuid4().hex)
     else:
         images = {}
-    materials = [_create_material(bmd, i, m, images, warn, scale)
+    if not import_meshes and not import_shaders:
+        if report:
+            report({"INFO"},
+                   f"Imported {base}: {len(images)} textures "
+                   "(meshes and materials skipped)")
+        return None
+    materials = [_create_material(bmd, i, m, images, warn, scale,
+                                  import_shaders=import_shaders)
                  for i, m in enumerate(bmd.materials)]
+
+    if not import_meshes:
+        if report:
+            report({"INFO"},
+                   f"Imported {base}: {len(materials)} materials, "
+                   f"{len(images)} textures (meshes skipped)")
+        return None
+
     arm_obj = _create_armature(context, coll, bmd, base, scale, bone_axis)
     bone_names = [b for b in arm_obj["bmd_bone_names"]]
 
@@ -409,30 +426,36 @@ def _get_json_material(bmd_mat):
     return json.dumps(bmd_mat, separators=(",", ":"))
 
 
-def _create_material(bmd, index, m, images, warn=None, scale=0.01):
+def _create_material(bmd, index, m, images, warn=None, scale=0.01,
+                     import_shaders=True):
     name = bmd.material_names[index] if index < len(bmd.material_names) else f"material{index}"
     mat = bpy.data.materials.new(name)
     mat.use_fake_user = True
     mat["bmd_name"] = name
     mat["bmd_index"] = index
     mat[bc.MATERIAL_LAST_NAME_PROP] = str(mat.name)
-    mat["bmd_material"] = _get_json_material(m)
     key_to_index = {t.key: i for i, t in enumerate(bmd.textures)}
     mat["bmd_texture_slots"] = json.dumps(
         [key_to_index.get(key) if key else None
          for key in m.get("texNames", [])], separators=(",", ":"))
     mat.use_backface_culling = (m.get("cull") == 2)
-    mat.bmd.render_mode = "AUTO"
     alpha_ref = m["alphaComp"][1] if m.get("alphaComp") else 128
     mat.bmd.alpha_ref = int(alpha_ref)
+    if import_shaders:
+        mat["bmd_material"] = _get_json_material(m)
+        mat.bmd.render_mode = "AUTO"
     try:
         samplers = {texture.key: {
             "wrap_s": int(texture.wrap_s),
             "wrap_t": int(texture.wrap_t),
             "mag_filter": int(texture.mag_filter),
         } for texture in bmd.textures}
-        blender_mat.build_import_nodes(mat, m, images, scale,
-                                       samplers=samplers)
+        if import_shaders:
+            blender_mat.build_import_nodes(mat, m, images, scale,
+                                           samplers=samplers)
+        else:
+            blender_mat.build_simple_import_material(mat, m, images,
+                                                     samplers=samplers)
     except Exception as exc:  # node API differences must never break the import
         _warn(warn, f"Material '{name}': preview nodes could not be built: {exc}")
 

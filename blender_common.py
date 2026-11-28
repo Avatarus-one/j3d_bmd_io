@@ -1552,12 +1552,20 @@ def material_texture_keys(mat):
     the material's own ``texNames`` is the authority for its texture slots.
     """
     stored = active_material_json(mat)
-    if not stored:
-        return []
-    try:
-        data = json.loads(stored)
-    except Exception:
-        return []
+    if stored:
+        try:
+            data = json.loads(stored)
+        except Exception:
+            data = {}
+    else:
+        data = {}
+        raw = mat.get("bmd_simple_textures")
+        if raw:
+            try:
+                return [str(name) if name else None
+                        for name in (json.loads(raw) or [])][:8]
+            except Exception:
+                return []
     return [str(name) if name else None
             for name in (data.get("texNames") or [])][:8]
 

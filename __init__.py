@@ -83,6 +83,14 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
     convert_units: BoolProperty(
         name="Convert Units", default=True,
         description="Convert J3D model units to Blender units (scale 0.01). ")
+    import_meshes: BoolProperty(
+        name="Import Meshes", default=True,
+        description="Import the armature and mesh objects; otherwise import "
+                    "only materials and textures")
+    import_shaders: BoolProperty(
+        name="Import Shaders", default=True,
+        description="Build TEV shader previews; otherwise create simple "
+                    "unlit materials")
     bone_axis: EnumProperty(name="Bone Orientation", items=bc.BONE_AXIS_ITEMS, default="X")
     import_textures: BoolProperty(name="Import Textures", default=True)
     import_shape_keys: BoolProperty(
@@ -101,10 +109,16 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
         layout = self.layout
         layout.use_property_split = True
         layout.prop(self, "convert_units")
-        layout.prop(self, "bone_axis")
+        bone_row = layout.row()
+        bone_row.enabled = self.import_meshes
+        bone_row.prop(self, "bone_axis")
+        layout.prop(self, "import_meshes")
+        layout.prop(self, "import_shaders")
         layout.prop(self, "import_textures")
-        layout.prop(self, "import_shape_keys")
-        layout.prop(self, "import_animations")
+        mesh_options = layout.column()
+        mesh_options.enabled = self.import_meshes
+        mesh_options.prop(self, "import_shape_keys")
+        mesh_options.prop(self, "import_animations")
 
     def execute(self, context):
         from . import blender_import
@@ -152,6 +166,8 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
                     "scale": scale,
                     "bone_axis": self.bone_axis,
                     "import_textures": self.import_textures,
+                    "import_meshes": self.import_meshes,
+                    "import_shaders": self.import_shaders,
                     "import_shape_keys": self.import_shape_keys,
                     "import_animations": self.import_animations,
                     "convert_units": self.convert_units,
@@ -178,7 +194,9 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
             try:
                 arm = blender_import.import_bmd(
                     context, p, scale, self.bone_axis,
-                    self.import_textures, report=self.report)
+                    self.import_textures, report=self.report,
+                    import_meshes=self.import_meshes,
+                    import_shaders=self.import_shaders)
             except J3DError as exc:
                 self.report({"ERROR"}, f"{os.path.basename(p)}: {exc}")
                 return {"CANCELLED"}
@@ -186,12 +204,12 @@ class IMPORT_OT_bmd(Operator, ImportHelper):
             last_arm = arm
 
             bls_imported = None
-            if self.import_shape_keys:
+            if self.import_meshes and self.import_shape_keys:
                 from . import bls_import
                 bls_imported = bls_import.import_shape_keys_for_bmd(
                     context, arm, p, scale, report=self.report)
 
-            if self.import_animations:
+            if self.import_meshes and self.import_animations:
                 from . import anim_import_ui
                 try:
                     count = anim_import_ui.import_animations_for_bmd(
@@ -336,7 +354,9 @@ class IMPORT_OT_bmd_texc(Operator):
                 arm = blender_import.import_bmd(
                     context, path, pending["scale"], pending["bone_axis"],
                     pending["import_textures"], report=self.report,
-                    texc_dir=texc_dir)
+                    texc_dir=texc_dir,
+                    import_meshes=pending.get("import_meshes", True),
+                    import_shaders=pending.get("import_shaders", True))
             except J3DError as exc:
                 _PENDING_BMD_IMPORT = None
                 self.report({"ERROR"}, f"{os.path.basename(path)}: {exc}")
@@ -345,13 +365,15 @@ class IMPORT_OT_bmd_texc(Operator):
             last_arm = arm
 
             bls_imported = None
-            if pending.get("import_shape_keys", True):
+            if (pending.get("import_meshes", True)
+                    and pending.get("import_shape_keys", True)):
                 from . import bls_import
                 bls_imported = bls_import.import_shape_keys_for_bmd(
                     context, arm, path, pending["scale"],
                     report=self.report)
 
-            if pending.get("import_animations", True):
+            if (pending.get("import_meshes", True)
+                    and pending.get("import_animations", True)):
                 from . import anim_import_ui
                 try:
                     count = anim_import_ui.import_animations_for_bmd(
