@@ -43,6 +43,10 @@ BMD_MESH_KEYS = frozenset({
     "bmd_bls_source", "bmd_source", "bmd_vtx_formats", "bmd_scale",
     "bmd_textures", "bmd_texture_keys",
 })
+# Last datablock name seen by the add-on.  It is copied with the material, so a
+# name mismatch also reveals a copy while still preserving duplicate internal
+# names on import (foo, foo.001, ...).
+MATERIAL_LAST_NAME_PROP = "bmd_last_name"
 
 
 def bmd_scale_value(obj):

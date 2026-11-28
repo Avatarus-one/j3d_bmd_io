@@ -3050,11 +3050,168 @@ def _recovery_signature(material, key_images=None):
     return tuple(entries)
 
 
+_GROUP_OWNER_PROPS = ("bmd_tev_owner", "bmd_wrap_owner",
+                      "bmd_pos_texgen_owner")
+
+
+def _group_owner(group):
+    """Material name a generated node group was built for, if any."""
+    if group is None:
+        return None
+    for prop in _GROUP_OWNER_PROPS:
+        owner = group.get(prop)
+        if owner:
+            return str(owner)
+    return None
+
+
+def _set_group_owner(group, name):
+    for prop in _GROUP_OWNER_PROPS:
+        if prop in group:
+            group[prop] = name
+
+
+def _group_copy_name(group, material):
+    owner = _group_owner(group) or ""
+    name = group.name
+    if owner and owner in name:
+        name = name.replace(owner, material.name, 1)
+    if name == group.name:
+        name = f"{name} [{material.name}]"
+    return name
+
+
+def _ensure_material_group(group, material, cache):
+    """A copy of *group* that belongs to *material* alone (cached)."""
+    if group in cache:
+        return cache[group]
+    owner = _group_owner(group)
+    if owner is None:
+        # Stateless conversion helpers are identical for every material.
+        cache[group] = group
+        return group
+    if owner == material.name:
+        cache[group] = group
+        return group
+    copy = group.copy()
+    copy.name = _group_copy_name(group, material)
+    _set_group_owner(copy, material.name)
+    cache[group] = copy
+    for node in copy.nodes:
+        if node.type == "GROUP" and node.node_tree is not None:
+            node.node_tree = _ensure_material_group(
+                node.node_tree, material, cache)
+    return copy
+
+
+def isolate_material_groups(material):
+    """Give a copied material its own generated TEV/wrap/texgen groups.
+
+    Blender copies the material node tree but keeps its group datablocks
+    shared.  A copy would therefore share the TEV stages and other generated
+    groups with the original, and a shader import on either material could
+    change both.  Reassign every group owned by another material to a copy
+    owned by this one.  Stateless helpers (sRGB <-> Linear) stay shared.
+    """
+    tree = getattr(material, "node_tree", None) if material is not None else None
+    if tree is None:
+        return False
+    cache = {}
+    changed = False
+    for node in tree.nodes:
+        if node.type != "GROUP" or node.node_tree is None:
+            continue
+        owner = _group_owner(node.node_tree)
+        if owner is None or owner == material.name:
+            continue
+        node.node_tree = _ensure_material_group(
+            node.node_tree, material, cache)
+        changed = True
+    return changed
+
+
+def _track_material_rename(material):
+    """Return ``(first_seen, previous_name)`` for the datablock name."""
+    current = str(material.name)
+    last = material.get(bc.MATERIAL_LAST_NAME_PROP)
+    if not last:
+        material[bc.MATERIAL_LAST_NAME_PROP] = current
+        return True, None
+    if str(last) == current:
+        return False, None
+    material[bc.MATERIAL_LAST_NAME_PROP] = current
+    material["bmd_name"] = current
+    return False, str(last)
+
+
+def _owned_groups_shared(material):
+    """True when a generated group is also referenced by another material."""
+    tree = getattr(material, "node_tree", None)
+    if tree is None:
+        return False
+    counts = {}
+    for node in tree.nodes:
+        if node.type != "GROUP" or node.node_tree is None:
+            continue
+        group = node.node_tree
+        if _group_owner(group) is None:
+            continue
+        counts[group] = counts.get(group, 0) + 1
+    return any(group.users > count for group, count in counts.items())
+
+
+def _retag_material_groups(material, old_name):
+    """A renamed material keeps its unique groups; only move the owner tag."""
+    tree = getattr(material, "node_tree", None)
+    if tree is None:
+        return
+
+    def retag(group):
+        if _group_owner(group) == old_name:
+            _set_group_owner(group, material.name)
+        for node in group.nodes:
+            if node.type == "GROUP" and node.node_tree is not None:
+                retag(node.node_tree)
+
+    for node in tree.nodes:
+        if node.type == "GROUP" and node.node_tree is not None:
+            retag(node.node_tree)
+
+
+def ensure_material_isolation():
+    """Keep material copies independent from each other.
+
+    The datablock name recorded by the importer is copied with the material, so
+    a name change means a copy or a manual rename.  A copy still references the
+    original's shared generated groups; those are rebuilt as unique copies.  A
+    rename of an already isolated material only moves its owner tags.
+    """
+    materials = [material for material in bpy.data.materials
+                 if material.library is None
+                 and (material.get("bmd_material")
+                      or material.get("bmd_shader_active"))]
+    for material in materials:
+        first_seen, old_name = _track_material_rename(material)
+        if first_seen:
+            if _owned_groups_shared(material):
+                # A copy from a file saved before names were tracked.
+                material["bmd_name"] = str(material.name)
+                isolate_material_groups(material)
+            continue
+        if old_name is None:
+            continue
+        if _owned_groups_shared(material):
+            isolate_material_groups(material)
+        else:
+            _retag_material_groups(material, old_name)
+
+
 @bpy.app.handlers.persistent
 def _texture_recovery_handler(scene=None, depsgraph=None):
     """Follow slot assignments; preview image swaps are ignored."""
     if _RECOVERY_UPDATING:
         return
+    ensure_material_isolation()
     key_images = None
     for material in bpy.data.materials:
         if not (material.get("bmd_material")
@@ -3723,6 +3880,8 @@ def build_import_nodes(material, data, images, scale=0.01, samplers=None):
     tree = material.node_tree
     if tree is None:
         return
+    if not material.get(bc.MATERIAL_LAST_NAME_PROP):
+        material[bc.MATERIAL_LAST_NAME_PROP] = str(material.name)
     tree.nodes.clear()
     protected = _open_node_groups()
     for group in list(bpy.data.node_groups):
@@ -4028,6 +4187,8 @@ def create_material(material, owner, mode):
     from . import btp_preview
 
     ensure_base(material, owner)
+    if not material.get(bc.MATERIAL_LAST_NAME_PROP):
+        material[bc.MATERIAL_LAST_NAME_PROP] = str(material.name)
 
     begin_sync()
     try:

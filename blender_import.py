@@ -414,6 +414,7 @@ def _create_material(bmd, index, m, images, warn=None, scale=0.01):
     mat = bpy.data.materials.new(name)
     mat["bmd_name"] = name
     mat["bmd_index"] = index
+    mat[bc.MATERIAL_LAST_NAME_PROP] = str(mat.name)
     mat["bmd_material"] = _get_json_material(m)
     key_to_index = {t.key: i for i, t in enumerate(bmd.textures)}
     mat["bmd_texture_slots"] = json.dumps(

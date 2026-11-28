@@ -77,6 +77,11 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
     if not valid or not mesh_objs:
         raise ExportError(bc.BMD_NO_MESH_ERROR)
 
+    # A material copied just before exporting may not have seen a depsgraph
+    # update yet; isolate it now so the copies keep their own names and groups.
+    from . import blender_mat
+    blender_mat.ensure_material_isolation()
+
     if len(armatures) > 1:
         raise ExportError(
             "The export contains meshes from multiple armatures. "
