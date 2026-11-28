@@ -757,6 +757,33 @@ def _animation_files(folders, extension):
     return paths
 
 
+def _bck_skeleton_usable(arm):
+    """False for single-joint placeholders that cannot own a BCK.
+
+    A static prop often has one bone named after the mesh or the generic
+    ``world_root`` joint. A custom bone name still allows BCKs, because
+    that joint may be animated.
+    """
+    if arm is None or arm.type != "ARMATURE":
+        return False
+    bones = list(arm.data.bones)
+    if not bones:
+        return False
+    if len(bones) != 1:
+        return True
+    bone_name = bc.strip_blender_suffix(bones[0].name).casefold()
+    if bone_name == "world_root":
+        return False
+    mesh_names = set()
+    for obj in bpy.data.objects:
+        if obj.type != "MESH" or bc.target_armature(obj) is not arm:
+            continue
+        mesh_names.add(bc.strip_blender_suffix(obj.name).casefold())
+        if obj.data is not None:
+            mesh_names.add(bc.strip_blender_suffix(obj.data.name).casefold())
+    return bone_name not in mesh_names
+
+
 def import_animations_for_bmd(context, arm, bmd_path, scale=0.01, report=None,
                               bls_ok=False):
     """Import BCK/BTP (and BLK when BLS shape keys exist) next to a BMD.
@@ -778,8 +805,10 @@ def import_animations_for_bmd(context, arm, bmd_path, scale=0.01, report=None,
         if report:
             report({"WARNING"}, f"{os.path.basename(path)}: {exc}")
 
-    for path in _animation_files(_bmd_animation_folders(bmd_path, "bck"),
-                                 ".bck"):
+    bck_paths = (_animation_files(_bmd_animation_folders(bmd_path, "bck"),
+                                  ".bck")
+                 if _bck_skeleton_usable(arm) else ())
+    for path in bck_paths:
         try:
             with open(path, "rb") as file:
                 animation = anim.parse_bck(file.read())

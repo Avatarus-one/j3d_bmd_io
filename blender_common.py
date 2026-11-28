@@ -1403,6 +1403,148 @@ def set_material_texture_slots(mat, slots):
     mat["bmd_texture_slots"] = json.dumps(values, separators=(",", ":"))
 
 
+def _texture_slot_match_names(slot):
+    """Normalised names a texture slot can be matched by."""
+    names = set()
+    if slot.name:
+        names.add(str(slot.name))
+    image = slot.image
+    if image is not None:
+        names.add(clean_texture_name(image))
+        stored = image.get("bmd_name")
+        if stored:
+            names.add(str(stored))
+    key = texture_slot_key(slot)
+    if key:
+        names.add(str(key))
+    return {strip_blender_suffix(name) for name in names if name}
+
+
+def ensure_material_texture_slots(owner, material):
+    """Add empty named slots for material textures missing from *owner*.
+
+    Mirrors shader-preset import: the material keeps its MAT3 references, but
+    a texture the target model does not have is represented by an empty slot
+    the user can fill instead of copying pixels from the source model.  The
+    material's slot indices are not rewritten, so a shared material can still
+    be exported by its original model.
+    """
+    if owner is None or material is None:
+        return False
+    native = material_texture_keys(material)
+    if not any(native):
+        return False
+    try:
+        textures = ensure_texture_list(owner)
+    except Exception:
+        return False
+
+    by_name = set()
+    for slot in textures:
+        by_name.update(_texture_slot_match_names(slot))
+
+    created = False
+    for key in native:
+        if not key:
+            continue
+        name = strip_blender_suffix(str(key))
+        if name in by_name:
+            continue
+        slot = textures.add()
+        slot.name = name
+        try:
+            slot.auto_created = True
+            slot.sampler_ready = True
+        except Exception:
+            pass
+        by_name.add(name)
+        created = True
+    if created:
+        try:
+            sync_texture_legacy(owner)
+        except Exception:
+            pass
+    return created
+
+
+def retarget_material_texture_slots(owner, material):
+    """Point a material at *owner*'s slots, creating empty ones if needed."""
+    if owner is None or material is None:
+        return False
+    native = material_texture_keys(material)
+    if not any(native):
+        return False
+    ensure_material_texture_slots(owner, material)
+    try:
+        textures = ensure_texture_list(owner)
+    except Exception:
+        return False
+
+    by_name = {}
+    for index, slot in enumerate(textures):
+        for name in _texture_slot_match_names(slot):
+            previous = by_name.get(name)
+            if (previous is None
+                    or (textures[previous].image is None
+                        and slot.image is not None)):
+                by_name[name] = index
+
+    slots = material_texture_slots(material, owner)
+    changed = False
+    for slot_index, key in enumerate(list(native)[:8]):
+        if not key:
+            continue
+        name = strip_blender_suffix(str(key))
+        target = by_name.get(name)
+        if target is None:
+            continue
+        while len(slots) <= slot_index:
+            slots.append(None)
+        if slots[slot_index] != target:
+            slots[slot_index] = target
+            changed = True
+    if changed:
+        set_material_texture_slots(material, slots)
+    tree = getattr(material, "node_tree", None)
+    if tree is not None:
+        for slot_index, target in enumerate(slots):
+            node = tree.nodes.get(f"bmd_tex{slot_index}")
+            if node is None or node.type != "TEX_IMAGE":
+                continue
+            image = (textures[target].image
+                     if target is not None and 0 <= target < len(textures)
+                     else None)
+            if node.image != image:
+                node.image = image
+    return changed
+
+
+def material_slots_match_owner(owner, material):
+    """True when the material's stored slots already name the owner's slots."""
+    if owner is None or material is None:
+        return True
+    native = material_texture_keys(material)
+    if not any(native):
+        return True
+    try:
+        textures = ensure_texture_list(owner)
+    except Exception:
+        return True
+    current = material_texture_slots(material, owner)
+    for slot_index, key in enumerate(list(native)[:8]):
+        if not key:
+            continue
+        name = strip_blender_suffix(str(key))
+        if slot_index >= len(current):
+            return False
+        target = current[slot_index]
+        if target is None or not (0 <= target < len(textures)):
+            return False
+        if name not in _texture_slot_match_names(textures[target]):
+            return False
+    return True
+
+
 def material_texture_keys(mat):
     """Native texture key per material slot (8 entries), from the MAT3 data.
 
@@ -1492,6 +1634,37 @@ def remove_material_texture_slot(owner, index):
 def material_slot_users(owner, index):
     return sum(1 for material in _sync_materials(owner)
                if index in material_texture_slots(material, owner, store=False))
+
+
+def prune_auto_texture_slots(owner):
+    """Remove empty slots the add-on created for a material that is gone.
+
+    Empty assignment slots stay while a material uses them.  Undoing the
+    material assignment leaves them unused, so undo/redo can drop them again
+    without touching slots the user created or filled.
+    """
+    try:
+        slots = owner.bmd_texture_list
+    except Exception:
+        return 0
+    removed = 0
+    for index in range(len(slots) - 1, -1, -1):
+        slot = slots[index]
+        if not getattr(slot, "auto_created", False):
+            continue
+        if slot.image is not None or slot.key:
+            continue
+        if material_slot_users(owner, index) > 0:
+            continue
+        remove_material_texture_slot(owner, index)
+        slots.remove(index)
+        removed += 1
+    if removed:
+        try:
+            sync_texture_legacy(owner)
+        except Exception:
+            pass
+    return removed
 
 
 def count_texture_users(key):
@@ -1669,6 +1842,8 @@ def _texture_slot_image_changed(self, context):
     arm_obj = self.id_data
     if arm_obj is None or arm_obj.get("bmd_texture_loading"):
         return
+    if self.image is not None and getattr(self, "auto_created", False):
+        self.auto_created = False
     old_key = str(self.key or "")
     image = self.image
     new_key = texture_key(image) if image is not None else ""
@@ -1702,6 +1877,8 @@ def _texture_slot_name_changed(self, context):
     arm_obj = self.id_data
     if arm_obj is None or arm_obj.get("bmd_texture_loading"):
         return
+    if getattr(self, "auto_created", False):
+        self.auto_created = False
     if self.image is not None:
         if self.name:
             self.image["bmd_name"] = self.name
@@ -1756,6 +1933,9 @@ class BMDTextureSlot(PropertyGroup):
                          description="Raw GX LOD value (1/8 units)",
                          update=_slot_max_lod_changed, options=set())
     max_lod_custom: BoolProperty(default=False, options={"HIDDEN"})
+    # Set on empty slots the add-on creates when a material is moved to a model
+    # that lacks its textures.  Undo can then remove them again.
+    auto_created: BoolProperty(default=False, options={"HIDDEN"})
     lod_bias: IntProperty(name="LOD Bias", default=0, min=-32768, max=32767,
                           description="Raw GX LOD bias (1/100 units)",
                           update=_slot_sampler_changed, options=set())

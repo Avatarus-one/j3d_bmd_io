@@ -142,6 +142,14 @@ def export_bmd(context, filepath, scale=100.0, use_selection=True, apply_modifie
                 texture_owner = obj
                 break
     if texture_owner is not None:
+        prepared = set()
+        for obj in mesh_objs:
+            for slot in obj.material_slots:
+                mat = slot.material
+                if mat is None or mat.name in prepared:
+                    continue
+                prepared.add(mat.name)
+                bc.ensure_material_texture_slots(texture_owner, mat)
         mats.preload_original_textures(texture_owner, source_file, allow_missing_textures, report)
     # Keep every imported material slot, including slots that currently have
     # no faces.  The game addresses materials by index, so dropping an unused
@@ -1016,7 +1024,7 @@ class _MaterialCollector:
         self.model = model
         self.warn = warn
         self.mat_index = {}
-        self.images = {}   # tex name -> (Texture)
+        self.images = {}   # tex key -> (Texture)
         self.pending = []  # (ExportMesh)
         self.sort_keys = {}  # material index -> original index
         self._source = None
@@ -1167,16 +1175,6 @@ class _MaterialCollector:
         """Find the image that currently owns *key* (the BMD Key is editable)."""
         return bc.image_by_key(key)
 
-    def _texture_for(self, image):
-        key = bc.texture_key(image)
-        if key in self.images:
-            return key
-        t = texture_from_image(image, self.warn,
-                               sampler=bc.sampler_for_image(image))
-        self.images[key] = t
-        self.model.textures.append(t)
-        return key
-
     def _image_nodes(self, bl_mat):
         """{slot: (image, extension)} from nodes named bmd_tex<N>, else first image node."""
         out = {}
@@ -1194,6 +1192,71 @@ class _MaterialCollector:
                     break
         return out
 
+    def _owner_texture_keys_by_name(self):
+        """Normalised owner slot name -> exported TEX1 key (filled slots only)."""
+        out = {}
+        if self.owner is None:
+            return out
+        try:
+            slots = self.owner.bmd_texture_list
+        except Exception:
+            return out
+        for index, slot in enumerate(slots):
+            if index >= len(self.texture_keys):
+                continue
+            key = self.texture_keys[index]
+            if not key or key not in self.images:
+                continue
+            names = set()
+            if slot.name:
+                names.add(str(slot.name))
+            image = slot.image
+            if image is not None:
+                names.add(bc.clean_texture_name(image))
+                stored = image.get("bmd_name")
+                if stored:
+                    names.add(str(stored))
+            names.add(str(key))
+            for name in names:
+                if name:
+                    out.setdefault(bc.strip_blender_suffix(name), key)
+        return out
+
+    def _material_tex_names(self, bl_mat, slots):
+        """Resolve each material texture slot to an exported TEX1 key.
+
+        A borrowed material keeps its own ``texNames``.  Its old sidebar
+        indices point into the other model's texture list and are not reused
+        when they select a different texture here.  A missing texture stays
+        empty; it is never copied from the node tree.  The target model gets an
+        empty named slot (like a shader preset import) and the user fills it.
+        """
+        native = list(bc.material_texture_keys(bl_mat) or []) \
+            if bl_mat is not None else []
+        native += [None] * (8 - len(native))
+        owner_by_name = self._owner_texture_keys_by_name()
+        names = [None] * 8
+        for slot in range(8):
+            index = slots[slot] if slot < len(slots) else None
+            owner_key = None
+            if index is not None and 0 <= index < len(self.texture_keys):
+                owner_key = self.texture_keys[index]
+            native_key = native[slot] if slot < len(native) else None
+            if not native_key:
+                if owner_key in self.images:
+                    names[slot] = owner_key
+                continue
+            normalized = bc.strip_blender_suffix(str(native_key))
+            if owner_key in self.images and (
+                    owner_key == native_key
+                    or bc.strip_blender_suffix(str(owner_key)) == normalized):
+                names[slot] = owner_key
+            elif normalized in owner_by_name:
+                names[slot] = owner_by_name[normalized]
+            elif native_key in self.images:
+                names[slot] = native_key
+        return names
+
     def _build(self, bl_mat, mesh):
         stored = bc.active_material_json(bl_mat) if bl_mat else None
         is_bmd = bool(bl_mat is not None
@@ -1204,21 +1267,13 @@ class _MaterialCollector:
         cull_back = bool(bl_mat.use_backface_culling) if bl_mat else True
         name = ((bc.material_export_name(bl_mat)) if bl_mat else "default")
 
-        # The J3D Textures sidebar is authoritative.  Material node trees are
-        # only a preview and must not change the exported TEX1 indices.
+        # The J3D Textures sidebar is authoritative for this model, but a
+        # material borrowed from another model keeps its own texture names.
         slots = (bc.material_texture_slots(bl_mat, self.owner)
                  if bl_mat is not None else [None] * 8)
 
-        def slot_key(slot):
-            if slot is None or slot < 0 or slot >= len(slots):
-                return None
-            index = slots[slot]
-            if index is None or not (0 <= index < len(self.texture_keys)):
-                return None
-            key = self.texture_keys[index]
-            return key if key in self.images else None
-
-        tex_names = [slot_key(slot) for slot in range(8)]
+        tex_names = (self._material_tex_names(bl_mat, slots)
+                     if bl_mat is not None else [None] * 8)
 
         d = None
         if stored:

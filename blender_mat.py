@@ -2881,6 +2881,13 @@ def _srgb_to_linear_node(tree, color, name="bmd_tev_linear"):
 TEXCOL_OFFSET = 300.0
 _RECOVERY_UPDATING = False
 _RECOVERY_SIGNATURE = {}
+_UNDO_BUSY = False
+_TRANSFER_PROMPTS = set()
+_TRANSFER_PENDING = None
+_TRANSFER_TIMER = False
+_TRANSFER_QUEUE = []
+_ASSIGNMENT_CACHE = {}
+_ASSIGNMENT_CACHE_READY = False
 
 
 def _texcol_name(slot):
@@ -3206,12 +3213,426 @@ def ensure_material_isolation():
             _retag_material_groups(material, old_name)
 
 
+def _mesh_bmd_owner(obj):
+    arm = bc.target_armature(obj)
+    if arm is not None:
+        return arm
+    if "bmd_textures" in obj or len(obj.bmd_texture_list):
+        return obj
+    return None
+
+
+def _bmd_owner_objects():
+    owners = []
+    seen = set()
+    for obj in bpy.data.objects:
+        if obj.type == "MESH":
+            owner = _mesh_bmd_owner(obj)
+        elif obj.type == "ARMATURE" and (
+                "bmd_textures" in obj or len(obj.bmd_texture_list)):
+            owner = obj
+        else:
+            continue
+        if owner is not None and owner not in seen:
+            seen.add(owner)
+            owners.append(owner)
+    return owners
+
+
+def texture_transfer_candidates(owner, material):
+    """Missing textures of *material* that another model still has."""
+    if owner is None or material is None:
+        return []
+    native = bc.material_texture_keys(material)
+    if not any(native):
+        return []
+    try:
+        target_slots = owner.bmd_texture_list
+    except Exception:
+        target_slots = ()
+
+    filled = set()
+    for slot in target_slots:
+        if slot.image is not None:
+            filled.update(bc._texture_slot_match_names(slot))
+
+    source = {}
+    for other in _bmd_owner_objects():
+        if other is owner:
+            continue
+        try:
+            slots = other.bmd_texture_list
+        except Exception:
+            continue
+        for index, slot in enumerate(slots):
+            image = slot.image
+            if image is None:
+                continue
+            info = {
+                "source_owner": other.name,
+                "source_index": index,
+                "image": image.name,
+                "key": bc.texture_slot_key(slot) or bc.texture_key(image),
+                "name": slot.name or bc.clean_texture_name(image),
+                "sampler": bc.slot_sampler(slot),
+            }
+            for name in bc._texture_slot_match_names(slot):
+                source.setdefault(name, info)
+
+    tree = getattr(material, "node_tree", None)
+    if tree is not None:
+        for node in tree.nodes:
+            image = getattr(node, "image", None)
+            if node.type != "TEX_IMAGE" or image is None:
+                continue
+            names = {
+                bc.clean_texture_name(image),
+                bc.strip_blender_suffix(bc.texture_key(image)),
+            }
+            info = {
+                "source_owner": "",
+                "source_index": -1,
+                "image": image.name,
+                "key": bc.texture_key(image),
+                "name": bc.clean_texture_name(image),
+                "sampler": bc.sampler_for_image(image),
+            }
+            for name in names:
+                if name:
+                    source.setdefault(bc.strip_blender_suffix(name), info)
+
+    out = []
+    for key in native[:8]:
+        if not key:
+            continue
+        name = bc.strip_blender_suffix(str(key))
+        if name in filled:
+            continue
+        info = source.get(name)
+        if info is None:
+            continue
+        out.append(dict(info, key=str(key), label=info.get("name") or name))
+    return out
+
+
+def _schedule_texture_transfer(owner, material, candidates):
+    """Queue the missing-texture dialog outside the depsgraph handler."""
+    global _TRANSFER_PENDING, _TRANSFER_TIMER
+    if _UNDO_BUSY or not candidates or owner is None or material is None:
+        return
+    signature = (owner.name, material.name,
+                 tuple(sorted(item["label"] for item in candidates)))
+    if signature in _TRANSFER_PROMPTS:
+        return
+    if getattr(bpy.context, "window", None) is None:
+        return
+    _TRANSFER_PROMPTS.add(signature)
+    entry = {"owner": owner.name, "material": material.name,
+             "candidates": candidates}
+    if _TRANSFER_PENDING is not None or _TRANSFER_TIMER:
+        _TRANSFER_QUEUE.append(entry)
+        return
+    _TRANSFER_PENDING = entry
+    _TRANSFER_TIMER = True
+    bpy.app.timers.register(_open_texture_transfer_dialog,
+                            first_interval=0.15)
+
+
+def prompt_next_transfer():
+    """Show the next queued missing-texture dialog, if any."""
+    global _TRANSFER_PENDING, _TRANSFER_TIMER
+    if _TRANSFER_PENDING is not None or _TRANSFER_TIMER:
+        return
+    while _TRANSFER_QUEUE:
+        entry = _TRANSFER_QUEUE.pop(0)
+        if getattr(bpy.context, "window", None) is None:
+            return
+        _TRANSFER_PENDING = entry
+        _TRANSFER_TIMER = True
+        bpy.app.timers.register(_open_texture_transfer_dialog,
+                                first_interval=0.15)
+        return
+
+
+def _open_texture_transfer_dialog():
+    global _TRANSFER_PENDING, _TRANSFER_TIMER
+    _TRANSFER_TIMER = False
+    pending = _TRANSFER_PENDING
+    if pending is None or _UNDO_BUSY:
+        _TRANSFER_PENDING = None
+        return None
+    if getattr(bpy.context, "window", None) is None:
+        _TRANSFER_PENDING = None
+        return None
+    try:
+        bpy.ops.bmd.material_transfer_textures("INVOKE_DEFAULT")
+    except Exception:
+        _TRANSFER_PENDING = None
+        prompt_next_transfer()
+    return None
+
+
+def take_texture_transfer_pending():
+    global _TRANSFER_PENDING
+    pending = _TRANSFER_PENDING
+    _TRANSFER_PENDING = None
+    return pending
+
+
+def _set_slot_sampler(slot, sampler):
+    if not sampler:
+        return
+    slot.wrap_s = str(int(sampler.get("wrap_s", 1)))
+    slot.wrap_t = str(int(sampler.get("wrap_t", 1)))
+    slot.min_filter = str(int(sampler.get("min_filter", 1)))
+    slot.mag_filter = str(int(sampler.get("mag_filter", 1)))
+    slot.min_lod = int(sampler.get("min_lod", 0))
+    slot.max_lod = int(sampler.get("max_lod", 0))
+    slot.max_lod_custom = bool(sampler.get("max_lod_custom", False))
+    slot.lod_bias = int(sampler.get("lod_bias", 0))
+    if "transparency" in sampler:
+        slot["bmd_transparency"] = int(sampler["transparency"])
+    if sampler.get("flags10"):
+        slot["bmd_flags10"] = str(sampler["flags10"])
+    slot.sampler_ready = True
+
+
+def apply_texture_transfer(owner_name, material_name, items):
+    """Copy the chosen source textures into the target model's slots."""
+    owner = bpy.data.objects.get(owner_name)
+    material = bpy.data.materials.get(material_name)
+    if owner is None or material is None:
+        return 0
+    bc.ensure_material_texture_slots(owner, material)
+    try:
+        textures = bc.ensure_texture_list(owner)
+    except Exception:
+        return 0
+
+    by_name = {}
+    for index, slot in enumerate(textures):
+        for name in bc._texture_slot_match_names(slot):
+            previous = by_name.get(name)
+            if (previous is None
+                    or (textures[previous].image is None
+                        and slot.image is not None)):
+                by_name[name] = index
+
+    applied = 0
+    for item in items:
+        name = bc.strip_blender_suffix(str(item.get("label") or item.get("key") or ""))
+        image = bpy.data.images.get(str(item.get("image") or ""))
+        if image is None:
+            source_owner = bpy.data.objects.get(str(item.get("source_owner") or ""))
+            index = int(item.get("source_index", -1))
+            if (source_owner is not None and 0 <= index
+                    < len(source_owner.bmd_texture_list)):
+                image = source_owner.bmd_texture_list[index].image
+        if image is None:
+            continue
+
+        target = by_name.get(name)
+        if target is None:
+            slot = textures.add()
+            slot.name = name
+            target = len(textures) - 1
+            by_name[name] = target
+        slot = textures[target]
+        slot.image = image
+        slot.key = str(item.get("key") or bc.texture_key(image))
+        slot.name = str(item.get("name") or bc.clean_texture_name(image))
+        _set_slot_sampler(slot, item.get("sampler"))
+        slot.auto_created = False
+        applied += 1
+
+    if applied:
+        bc.retarget_material_texture_slots(owner, material)
+        try:
+            bc.sync_texture_legacy(owner)
+        except Exception:
+            pass
+    return applied
+
+
+def ensure_owner_material_copies(owner):
+    """Give *owner* its own copy of BMD materials shared with another model.
+
+    A texture-order change belongs to one model.  Copying the shared material
+    for that model before the indices move keeps the other models (which were
+    not edited) on the original material.
+    """
+    if owner is None:
+        return 0
+    material_owners = {}
+    for obj in bpy.data.objects:
+        if obj.type != "MESH" or obj.data is None:
+            continue
+        obj_owner = _mesh_bmd_owner(obj)
+        if obj_owner is None:
+            continue
+        for slot in obj.material_slots:
+            material = slot.material
+            if material is None or not (material.get("bmd_material")
+                                        or material.get("bmd_shader_active")):
+                continue
+            material_owners.setdefault(material, set()).add(obj_owner)
+
+    copies = {}
+    for mesh in bc.owner_meshes(owner):
+        for slot in mesh.material_slots:
+            material = slot.material
+            if material is None or not (material.get("bmd_material")
+                                        or material.get("bmd_shader_active")):
+                continue
+            if len(material_owners.get(material, ())) <= 1:
+                continue
+            target = copies.get(material)
+            if target is None:
+                target = material.copy()
+                target["bmd_name"] = str(target.name)
+                target[bc.MATERIAL_LAST_NAME_PROP] = str(target.name)
+                isolate_material_groups(target)
+                copies[material] = target
+            slot.material = target
+            bc.retarget_material_texture_slots(owner, target)
+    return len(copies)
+
+
+def _active_bmd_owner():
+    try:
+        active = bpy.context.view_layer.objects.active
+    except Exception:
+        active = None
+    candidates = [active]
+    try:
+        candidates.extend(list(bpy.context.selected_objects or ()))
+    except Exception:
+        pass
+    for obj in candidates:
+        if obj is None:
+            continue
+        if obj.type == "MESH":
+            owner = _mesh_bmd_owner(obj)
+            if owner is not None:
+                return owner
+        elif obj.type == "ARMATURE" and (
+                "bmd_textures" in obj or len(obj.bmd_texture_list)):
+            return obj
+    return None
+
+
+def _forget_transfer_prompt(owner, candidates):
+    """A new assignment attempt may ask again after an earlier cancel."""
+    labels = tuple(sorted(item["label"] for item in candidates))
+    for signature in list(_TRANSFER_PROMPTS):
+        if signature[0] == owner.name and signature[2] == labels:
+            _TRANSFER_PROMPTS.discard(signature)
+    _TRANSFER_QUEUE[:] = [
+        entry for entry in _TRANSFER_QUEUE
+        if not (entry.get("owner") == owner.name
+                and tuple(sorted(item["label"]
+                                 for item in entry.get("candidates", ()))) == labels)
+    ]
+
+
+def ensure_foreign_material_slots():
+    """Retarget BMD materials assigned to a different model.
+
+    A material keeps one texture-slot table.  When it is assigned to another
+    BMD model, its old indices select unrelated textures there.  Empty named
+    slots are added for the material's missing textures and its slots are
+    pointed at the new owner.  If the same material is still used by another
+    model, this slot gets an independent copy so neither model is changed.
+    The copy is made only for the active model; an unselected model is never
+    modified just because it happens to share the material.
+    """
+    global _ASSIGNMENT_CACHE_READY
+    entries = []
+    owners = {}
+    owner_objects = set()
+    for obj in bpy.data.objects:
+        if obj.type != "MESH" or obj.data is None:
+            continue
+        owner = _mesh_bmd_owner(obj)
+        if owner is None:
+            continue
+        owner_objects.add(owner)
+        for index, slot in enumerate(obj.material_slots):
+            material = slot.material
+            if material is None or not (material.get("bmd_material")
+                                        or material.get("bmd_shader_active")):
+                continue
+            entries.append((obj, index, slot, material, owner))
+            owners.setdefault(material, set()).add(owner)
+
+    active_owner = _active_bmd_owner()
+    all_owners = set(owner_objects)
+    if active_owner is None and len(all_owners) == 1:
+        active_owner = next(iter(all_owners))
+
+    current_assignments = {}
+    prompt_candidates = {}
+    for obj, index, slot, material, owner in entries:
+        slot_key = (obj.as_pointer(), index)
+        if owner != active_owner:
+            continue
+        was_new = _ASSIGNMENT_CACHE.get(slot_key) != material.as_pointer()
+        if not _ASSIGNMENT_CACHE_READY or not was_new:
+            continue
+        candidates = texture_transfer_candidates(owner, material)
+        if candidates:
+            _forget_transfer_prompt(owner, candidates)
+            prompt_candidates[(owner, material)] = candidates
+
+    copies = {}
+    for _obj, _index, slot, material, owner in entries:
+        if owner != active_owner:
+            continue
+        if bc.material_slots_match_owner(owner, material):
+            continue
+        target = material
+        if len(owners.get(material, ())) > 1:
+            key = (material, owner)
+            target = copies.get(key)
+            if target is None:
+                target = material.copy()
+                target["bmd_name"] = str(target.name)
+                target[bc.MATERIAL_LAST_NAME_PROP] = str(target.name)
+                isolate_material_groups(target)
+                copies[key] = target
+                owners.setdefault(target, set()).add(owner)
+            if slot.material != target:
+                slot.material = target
+        bc.retarget_material_texture_slots(owner, target)
+
+    for _obj, _index, slot, _material, _owner in entries:
+        if slot.material is not None:
+            current_assignments[(_obj.as_pointer(), _index)] = slot.material.as_pointer()
+
+    for owner, material in prompt_candidates:
+        final = material
+        for _obj, _index, slot, original, entry_owner in entries:
+            if entry_owner == owner and original == material:
+                final = slot.material or material
+                break
+        _schedule_texture_transfer(owner, final,
+                                   prompt_candidates[(owner, material)])
+
+    _ASSIGNMENT_CACHE.clear()
+    _ASSIGNMENT_CACHE.update(current_assignments)
+    _ASSIGNMENT_CACHE_READY = True
+
+    for owner in owner_objects:
+        bc.prune_auto_texture_slots(owner)
+
+
 @bpy.app.handlers.persistent
 def _texture_recovery_handler(scene=None, depsgraph=None):
     """Follow slot assignments; preview image swaps are ignored."""
-    if _RECOVERY_UPDATING:
+    if _RECOVERY_UPDATING or _UNDO_BUSY:
         return
     ensure_material_isolation()
+    ensure_foreign_material_slots()
     key_images = None
     for material in bpy.data.materials:
         if not (material.get("bmd_material")
@@ -3228,10 +3649,72 @@ def _texture_recovery_handler(scene=None, depsgraph=None):
         refresh_texture_recovery(material)
 
 
+def _fill_assignment_cache():
+    global _ASSIGNMENT_CACHE_READY
+    _ASSIGNMENT_CACHE.clear()
+    for obj in bpy.data.objects:
+        if obj.type != "MESH" or obj.data is None:
+            continue
+        for index, slot in enumerate(obj.material_slots):
+            if slot.material is not None:
+                _ASSIGNMENT_CACHE[(obj.as_pointer(), index)] = (
+                    slot.material.as_pointer())
+    _ASSIGNMENT_CACHE_READY = True
+
+
+@bpy.app.handlers.persistent
+def _reset_transfer_cache(*_args):
+    global _ASSIGNMENT_CACHE_READY, _TRANSFER_PENDING, _TRANSFER_TIMER
+    _fill_assignment_cache()
+    _TRANSFER_PROMPTS.clear()
+    _TRANSFER_PENDING = None
+    _TRANSFER_TIMER = False
+    _TRANSFER_QUEUE.clear()
+
+
+@bpy.app.handlers.persistent
+def _undo_busy_pre(*_args):
+    global _UNDO_BUSY, _ASSIGNMENT_CACHE_READY, _TRANSFER_PENDING, _TRANSFER_TIMER
+    _UNDO_BUSY = True
+    # Undo restores the scene; never open a texture-transfer dialog from the
+    # restored state.  Treat the next update as a fresh scan only.
+    _TRANSFER_PENDING = None
+    _TRANSFER_TIMER = False
+    _TRANSFER_QUEUE.clear()
+    _TRANSFER_PROMPTS.clear()
+    _ASSIGNMENT_CACHE.clear()
+    _ASSIGNMENT_CACHE_READY = False
+
+
+@bpy.app.handlers.persistent
+def _undo_cleanup_auto_slots(*_args):
+    """Drop empty assignment slots that no material uses after undo/redo."""
+    global _UNDO_BUSY, _ASSIGNMENT_CACHE_READY
+    try:
+        for owner in bpy.data.objects:
+            if owner.type in {"ARMATURE", "MESH"}:
+                try:
+                    bc.prune_auto_texture_slots(owner)
+                except Exception:
+                    pass
+    finally:
+        _fill_assignment_cache()
+        _UNDO_BUSY = False
+
+
 def install_texture_recovery():
     handlers = bpy.app.handlers.depsgraph_update_post
     if _texture_recovery_handler not in handlers:
         handlers.append(_texture_recovery_handler)
+    for handlers in (bpy.app.handlers.undo_pre, bpy.app.handlers.redo_pre):
+        if _undo_busy_pre not in handlers:
+            handlers.append(_undo_busy_pre)
+    for handlers in (bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
+        if _undo_cleanup_auto_slots not in handlers:
+            handlers.append(_undo_cleanup_auto_slots)
+    if _reset_transfer_cache not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_reset_transfer_cache)
+    _reset_transfer_cache()
     _RECOVERY_SIGNATURE.clear()
 
 
@@ -3239,6 +3722,14 @@ def uninstall_texture_recovery():
     handlers = bpy.app.handlers.depsgraph_update_post
     if _texture_recovery_handler in handlers:
         handlers.remove(_texture_recovery_handler)
+    for handlers in (bpy.app.handlers.undo_pre, bpy.app.handlers.redo_pre):
+        if _undo_busy_pre in handlers:
+            handlers.remove(_undo_busy_pre)
+    for handlers in (bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
+        if _undo_cleanup_auto_slots in handlers:
+            handlers.remove(_undo_cleanup_auto_slots)
+    if _reset_transfer_cache in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_reset_transfer_cache)
     _RECOVERY_SIGNATURE.clear()
 
 
@@ -4494,13 +4985,12 @@ def _apply_data_settings(material, data):
 
 
 def apply_shader_preset(material, owner, preset):
-    """Apply a SuperBMD shader preset, keeping the material's original data.
+    """Replace the material's shader from a SuperBMD preset.
 
     Returns ``(applied_name, created_slots, empty_slots)``.  Textures that the
     target model does not have are appended as empty slots, so a shader can be
-    moved between models with different texture sets.  The material's original
-    MAT3 data and texture slots stay on it (``reset_shader`` restores them);
-    every node is removed and re-created from the imported data.
+    moved between models with different texture sets.  The imported shader
+    replaces the previous MAT3 data; no backup is kept for reset.
     """
     from .j3d import mat3_json
 
@@ -4522,22 +5012,16 @@ def apply_shader_preset(material, owner, preset):
         keys[index] = str(slot.key or "") or bc.texture_slot_key(slot) or None
     data["texNames"] = keys
 
-    if not material.get("bmd_shader_active"):
-        material["bmd_texture_slots_backup"] = str(
-            material.get("bmd_texture_slots") or "")
-
-    material["bmd_shader_material"] = json.dumps(data, separators=(",", ":"))
-    material["bmd_shader_active"] = 1
+    # The imported shader is now the material's own data.  Drop leftovers of
+    # the old "preset shadows the original" mode so no reset backup remains.
+    for key in ("bmd_shader_active", "bmd_shader_material",
+                "bmd_texture_slots_backup", "bmd_shader_mode_backup",
+                "bmd_shader_alpha_backup", "bmd_shader_cull_backup",
+                "bmd_shader_created_slots"):
+        if key in material:
+            del material[key]
+    material["bmd_material"] = json.dumps(data, separators=(",", ":"))
     bc.set_material_texture_slots(material, slots)
-    created_slots = sorted({by_name[name] for name in created if name in by_name})
-    if created_slots:
-        try:
-            previous = set(json.loads(material.get("bmd_shader_created_slots")
-                                      or "[]"))
-        except Exception:
-            previous = set()
-        material["bmd_shader_created_slots"] = json.dumps(
-            sorted(previous | set(created_slots)))
 
     _apply_data_settings(material, data)
 
@@ -4553,57 +5037,5 @@ def apply_shader_preset(material, owner, preset):
 
 
 def reset_shader(material, owner=None):
-    """Drop the imported shader and rebuild the material from its own data."""
-    if not material.get("bmd_shader_active"):
-        return False
-    backup = str(material.get("bmd_texture_slots_backup") or "")
-    try:
-        created_slots = sorted((int(i) for i in
-                                json.loads(material.get("bmd_shader_created_slots")
-                                           or "[]")), reverse=True)
-    except Exception:
-        created_slots = []
-    for key in ("bmd_shader_active", "bmd_shader_material",
-                "bmd_texture_slots_backup", "bmd_shader_mode_backup",
-                "bmd_shader_alpha_backup", "bmd_shader_cull_backup",
-                "bmd_shader_created_slots"):
-        if key in material:
-            del material[key]
-    if backup:
-        material["bmd_texture_slots"] = backup
-    else:
-        bc.set_material_texture_slots(material, [None] * 8)
-
-    # Drop the slots the import appended, newest first, so the model's texture
-    # list returns to its original length.  A slot that another material now
-    # references stays; the images themselves are not deleted.
-    if created_slots and owner is not None:
-        try:
-            coll = owner.bmd_texture_list
-        except Exception:
-            coll = ()
-        for index in created_slots:
-            if not (0 <= index < len(coll)):
-                continue
-            if bc.material_slot_users(owner, index) > 0:
-                continue
-            coll.remove(index)
-            bc.remove_material_texture_slot(owner, index)
-        try:
-            bc.sync_texture_legacy(owner)
-        except Exception:
-            pass
-
-    data = material_data(material)
-    images, samplers, _by_name = _owner_texture_maps(owner)
-    _apply_data_settings(material, data)
-
-    if data is None:
-        tree = material.node_tree
-        if tree is not None:
-            tree.nodes.clear()
-            ensure_output_bsdf(tree)
-        return True
-    build_import_nodes(material, data, images, _material_scale(material, owner),
-                       samplers=samplers)
-    return True
+    """Compatibility stub: shader imports no longer keep a reset backup."""
+    return False

@@ -11,9 +11,9 @@ import json
 import os
 
 import bpy
-from bpy.props import (BoolProperty, EnumProperty, IntProperty, PointerProperty,
-                       StringProperty)
-from bpy.types import Operator, Panel, UIList
+from bpy.props import (BoolProperty, CollectionProperty, EnumProperty,
+                       IntProperty, PointerProperty, StringProperty)
+from bpy.types import Operator, Panel, PropertyGroup, UIList
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from . import blender_common as bc
@@ -63,13 +63,6 @@ class MATERIAL_PT_bmd(Panel):
         op.material_name = mat.name
         op.owner_name = owner.name if owner is not None else ""
 
-        reset_row = layout.row(align=True)
-        reset_row.enabled = shader_active
-        op = reset_row.operator(BMD_OT_material_shader_reset.bl_idname,
-                                text="Reset Shader", icon="LOOP_BACK")
-        op.material_name = mat.name
-        op.owner_name = owner.name if owner is not None else ""
-
         layout.prop(mat.bmd, "render_mode")
         if mat.bmd.render_mode in {"CUTOUT", "TRANSLUCENT"}:
             layout.prop(mat.bmd, "alpha_ref")
@@ -84,23 +77,27 @@ class MATERIAL_PT_bmd(Panel):
                 owner_index = slots[slot]
                 owner_slot = owner.bmd_texture_list[owner_index]
                 key = bc.texture_slot_key(owner_slot)
-                label = f"{owner_index}: {owner_slot.name or key}"
+                name = owner_slot.name or key
                 row = box.row(align=True)
                 # An empty slot (a texture the imported shader expects) needs an
                 # image from the user, so it is highlighted.
                 row.alert = owner_slot.image is None
-                row.label(text=f"{slot}: {label}")
-                op = row.operator(BMD_OT_material_texture_menu.bl_idname,
-                                  text="", icon="IMAGE_DATA")
+                index_cell = _texture_index_cell(row)
+                index_cell.label(text=f"[{slot}]")
+                content = row.row(align=True)
+                content.alert = row.alert
+                content.label(text=f"{owner_index:02d} · {name}")
+                op = content.operator(BMD_OT_material_texture_menu.bl_idname,
+                                      text="", icon="IMAGE_DATA")
                 op.slot = slot
                 op.add = False
                 op.owner_name = owner.name if owner is not None else ""
-                op = row.operator(BMD_OT_texture_focus.bl_idname, text="",
-                                  icon="PREFERENCES")
+                op = content.operator(BMD_OT_texture_focus.bl_idname, text="",
+                                      icon="PREFERENCES")
                 op.owner_name = owner.name if owner is not None else ""
                 op.texture_index = owner_index
-                op = row.operator(BMD_OT_material_remove_texture.bl_idname,
-                                  text="", icon="X")
+                op = content.operator(BMD_OT_material_remove_texture.bl_idname,
+                                      text="", icon="X")
                 op.slot = slot
         else:
             if owner is not None and not items:
@@ -114,6 +111,18 @@ class MATERIAL_PT_bmd(Panel):
                 add.add = True
 
         _draw_btp_box(layout, mat, owner)
+
+
+def _texture_index_cell(row):
+    """Fixed-width index cell shared by the material and texture lists.
+
+    ``split(factor=...)`` is relative to the available width, so a UIList
+    (whose width changes with the side panel) stretches it.  ``ui_units_x``
+    keeps the column the same size at every panel width.
+    """
+    cell = row.column()
+    cell.ui_units_x = 2.0
+    return cell
 
 
 def _draw_btp_box(layout, mat, owner):
@@ -844,14 +853,15 @@ class BMD_UL_textures(UIList):
         row = layout.row(align=True)
         # Empty slots (e.g. textures an imported shader expects) need an image.
         row.alert = item.image is None
-        index_col = row.column()
-        index_col.ui_units_x = 2.0
-        index_col.label(text=f"{index:02d}")
+        index_cell = _texture_index_cell(row)
+        index_cell.label(text=f"{index:02d}")
+        content = row.row(align=True)
+        content.alert = row.alert
         if item.image is None and item.name:
             name = f"{item.name} (no image)"
         else:
             name = item.name or (item.image.name if item.image is not None else "(no image)")
-        row.label(text=name)
+        content.label(text=name)
 
 
 class BMD_OT_texture_add(Operator):
@@ -890,6 +900,8 @@ class BMD_OT_texture_remove(Operator):
         index = self.index if self.index >= 0 else int(arm.bmd_texture_index)
         if not (0 <= index < len(coll)):
             return {"CANCELLED"}
+        from . import blender_mat
+        blender_mat.ensure_owner_material_copies(arm)
         key = bc.texture_slot_key(coll[index])
         users = bc.material_slot_users(arm, index) if key else 0
         if key:
@@ -941,6 +953,8 @@ class BMD_OT_texture_move(Operator):
         target = index - 1 if self.direction == "UP" else index + 1
         if not (0 <= index < len(coll) and 0 <= target < len(coll)):
             return {"CANCELLED"}
+        from . import blender_mat
+        blender_mat.ensure_owner_material_copies(arm)
         order = list(range(len(coll)))
         order.pop(index)
         order.insert(target, index)
@@ -1172,12 +1186,12 @@ def _shader_read_entries(path):
 
 
 class BMD_OT_material_shader_import(Operator, ImportHelper):
-    """Import a shader preset into this material"""
+    """Import a shader preset into this material."""
 
     bl_idname = "bmd.material_shader_import"
     bl_label = "Import Shader"
     bl_description = (
-        "Apply a shader preset to this material.")
+        "Apply a shader preset to this material. Make a copy if you need to keep a backup of the original shader.")
     # The operator rewrites the material's node tree and its MAT3 data; its own
     # undo step keeps Ctrl+Z from restoring a half-rebuilt tree.
     bl_options = {"REGISTER", "UNDO"}
@@ -1380,35 +1394,6 @@ class BMD_OT_material_shader_export(Operator, ExportHelper):
             return {"CANCELLED"}
         self.report({"INFO"},
                     f"Wrote shader preset {os.path.basename(path)}")
-        return {"FINISHED"}
-
-
-class BMD_OT_material_shader_reset(Operator):
-    """Drop the imported shader and rebuild the material from its own data"""
-
-    bl_idname = "bmd.material_shader_reset"
-    bl_label = "Reset Shader"
-    bl_description = ("Remove the imported shader and restore the "
-                      "original MAT3 data")
-    bl_options = {"REGISTER", "UNDO"}
-
-    material_name: StringProperty(options={"HIDDEN"})
-    owner_name: StringProperty(options={"HIDDEN"})
-
-    def execute(self, context):
-        from . import blender_mat
-
-        material = (bpy.data.materials.get(self.material_name)
-                    if self.material_name else context.material)
-        if material is None:
-            self.report({"ERROR"}, "Select a material")
-            return {"CANCELLED"}
-        owner = (bpy.data.objects.get(self.owner_name)
-                 if self.owner_name else _texture_owner(context))
-        if not blender_mat.reset_shader(material, owner):
-            self.report({"ERROR"}, "No imported shader to reset")
-            return {"CANCELLED"}
-        self.report({"INFO"}, f"Restored the original shader of {material.name}")
         return {"FINISHED"}
 
 
@@ -1626,7 +1611,96 @@ class BMD_OT_btp_insert_key(Operator):
         return {"FINISHED"}
 
 
+class BMDTransferTexture(PropertyGroup):
+    selected: BoolProperty(default=True)
+    label: StringProperty()
+    key: StringProperty()
+    name: StringProperty()
+    image: StringProperty()
+    source_owner: StringProperty()
+    source_index: IntProperty(default=-1)
+    sampler: StringProperty()
+
+
+class BMD_OT_material_transfer_textures(Operator):
+    """Transfer textures missing from the target model"""
+
+    bl_idname = "bmd.material_transfer_textures"
+    bl_label = "Transfer Missing Textures"
+    bl_options = {"UNDO"}
+
+    owner_name: StringProperty(options={"HIDDEN"})
+    material_name: StringProperty(options={"HIDDEN"})
+    items: CollectionProperty(type=BMDTransferTexture, options={"HIDDEN"})
+
+    def invoke(self, context, _event):
+        from . import blender_mat
+        pending = blender_mat.take_texture_transfer_pending()
+        if not pending:
+            return {"CANCELLED"}
+        self.owner_name = pending["owner"]
+        self.material_name = pending["material"]
+        self.items.clear()
+        for candidate in pending["candidates"]:
+            item = self.items.add()
+            item.selected = True
+            item.label = str(candidate.get("label") or "")
+            item.key = str(candidate.get("key") or "")
+            item.name = str(candidate.get("name") or "")
+            item.image = str(candidate.get("image") or "")
+            item.source_owner = str(candidate.get("source_owner") or "")
+            item.source_index = int(candidate.get("source_index", -1))
+            item.sampler = json.dumps(candidate.get("sampler") or {},
+                                      separators=(",", ":"))
+        return context.window_manager.invoke_props_dialog(
+            self, width=460, confirm_text="Transfer")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="The model is missing textures. "
+                          "Choose which ones to transfer:")
+        for item in self.items:
+            row = layout.row(align=True)
+            row.prop(item, "selected", text="")
+            row.label(text=item.label or item.key, icon="IMAGE_DATA")
+
+    def execute(self, context):
+        from . import blender_mat
+        selected = []
+        for item in self.items:
+            if not item.selected:
+                continue
+            try:
+                sampler = json.loads(item.sampler) if item.sampler else {}
+            except Exception:
+                sampler = {}
+            selected.append({
+                "label": item.label,
+                "key": item.key,
+                "name": item.name,
+                "image": item.image,
+                "source_owner": item.source_owner,
+                "source_index": int(item.source_index),
+                "sampler": sampler,
+            })
+        count = blender_mat.apply_texture_transfer(
+            self.owner_name, self.material_name, selected)
+        if count:
+            self.report({"INFO"}, f"Transferred {count} texture(s)")
+        else:
+            self.report({"WARNING"}, "No textures were transferred")
+        blender_mat.prompt_next_transfer()
+        return {"FINISHED"}
+
+    def cancel(self, context):
+        from . import blender_mat
+        blender_mat.prompt_next_transfer()
+        return None
+
+
 CLASSES = (
+    BMDTransferTexture,
+    BMD_OT_material_transfer_textures,
     MATERIAL_PT_bmd,
     IMAGE_PT_bmd,
     BMD_PT_j3d,
@@ -1648,7 +1722,6 @@ CLASSES = (
     BMD_OT_material_shader_import,
     BMD_OT_material_shader_apply,
     BMD_OT_material_shader_export,
-    BMD_OT_material_shader_reset,
     *CREATE_OPERATORS,
     BMD_OT_material_track_menu,
     BMD_OT_material_track_add,

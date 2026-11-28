@@ -412,6 +412,7 @@ def _get_json_material(bmd_mat):
 def _create_material(bmd, index, m, images, warn=None, scale=0.01):
     name = bmd.material_names[index] if index < len(bmd.material_names) else f"material{index}"
     mat = bpy.data.materials.new(name)
+    mat.use_fake_user = True
     mat["bmd_name"] = name
     mat["bmd_index"] = index
     mat[bc.MATERIAL_LAST_NAME_PROP] = str(mat.name)
